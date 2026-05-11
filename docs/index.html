@@ -155,7 +155,7 @@
 <div class="wrap">
 
 <header>
-  <h1>kiosk-exit-guard <span class="version-pill">v0.5.x</span></h1>
+  <h1>kiosk-exit-guard <span class="version-pill">v0.5.1</span></h1>
   <p class="tagline">Single-binary kiosk lockdown for Windows 11 Home. Embedded WebView2 kiosk window, password-gated keyboard, Chrome uninstalled, Edge launches blocked at the OS level — all from one exe.</p>
 </header>
 
@@ -183,14 +183,21 @@
   <a href="#build">Build</a>
 </nav>
 
-<h2 id="whats-new">What's new in v0.5.x</h2>
+<h2 id="whats-new">What's new in v0.5.1</h2>
+
+<div class="callout callout-good">
+  <strong>The big shift in v0.5.1:</strong> the SK Filter is now <strong>always ON by default</strong>. There is no "turn off" path. Instead, the admin can <strong>pause</strong> the filter for a chosen duration (1, 5, 10, 20, 30, 45 minutes, or any custom value up to 100). During a pause, <strong>Edge is re-enabled</strong>, the kiosk window closes, and the registry lockdown is lifted. When the timer fires, everything goes back on automatically — no user intervention needed.
+</div>
 
 <div class="feature-grid">
-  <div class="feature"><h4><span class="dot new"></span>Branded password modal<span class="badge">new</span></h4><p>WebView2 dialog with autofocused input. Header reads <em>"This command has been locked by the SK Filter"</em>. Replaces the small zenity prompt.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Re-injection on success<span class="badge">new</span></h4><p>Every blocked Ctrl/Win/Alt combo (not just Alt+F4) now opens the password prompt. Correct password re-sends the original combo via <code>SendInput</code> so the user's intended action goes through.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>WebView2 Runtime auto-install<span class="badge">new</span></h4><p>If the runtime is missing (Server SKUs, stripped images), the exe downloads the evergreen bootstrapper from <code>go.microsoft.com</code> and runs it silently on first launch.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Desktop shortcut<span class="badge">new</span></h4><p>First-run setup drops a <code>Kiosk Exit Guard.lnk</code> on the admin's desktop. Self-heals on subsequent launches if you delete it.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Branded first-run wizard<span class="badge">new</span></h4><p>One WebView2 page collects password + URL with proper form validation. Replaces the chain of small zenity prompts from v0.4.x.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>Default-ON, pause-only model<span class="badge">v0.5.1</span></h4><p>Filter active at install, after every reboot, and after every pause expires. The hotkey now opens a <strong>pause prompt</strong> rather than a toggle.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>Pause re-enables Edge<span class="badge">v0.5.1</span></h4><p>When a pause starts, the Chrome/Edge IFEO blocks are <strong>removed</strong> so the admin can actually launch Edge. When the timer expires they're re-applied automatically.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>1–100 min durations + custom<span class="badge">v0.5.1</span></h4><p>Quick picks of 1 / 5 / 10 / 20 / 30 / 45 min plus a "Custom" option that takes any whole number from 1 to 100.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>Branded SK Filter password modal<span class="badge">v0.5.0</span></h4><p>WebView2 dialog with autofocused input. Reads <em>"This command has been locked by the SK Filter — Please enter your password to continue."</em></p></div>
+  <div class="feature"><h4><span class="dot new"></span>Re-injection of blocked combos<span class="badge">v0.5.0</span></h4><p>Every blocked Ctrl/Win/Alt combo opens the password modal. Correct password re-sends the original combo via <code>SendInput</code> so the user's intended action goes through.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>WebView2 Runtime auto-install<span class="badge">v0.5.0</span></h4><p>If the runtime is missing (Server SKUs, stripped images), the exe downloads the evergreen bootstrapper from <code>go.microsoft.com</code> and runs it silently.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>Desktop shortcut<span class="badge">v0.5.0</span></h4><p>First-run drops a <code>Kiosk Exit Guard.lnk</code> on the admin's desktop. Self-heals if deleted.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>Branded first-run wizard<span class="badge">v0.5.0</span></h4><p>One WebView2 page collects password + URL with form validation, replacing the v0.4.x chain of small zenity prompts.</p></div>
 </div>
 
 <h3>What the password modal looks like</h3>
@@ -276,7 +283,7 @@
   </div>
 </div>
 
-<h3>Pressing a blocked combo (filter mode ON)</h3>
+<h3>Pressing a blocked combo (filter active)</h3>
 
 <div class="arch">
   <div class="arch-row">
@@ -289,7 +296,7 @@
     <span class="arch-arrow">↓</span>
   </div>
   <div class="arch-row">
-    <span class="arch-box accent">branded password modal opens (autofocused input)</span>
+    <span class="arch-box accent">branded SK Filter password modal opens (autofocused input)</span>
   </div>
   <div class="arch-row">
     <span class="arch-arrow">↓ correct password</span>
@@ -302,33 +309,69 @@
 
 <p>The re-injected events carry a marker in <code>ExtraInfo</code> so the LL hook recognizes them as our own and lets them through. Wrong password → keystroke stays swallowed, "Wrong password" toast appears.</p>
 
-<h2 id="flow">Filter mode flow</h2>
+<h3>Pausing the SK Filter</h3>
+
+<div class="arch">
+  <div class="arch-row">
+    <span class="arch-box">user presses Ctrl+Shift+Alt+K</span>
+    <span class="arch-arrow">→</span>
+    <span class="arch-box accent">password modal</span>
+  </div>
+  <div class="arch-row">
+    <span class="arch-arrow">↓ correct password</span>
+  </div>
+  <div class="arch-row">
+    <span class="arch-box accent">duration picker (1 / 5 / 10 / 20 / 30 / 45 / Custom 1-100)</span>
+  </div>
+  <div class="arch-row">
+    <span class="arch-arrow">↓</span>
+  </div>
+  <div class="arch-row">
+    <span class="arch-box good">WebView2 kiosk closed</span>
+    <span class="arch-arrow">·</span>
+    <span class="arch-box good">Edge IFEO block lifted</span>
+    <span class="arch-arrow">·</span>
+    <span class="arch-box good">HKCU lockdown removed</span>
+  </div>
+  <div class="arch-row">
+    <span class="arch-arrow">↓ timer fires (1–100 minutes later)</span>
+  </div>
+  <div class="arch-row">
+    <span class="arch-box accent">filter re-activates automatically — back to baseline</span>
+  </div>
+</div>
+
+<p>If the user presses the hotkey again while paused, they get a read-only status toast showing the remaining time. There is no "end pause early" path — every pause runs its course.</p>
+
+<h2 id="flow">States</h2>
 
 <table class="state-table">
   <thead>
-    <tr><th>State</th><th>Keyboard</th><th>Task Manager</th><th>Run dialog</th><th>WebView2 kiosk</th><th>Chrome / Edge</th></tr>
+    <tr><th>State</th><th>Keyboard</th><th>Task Manager</th><th>Run dialog</th><th>WebView2 kiosk</th><th>Edge</th></tr>
   </thead>
   <tbody>
     <tr>
-      <td><span class="state-off">OFF</span> <em>(default)</em></td>
-      <td>All keys pass through</td>
-      <td class="state-on">Open</td>
-      <td class="state-on">Open</td>
-      <td>Not running</td>
-      <td class="state-blocked">Chrome gone; Edge blocked</td>
-    </tr>
-    <tr>
-      <td><span class="state-on">ON</span></td>
+      <td><span class="state-on">Active</span> <em>(default)</em></td>
       <td>Any Ctrl/Win/Alt combo → SK Filter password modal → re-injected if correct</td>
       <td class="state-blocked">Disabled by policy</td>
       <td class="state-blocked">Disabled by policy</td>
       <td>Fullscreen, topmost, frameless</td>
-      <td class="state-blocked">Chrome gone; Edge blocked</td>
+      <td class="state-blocked">IFEO-blocked from launching</td>
+    </tr>
+    <tr>
+      <td><span class="state-off">Paused</span> <em>(temporary, 1–100 min)</em></td>
+      <td>All keys pass through</td>
+      <td class="state-on">Open</td>
+      <td class="state-on">Open</td>
+      <td>Closed</td>
+      <td class="state-on">Allowed (IFEO block lifted)</td>
     </tr>
   </tbody>
 </table>
 
-<p>Chrome uninstall + Edge IFEO block apply <strong>regardless of filter mode</strong> — permanent property of the installation. Filter mode controls everything else.</p>
+<p><strong>Chrome remains uninstalled in both states</strong> — it was removed during first-run setup and isn't reinstalled by the pause. Only Edge re-launches are re-enabled during a pause.</p>
+
+<p>When the pause timer fires, the state flips back to Active automatically: Edge IFEO block is re-applied, the registry lockdown is reapplied, and the WebView2 kiosk relaunches. No user action required.</p>
 
 <h2 id="setup">Setup</h2>
 
@@ -338,7 +381,7 @@
   <li><strong>WebView2 Runtime</strong> auto-installs if missing (~30 seconds, silent).</li>
   <li><strong>First-run wizard</strong> opens — enter password (twice), confirm or change the kiosk URL.</li>
   <li>Setup then <strong>uninstalls Chrome</strong>, <strong>blocks Chrome+Edge launches</strong>, drops a <strong>desktop shortcut</strong>, and registers the <strong>logon task</strong>.</li>
-  <li>Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Alt</kbd>+<kbd>K</kbd> to flip filter mode on when ready.</li>
+  <li>The SK Filter is <strong>ON immediately</strong> after setup. Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Alt</kbd>+<kbd>K</kbd> to pause it when needed.</li>
 </ol>
 
 <div class="callout callout-warn">
