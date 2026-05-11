@@ -782,9 +782,14 @@ func ensureWebView2Installed() error {
 
 // ---------- desktop shortcut ----------
 
-// createDesktopShortcut drops a .lnk on the current user's desktop pointing
-// at this exe. Idempotent. Run as part of first-run setup so the admin has
-// a one-click launcher next to whatever else they use.
+// createDesktopShortcut drops two .lnk files on the current user's desktop:
+//   - "Kiosk Exit Guard.lnk" — runs the controller exe (rarely needed
+//     since Task Scheduler launches it at logon, but useful as a fallback)
+//   - "Pause SK Filter.lnk" — runs the exe with --pause, which opens the
+//     password + duration prompt directly without going through the
+//     Ctrl+Shift+Alt+K hotkey
+//
+// Idempotent: re-creating overwrites the existing shortcuts.
 func createDesktopShortcut() error {
 	exe, err := os.Executable()
 	if err != nil {
@@ -795,13 +800,22 @@ func createDesktopShortcut() error {
 	ps := fmt.Sprintf(`
 $ws = New-Object -ComObject WScript.Shell
 $desktop = [Environment]::GetFolderPath('Desktop')
-$lnk = $ws.CreateShortcut(("$desktop\Kiosk Exit Guard.lnk"))
-$lnk.TargetPath = '%s'
-$lnk.WorkingDirectory = '%s'
-$lnk.IconLocation = ('%s' + ',0')
-$lnk.Description = 'Kiosk Exit Guard - kiosk lockdown utility'
-$lnk.Save()
-`, exeQ, workDir, exeQ)
+
+$lnk1 = $ws.CreateShortcut(("$desktop\Kiosk Exit Guard.lnk"))
+$lnk1.TargetPath = '%s'
+$lnk1.WorkingDirectory = '%s'
+$lnk1.IconLocation = ('%s' + ',0')
+$lnk1.Description = 'Kiosk Exit Guard - kiosk lockdown controller'
+$lnk1.Save()
+
+$lnk2 = $ws.CreateShortcut(("$desktop\Pause SK Filter.lnk"))
+$lnk2.TargetPath = '%s'
+$lnk2.Arguments = '--pause'
+$lnk2.WorkingDirectory = '%s'
+$lnk2.IconLocation = ('%s' + ',0')
+$lnk2.Description = 'Pause the SK Filter for a set time'
+$lnk2.Save()
+`, exeQ, workDir, exeQ, exeQ, workDir, exeQ)
 	cmd := exec.Command("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps)
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -1531,6 +1545,95 @@ func promptAndPause() {
 	))
 }
 
+// ---------- desktop button (--pause) handler ----------
+
+// runPauseInvocation is the entry point for `kiosk-exit-guard.exe --pause`,
+// which is wired to the "Pause SK Filter" desktop shortcut. It performs
+// the same flow as the Ctrl+Shift+Alt+K hotkey would inside the running
+// controller, but as a fresh process — password modal, duration picker,
+// state changes — and exits.
+//
+// The running controller picks up the change via its file-watching
+// goroutine (see syncFilterStateLoop) and updates its in-memory state to
+// match (kills the kiosk child, etc.).
+func runPauseInvocation() {
+	migrateLegacyHash()
+	hash, err := loadHash()
+	if err != nil || len(hash) == 0 {
+		_ = zenity.Error(
+			"SK Filter is not set up yet. Run kiosk-exit-guard.exe first to complete setup.",
+			zenity.Title("SK Filter"),
+		)
+		os.Exit(1)
+	}
+	storedHash = hash
+
+	if !askPasswordModal(
+		"Pause the SK Filter?",
+		"Edge will be allowed and the kiosk will close for the duration you choose. The filter resumes automatically when the timer ends.",
+	) {
+		showFailedToast()
+		os.Exit(1)
+	}
+	dur, accepted := askPauseDuration()
+	if !accepted || dur <= 0 {
+		return
+	}
+
+	until := time.Now().Add(dur)
+	setPauseUntil(until)
+
+	// Tear down lockdown state directly. The controller's sync loop will
+	// also update its in-memory filterMode within 2s, but doing the
+	// teardown here means the user gets immediate relief without
+	// waiting for the polling tick.
+	removeLockdown()
+	removeIFEOBlock("chrome.exe")
+	removeIFEOBlock("msedge.exe")
+
+	// Kill the kiosk WebView2 child if it's running.
+	if p := findOurWebViewChild(); p != nil {
+		_ = p.Kill()
+	}
+
+	showTimedInfo(fmt.Sprintf(
+		"SK Filter paused.\nEdge is allowed; kiosk closed.\nResumes at %s.",
+		until.Format("3:04 PM"),
+	))
+}
+
+// syncFilterStateLoop runs in the controller process and reconciles
+// in-memory filterMode + lockdown state with the pause file on disk. The
+// pause file is the source of truth across processes — when a separate
+// --pause invocation writes to it, this loop picks the change up within
+// ~2 seconds and reflects it in the controller (kills the kiosk child,
+// flips the in-memory flag so the hook stops blocking keystrokes, etc.).
+func syncFilterStateLoop() {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		pu := loadPauseFromDisk()
+		paused := !pu.IsZero() && time.Now().Before(pu)
+		switch {
+		case paused && filterMode.Load():
+			// External --pause invocation just started a pause. Mirror
+			// it into the controller's state.
+			pauseUntilNano.Store(pu.UnixNano())
+			schedulePauseExpiry(time.Until(pu))
+			filterMode.Store(false)
+			saveFilterModeToDisk(false)
+			removeLockdown()
+			removeIFEOBlock("chrome.exe")
+			removeIFEOBlock("msedge.exe")
+			killWebViewChild()
+		case !paused && !filterMode.Load():
+			// Pause window ended (timer fired in another process, or the
+			// file was manually cleared). Bring the lockdown back.
+			autoReenableFilterMode()
+		}
+	}
+}
+
 // ---------- main ----------
 
 func main() {
@@ -1545,6 +1648,15 @@ func main() {
 	// WebView2 child mode — render the kiosk window and exit when closed.
 	if len(os.Args) > 1 && os.Args[1] == "--webview" {
 		runWebViewKiosk(loadKioskURL())
+		return
+	}
+
+	// --pause: triggered by the "Pause SK Filter" desktop shortcut.
+	// Shows the password modal + duration picker in a fresh elevated
+	// process, writes the pause state, and exits. The running controller
+	// picks the change up via syncFilterStateLoop.
+	if len(os.Args) > 1 && os.Args[1] == "--pause" {
+		runPauseInvocation()
 		return
 	}
 
@@ -1656,6 +1768,7 @@ func main() {
 	defer killWebViewChild()
 
 	go runWatchdog()
+	go syncFilterStateLoop()
 
 	cb := syscall.NewCallback(hookCallback)
 	h, _, callErr := procSetWindowHookExW.Call(uintptr(whKeyboardLL), cb, 0, 0)
