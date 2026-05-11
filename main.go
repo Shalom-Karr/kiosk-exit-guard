@@ -59,6 +59,8 @@ const (
 	wmClose      = 0x0010
 
 	vkF4     = 0x73
+	vkF5     = 0x74
+	vkR      = 0x52
 	vkK      = 0x4B
 	vkLMenu  = 0xA4
 	vkRMenu  = 0xA5
@@ -145,6 +147,8 @@ var (
 	procGetSystemMetrics    = user32.NewProc("GetSystemMetrics")
 	procShowWindow          = user32.NewProc("ShowWindow")
 	procSendInput           = user32.NewProc("SendInput")
+	procSetForegroundWindow = user32.NewProc("SetForegroundWindow")
+	procBringWindowToTop    = user32.NewProc("BringWindowToTop")
 
 	storedHash []byte
 	promptOpen atomic.Bool
@@ -528,6 +532,39 @@ func isModifierVK(vk uint32) bool {
 		return true
 	}
 	return false
+}
+
+// isAlwaysAllowedCombo lets specific keystrokes through even when the
+// filter is active. Today: Ctrl+R and F5 are reload shortcuts the kiosk
+// page should respect (admin can refresh the display without entering
+// the password). Add more here as legitimate kiosk use cases emerge.
+func isAlwaysAllowedCombo(vk uint32) bool {
+	if vk == vkF5 && !ctrlDown() && !altDown() && !winDown() {
+		return true
+	}
+	if vk == vkR && ctrlDown() && !altDown() && !winDown() {
+		return true
+	}
+	return false
+}
+
+// makeWindowTopmostFront forces a window to the top of the z-order and
+// gives it focus. Used for the password modal so it appears over the
+// fullscreen topmost WebView2 kiosk window (which would otherwise hide
+// it — both are HWND_TOPMOST and the kiosk was activated first).
+func makeWindowTopmostFront(hwnd uintptr) {
+	if hwnd == 0 {
+		return
+	}
+	const (
+		swpNoMove = 0x0002
+		swpNoSize = 0x0001
+		swpShow   = 0x0040
+	)
+	procSetWindowPos.Call(hwnd, hwndTopmost, 0, 0, 0, 0,
+		uintptr(swpNoMove|swpNoSize|swpShow))
+	procBringWindowToTop.Call(hwnd)
+	procSetForegroundWindow.Call(hwnd)
 }
 
 // ---------- SendInput re-injection ----------
@@ -919,6 +956,15 @@ func runFirstRunWizard() *firstRunInput {
 	// runs so the input's value is correct on first paint.
 	w.Init(fmt.Sprintf(`window.__defaultURL = %q;`, loadKioskURL()))
 	w.SetHtml(firstRunHTML)
+	go func() {
+		for i := 0; i < 12; i++ {
+			time.Sleep(80 * time.Millisecond)
+			h := uintptr(w.Window())
+			if h != 0 {
+				makeWindowTopmostFront(h)
+			}
+		}
+	}()
 	w.Run()
 	return result
 }
@@ -1204,7 +1250,11 @@ func hookCallback(nCode int32, wParam uintptr, lParam uintptr) uintptr {
 				return 1
 			}
 			if filterMode.Load() {
-				if !isModifierVK(kb.VkCode) && (ctrlDown() || winDown() || altDown()) {
+				// Allowlist must come before the broad block so reload
+				// shortcuts get through to the kiosk.
+				if isAlwaysAllowedCombo(kb.VkCode) {
+					// fall through to procCallNextHookEx below
+				} else if !isModifierVK(kb.VkCode) && (ctrlDown() || winDown() || altDown()) {
 					// Capture the combo, swallow this event, and prompt
 					// for the password. On verification, re-inject the
 					// original combo so the user's intended action lands.
@@ -1367,6 +1417,21 @@ func askPasswordModal(title, subtitle string) bool {
 
 	w.Init(fmt.Sprintf(`window.__title = %q; window.__subtitle = %q;`, title, subtitle))
 	w.SetHtml(passwordPromptHTML)
+	// The kiosk WebView2 window is fullscreen and HWND_TOPMOST. Without
+	// this, the password modal is created behind it and the user sees
+	// nothing happen. Forcing topmost + foreground brings our modal to
+	// the front. Done in a goroutine because Window() may not return a
+	// valid HWND until the WebView2 has finished setting itself up — we
+	// retry briefly while Run() spins up.
+	go func() {
+		for i := 0; i < 12; i++ {
+			time.Sleep(80 * time.Millisecond)
+			h := uintptr(w.Window())
+			if h != 0 {
+				makeWindowTopmostFront(h)
+			}
+		}
+	}()
 	w.Run()
 
 	if !ok {
