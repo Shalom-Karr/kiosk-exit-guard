@@ -31,6 +31,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -541,6 +543,114 @@ func showTimedInfo(text string) {
 
 func showFailedToast() { showTimedInfo("Wrong password.") }
 
+// ---------- WebView2 runtime auto-install ----------
+
+const (
+	// Microsoft's evergreen WebView2 bootstrapper. Tiny (~2 MB), downloads
+	// the real runtime as needed. Same URL the Microsoft docs publish.
+	webView2InstallerURL = "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
+
+	// WebView2 Runtime is detected via a "pv" version string under any of
+	// these EdgeUpdate keys. See https://learn.microsoft.com/microsoft-edge/webview2/concepts/distribution#detect-if-a-suitable-webview2-runtime-is-already-installed
+	webView2GUID = `{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}`
+)
+
+// isWebView2Installed returns true if any of the three canonical registry
+// locations report a non-empty WebView2 Runtime "pv" version.
+func isWebView2Installed() bool {
+	type loc struct {
+		root registry.Key
+		path string
+	}
+	locs := []loc{
+		{registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\EdgeUpdate\Clients\` + webView2GUID},
+		{registry.LOCAL_MACHINE, `SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\` + webView2GUID},
+		{registry.CURRENT_USER, `SOFTWARE\Microsoft\EdgeUpdate\Clients\` + webView2GUID},
+	}
+	for _, l := range locs {
+		k, err := registry.OpenKey(l.root, l.path, registry.QUERY_VALUE)
+		if err != nil {
+			continue
+		}
+		pv, _, perr := k.GetStringValue("pv")
+		k.Close()
+		if perr == nil && pv != "" && pv != "0.0.0.0" {
+			return true
+		}
+	}
+	return false
+}
+
+func downloadFile(url, dest string) error {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", "kiosk-exit-guard")
+	client := &http.Client{Timeout: 5 * time.Minute}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("http %d", resp.StatusCode)
+	}
+	f, err := os.Create(dest)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = io.Copy(f, resp.Body)
+	return err
+}
+
+// installWebView2Runtime downloads the evergreen bootstrapper to TEMP and
+// runs it silently. Bootstrapper handles the actual runtime download itself.
+func installWebView2Runtime() error {
+	tmpPath := filepath.Join(os.TempDir(), "MicrosoftEdgeWebview2Setup.exe")
+	if err := downloadFile(webView2InstallerURL, tmpPath); err != nil {
+		return fmt.Errorf("download bootstrapper: %w", err)
+	}
+	defer os.Remove(tmpPath)
+	cmd := exec.Command(tmpPath, "/silent", "/install")
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("bootstrapper exit: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// ensureWebView2Installed is called by the controller before doing anything
+// that needs the runtime. If missing, shows a non-blocking progress dialog
+// and runs the silent install. On Win10/11 client SKUs this is a no-op
+// (runtime ships pre-installed); on Server SKUs and stripped images it does
+// the real work.
+func ensureWebView2Installed() error {
+	if isWebView2Installed() {
+		return nil
+	}
+	// Spawn the "installing…" dialog asynchronously. Cancel its context
+	// once the install completes so the dialog auto-closes.
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		_ = zenity.Info(
+			"WebView2 Runtime is missing — installing now.\nThis takes about 30 seconds and runs in the background.\n\nDo not close this window.",
+			zenity.Title("kiosk-exit-guard — installing WebView2"),
+			zenity.Context(ctx),
+		)
+	}()
+	err := installWebView2Runtime()
+	cancel()
+	if err != nil {
+		return err
+	}
+	if !isWebView2Installed() {
+		return fmt.Errorf("bootstrapper exited cleanly but runtime still not detected")
+	}
+	return nil
+}
+
 // ---------- WebView2 kiosk window ----------
 
 func makeFullscreenTopmost(hwnd uintptr) {
@@ -894,6 +1004,17 @@ func main() {
 		}
 		_ = zenity.Info("Kiosk URL updated.", zenity.Title("kiosk-exit-guard"))
 		return
+	}
+
+	// Ensure WebView2 Runtime is available before we touch anything else.
+	// Auto-installs silently if missing (no-op on Win10/11 client; does
+	// the real work on Server SKUs / stripped images). If install fails,
+	// continue without — the --webview child will surface the error.
+	if err := ensureWebView2Installed(); err != nil {
+		_ = zenity.Warning(
+			fmt.Sprintf("WebView2 auto-install failed: %v\n\nDownload manually from https://developer.microsoft.com/microsoft-edge/webview2/ and re-launch kiosk-exit-guard.", err),
+			zenity.Title("kiosk-exit-guard"),
+		)
 	}
 
 	hash, err := loadHash()
