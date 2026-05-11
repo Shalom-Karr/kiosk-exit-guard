@@ -1,23 +1,30 @@
 //go:build windows && amd64
 
-// kiosk-exit-guard is a single-binary Windows kiosk lockdown utility built
-// for Windows 11 Home where Assigned Access isn't available.
+// kiosk-exit-guard v0.4.0 — Windows 11 Home kiosk lockdown utility.
 //
-// Filter mode toggle (Ctrl+Shift+Alt+K, password-gated):
+// Architecture:
 //
-//   - OFF (default): keys pass through; registry policies are clean; the
-//     Chrome kiosk watchdog is paused.
-//   - ON: Alt+F4 prompts for the password; Win+R, Win+E, Win+D, and
-//     Ctrl+Shift+Esc are silently swallowed; Task Manager and Run dialog
-//     disabled via HKCU policy registry; a 30s-tick watchdog auto-launches
-//     Chrome in --kiosk mode pointing at the configured URL and re-launches
-//     it if killed.
+//   - The exe runs as a background controller (LL keyboard hook, registry
+//     lockdown, kiosk-window supervisor). When filter mode is ON it launches
+//     itself with the --webview flag as a child process to display the
+//     kiosk page via embedded WebView2 (no Chrome dependency).
+//   - First-run setup writes the bcrypt password hash and the kiosk URL to
+//     HKLM\Software\KioskExitGuard (admin-write, can't be wiped by a
+//     standard kiosk user). It also uninstalls Chrome silently and installs
+//     an IFEO Debugger redirect on chrome.exe / msedge.exe so neither can
+//     be launched as a kiosk-escape.
+//   - When invoked via the IFEO Debugger redirect (Windows passes us a
+//     --silent-exit flag followed by the target exe path), we exit
+//     immediately — Chrome/Edge launches just silently fail.
 //
-// Toggling filter mode OFF prompts the admin for a pause duration. When
-// the pause expires, filter mode automatically flips back ON.
+// Flag summary:
 //
-// Config: kiosk URL is read from kiosk.url next to the exe; defaults to
-// https://skluach.pages.dev/CMH/ if the file is missing or empty.
+//	(none)                  normal run — controller + hook + watchdog
+//	--webview               render the WebView2 kiosk window
+//	--silent-exit ...       no-op (IFEO Debugger redirect handler)
+//	--set-password          change the password
+//	--set-url               change the kiosk URL
+//	--reset                 password-gated; clears registry lockdown + filter state
 package main
 
 import (
@@ -34,13 +41,14 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/jchv/go-webview2"
 	"github.com/ncruces/zenity"
 	"github.com/shirou/gopsutil/v4/process"
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/sys/windows/registry"
 )
 
-// ---------- Win32 constants ----------
+// ---------- constants ----------
 
 const (
 	whKeyboardLL = 13
@@ -49,11 +57,7 @@ const (
 	wmClose      = 0x0010
 
 	vkF4     = 0x73
-	vkR      = 0x52
-	vkE      = 0x45
-	vkD      = 0x44
 	vkK      = 0x4B
-	vkEscape = 0x1B
 	vkLMenu  = 0xA4
 	vkRMenu  = 0xA5
 	vkLWin   = 0x5B
@@ -65,23 +69,22 @@ const (
 
 	llkhfInject = 0x10
 
+	// HKCU policy paths used for Task Manager + Run dialog lockdown
 	regPolicySystem   = `Software\Microsoft\Windows\CurrentVersion\Policies\System`
 	regPolicyExplorer = `Software\Microsoft\Windows\CurrentVersion\Policies\Explorer`
 	regDisableTaskMgr = "DisableTaskMgr"
 	regNoRun          = "NoRun"
 
-	// HKLM key + value where the bcrypt password hash lives. HKLM means
-	// only an admin / elevated process can write or delete the value, so a
-	// kiosk user with a standard account can't bypass the password by
-	// deleting a config file.
 	regAppKey    = `Software\KioskExitGuard`
 	regHashValue = "PasswordHash"
 	regURLValue  = "KioskURL"
 
+	ifeoBase = `Software\Microsoft\Windows NT\CurrentVersion\Image File Execution Options`
+
 	taskName         = "KioskExitGuard"
 	stateFileName    = "filter_mode.state"
-	hashFileName     = "password.hash" // legacy — migrated to HKLM on startup
-	kioskURLFileName = "kiosk.url"
+	hashFileName     = "password.hash" // legacy file — migrated to HKLM
+	kioskURLFileName = "kiosk.url"     // legacy file — migrated to HKLM
 	pauseFileName    = "pause_until.state"
 
 	defaultKioskURL  = "https://skluach.pages.dev/CMH/"
@@ -90,6 +93,23 @@ const (
 
 	createNoWindow = 0x08000000
 )
+
+// Win32 constants for fullscreen + topmost window manipulation
+const (
+	// GWL_STYLE / GWL_EXSTYLE are negative; encode their two's-complement
+	// bit pattern as uint32 so we can pass them through Call() cleanly.
+	gwlStyleU     uint32 = 0xFFFFFFF0 // -16 reinterpreted
+	gwlExStyleU   uint32 = 0xFFFFFFEC // -20 reinterpreted
+	wsPopup       uint32 = 0x80000000
+	wsVisible     uint32 = 0x10000000
+	wsExTopmost   uint32 = 0x00000008
+	swpShowWindow        = 0x0040
+	swpFrameChang        = 0x0020
+	smCXScreen           = 0
+	smCYScreen           = 1
+)
+
+var hwndTopmost = ^uintptr(0) // (HWND)-1
 
 type kbdLLHookStruct struct {
 	VkCode      uint32
@@ -111,19 +131,23 @@ type msgT struct {
 var (
 	user32 = syscall.NewLazyDLL("user32.dll")
 
-	procSetWindowsHookExW   = user32.NewProc("SetWindowsHookExW")
+	procSetWindowHookExW    = user32.NewProc("SetWindowsHookExW")
 	procUnhookWindowsHookEx = user32.NewProc("UnhookWindowsHookEx")
 	procCallNextHookEx      = user32.NewProc("CallNextHookEx")
 	procGetMessageW         = user32.NewProc("GetMessageW")
 	procGetAsyncKeyState    = user32.NewProc("GetAsyncKeyState")
 	procGetForegroundWindow = user32.NewProc("GetForegroundWindow")
 	procPostMessageW        = user32.NewProc("PostMessageW")
+	procSetWindowLongPtrW   = user32.NewProc("SetWindowLongPtrW")
+	procSetWindowPos        = user32.NewProc("SetWindowPos")
+	procGetSystemMetrics    = user32.NewProc("GetSystemMetrics")
+	procShowWindow          = user32.NewProc("ShowWindow")
 
 	storedHash []byte
 	promptOpen atomic.Bool
 	filterMode atomic.Bool
 
-	pauseUntilNano atomic.Int64 // 0 = not paused; else unix nano of expiry
+	pauseUntilNano atomic.Int64
 
 	pauseTimerMu sync.Mutex
 	pauseTimer   *time.Timer
@@ -144,11 +168,8 @@ func statePath() (string, error)    { return nextToExe(stateFileName) }
 func kioskURLPath() (string, error) { return nextToExe(kioskURLFileName) }
 func pausePath() (string, error)    { return nextToExe(pauseFileName) }
 
-// ---------- password storage ----------
+// ---------- HKLM password / URL storage ----------
 
-// loadHashFromRegistry reads the bcrypt password hash out of HKLM. Returns
-// (nil, nil) when no value is set — callers should treat that as "not
-// configured" rather than an error.
 func loadHashFromRegistry() ([]byte, error) {
 	k, err := registry.OpenKey(registry.LOCAL_MACHINE, regAppKey, registry.QUERY_VALUE)
 	if err != nil {
@@ -177,9 +198,28 @@ func saveHashToRegistry(hash []byte) error {
 	return k.SetBinaryValue(regHashValue, hash)
 }
 
-// migrateLegacyHash moves a v0.2.x-style password.hash file into HKLM and
-// deletes the file. Idempotent — does nothing if file is absent or registry
-// already populated.
+func loadKioskURLFromRegistry() string {
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, regAppKey, registry.QUERY_VALUE)
+	if err != nil {
+		return ""
+	}
+	defer k.Close()
+	v, _, err := k.GetStringValue(regURLValue)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(v)
+}
+
+func saveKioskURLToRegistry(url string) error {
+	k, _, err := registry.CreateKey(registry.LOCAL_MACHINE, regAppKey, registry.SET_VALUE)
+	if err != nil {
+		return err
+	}
+	defer k.Close()
+	return k.SetStringValue(regURLValue, url)
+}
+
 func migrateLegacyHash() {
 	p, err := hashPath()
 	if err != nil {
@@ -191,7 +231,6 @@ func migrateLegacyHash() {
 	}
 	regHash, _ := loadHashFromRegistry()
 	if len(regHash) > 0 {
-		// Registry wins; remove stale file.
 		_ = os.Remove(p)
 		return
 	}
@@ -236,6 +275,40 @@ func setPassword() error {
 		return err
 	}
 	return saveHashToRegistry(hash)
+}
+
+func loadKioskURL() string {
+	if u := loadKioskURLFromRegistry(); u != "" {
+		return u
+	}
+	if p, err := kioskURLPath(); err == nil {
+		if data, err := os.ReadFile(p); err == nil {
+			if u := strings.TrimSpace(string(data)); u != "" {
+				return u
+			}
+		}
+	}
+	return defaultKioskURL
+}
+
+func promptForKioskURL() (string, error) {
+	current := loadKioskURL()
+	url, err := zenity.Entry(
+		"Enter the kiosk URL.\nThis is the page WebView2 will open in fullscreen.",
+		zenity.Title("kiosk-exit-guard — kiosk URL"),
+		zenity.EntryText(current),
+	)
+	if err != nil {
+		return "", err
+	}
+	url = strings.TrimSpace(url)
+	if url == "" {
+		url = current
+	}
+	if err := saveKioskURLToRegistry(url); err != nil {
+		return "", err
+	}
+	return url, nil
 }
 
 // ---------- filter mode + pause persistence ----------
@@ -309,7 +382,7 @@ func setPauseUntil(t time.Time) {
 	savePauseToDisk(t)
 }
 
-// ---------- registry lockdown ----------
+// ---------- registry lockdown (HKCU) ----------
 
 func setPolicyDWORD(subkey, name string, value uint32) error {
 	k, _, err := registry.CreateKey(registry.CURRENT_USER, subkey, registry.SET_VALUE)
@@ -346,6 +419,73 @@ func removeLockdown() {
 	_ = deletePolicyValue(regPolicyExplorer, regNoRun)
 }
 
+// ---------- IFEO browser launch block ----------
+
+// setIFEOBlock makes any attempt to launch targetExe re-launch us with the
+// --silent-exit flag (we exit immediately). Standard kiosk user cannot edit
+// HKLM, so they can't remove the block.
+func setIFEOBlock(targetExe string) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	keyPath := ifeoBase + `\` + targetExe
+	k, _, err := registry.CreateKey(registry.LOCAL_MACHINE, keyPath, registry.SET_VALUE)
+	if err != nil {
+		return err
+	}
+	defer k.Close()
+	return k.SetStringValue("Debugger", fmt.Sprintf(`"%s" --silent-exit`, exe))
+}
+
+func removeIFEOBlock(targetExe string) {
+	keyPath := ifeoBase + `\` + targetExe
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, keyPath, registry.SET_VALUE)
+	if err != nil {
+		return
+	}
+	defer k.Close()
+	_ = k.DeleteValue("Debugger")
+}
+
+func applyBrowserBlocks() {
+	_ = setIFEOBlock("chrome.exe")
+	_ = setIFEOBlock("msedge.exe")
+}
+
+// ---------- Chrome silent uninstall ----------
+
+// uninstallChrome reads Chrome's UninstallString from the registry and
+// runs it with --force-uninstall flags. Returns nil if Chrome isn't
+// installed (treated as success since the end state is what we wanted).
+func uninstallChrome() error {
+	candidates := []struct {
+		Root registry.Key
+		Path string
+	}{
+		{registry.LOCAL_MACHINE, `Software\Microsoft\Windows\CurrentVersion\Uninstall\Google Chrome`},
+		{registry.LOCAL_MACHINE, `Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Google Chrome`},
+		{registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Uninstall\Google Chrome`},
+	}
+	for _, c := range candidates {
+		k, err := registry.OpenKey(c.Root, c.Path, registry.QUERY_VALUE)
+		if err != nil {
+			continue
+		}
+		uninstallStr, _, err := k.GetStringValue("UninstallString")
+		k.Close()
+		if err != nil || uninstallStr == "" {
+			continue
+		}
+		cmd := exec.Command("cmd", "/C", uninstallStr+" --force-uninstall --do-not-launch-chrome")
+		cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+		if err := cmd.Run(); err == nil {
+			return nil
+		}
+	}
+	return nil // not found is fine
+}
+
 // ---------- self-install via schtasks ----------
 
 func installStartupTask() error {
@@ -379,12 +519,10 @@ func winDown() bool   { return keyDown(vkLWin) || keyDown(vkRWin) }
 func ctrlDown() bool  { return keyDown(vkLCtrl) || keyDown(vkRCtrl) }
 func shiftDown() bool { return keyDown(vkLShift) || keyDown(vkRShift) }
 
-func shouldSilentlyBlock(vk uint32) bool {
+func isModifierVK(vk uint32) bool {
 	switch vk {
-	case vkR, vkE, vkD:
-		return winDown()
-	case vkEscape:
-		return ctrlDown() && shiftDown()
+	case vkLCtrl, vkRCtrl, vkLMenu, vkRMenu, vkLWin, vkRWin, vkLShift, vkRShift:
+		return true
 	}
 	return false
 }
@@ -403,142 +541,124 @@ func showTimedInfo(text string) {
 
 func showFailedToast() { showTimedInfo("Wrong password.") }
 
-// ---------- chrome watchdog ----------
+// ---------- WebView2 kiosk window ----------
 
-func loadKioskURLFromRegistry() string {
-	k, err := registry.OpenKey(registry.LOCAL_MACHINE, regAppKey, registry.QUERY_VALUE)
-	if err != nil {
-		return ""
-	}
-	defer k.Close()
-	v, _, err := k.GetStringValue(regURLValue)
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(v)
+func makeFullscreenTopmost(hwnd uintptr) {
+	cx, _, _ := procGetSystemMetrics.Call(smCXScreen)
+	cy, _, _ := procGetSystemMetrics.Call(smCYScreen)
+	// GWL_STYLE / GWL_EXSTYLE are negative int32 — cast through uint32
+	// to preserve the sign-extended bit pattern as uintptr.
+	procSetWindowLongPtrW.Call(hwnd, uintptr(gwlStyleU), uintptr(wsPopup|wsVisible))
+	procSetWindowLongPtrW.Call(hwnd, uintptr(gwlExStyleU), uintptr(wsExTopmost))
+	procSetWindowPos.Call(hwnd, hwndTopmost, 0, 0, cx, cy, uintptr(swpShowWindow|swpFrameChang))
 }
 
-func saveKioskURLToRegistry(url string) error {
-	k, _, err := registry.CreateKey(registry.LOCAL_MACHINE, regAppKey, registry.SET_VALUE)
-	if err != nil {
-		return err
+// runWebViewKiosk renders the kiosk URL in a fullscreen WebView2 window.
+// Blocks until the window is destroyed.
+func runWebViewKiosk(url string) {
+	w := webview2.NewWithOptions(webview2.WebViewOptions{
+		Debug:     false,
+		AutoFocus: true,
+		WindowOptions: webview2.WindowOptions{
+			Title:  "Kiosk",
+			Width:  1024,
+			Height: 768,
+			Center: false,
+		},
+	})
+	if w == nil {
+		_ = zenity.Error(
+			"WebView2 Runtime is not installed.\n\nInstall it from https://developer.microsoft.com/microsoft-edge/webview2/ and re-run the kiosk.",
+			zenity.Title("kiosk-exit-guard — webview"),
+		)
+		os.Exit(1)
 	}
-	defer k.Close()
-	return k.SetStringValue(regURLValue, url)
+	defer w.Destroy()
+
+	hwnd := w.Window()
+	makeFullscreenTopmost(uintptr(hwnd))
+
+	// Lock navigation to the kiosk URL only. Anything else gets canceled
+	// at the JS level (and again at the navigation event in a real
+	// hardened build, but this catches all anchor clicks).
+	w.Init(fmt.Sprintf(`
+		(function() {
+			var kioskPrefix = %q;
+			document.addEventListener('click', function(e) {
+				var a = e.target.closest && e.target.closest('a');
+				if (a && a.href && a.href.indexOf(kioskPrefix) !== 0) {
+					e.preventDefault();
+					e.stopPropagation();
+				}
+			}, true);
+		})();
+	`, url))
+
+	w.Navigate(url)
+	w.Run() // blocks until window destroyed
 }
 
-// loadKioskURL: registry first, then legacy kiosk.url file next to exe,
-// then the default. Lets v0.2.x users keep their file-based config until
-// they re-run setup (which will write the URL into HKLM).
-func loadKioskURL() string {
-	if u := loadKioskURLFromRegistry(); u != "" {
-		return u
+// ---------- watchdog (manages the WebView2 child) ----------
+
+func findOurWebViewChild() *process.Process {
+	exe, _ := os.Executable()
+	exeBase := strings.ToLower(filepath.Base(exe))
+	procs, err := process.Processes()
+	if err != nil {
+		return nil
 	}
-	if p, err := kioskURLPath(); err == nil {
-		if data, err := os.ReadFile(p); err == nil {
-			if u := strings.TrimSpace(string(data)); u != "" {
-				return u
-			}
+	selfPID := int32(os.Getpid())
+	for _, p := range procs {
+		if p.Pid == selfPID {
+			continue
 		}
-	}
-	return defaultKioskURL
-}
-
-// promptForKioskURL asks the admin which URL the watchdog should keep open
-// in Chrome. Pre-filled with the existing value (registry, file, or default)
-// so an empty submission keeps the previous URL.
-func promptForKioskURL() (string, error) {
-	current := loadKioskURL()
-	url, err := zenity.Entry(
-		"Enter the kiosk URL.\nThis is the page Chrome will open in --kiosk mode and the watchdog will keep alive.",
-		zenity.Title("kiosk-exit-guard — kiosk URL"),
-		zenity.EntryText(current),
-	)
-	if err != nil {
-		return "", err
-	}
-	url = strings.TrimSpace(url)
-	if url == "" {
-		url = current
-	}
-	if err := saveKioskURLToRegistry(url); err != nil {
-		return "", err
-	}
-	return url, nil
-}
-
-func findChrome() string {
-	candidates := []string{
-		filepath.Join(os.Getenv("ProgramFiles"), "Google", "Chrome", "Application", "chrome.exe"),
-		filepath.Join(os.Getenv("ProgramFiles(x86)"), "Google", "Chrome", "Application", "chrome.exe"),
-		filepath.Join(os.Getenv("LocalAppData"), "Google", "Chrome", "Application", "chrome.exe"),
-	}
-	for _, p := range candidates {
-		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+		name, _ := p.Name()
+		if !strings.EqualFold(name, exeBase) {
+			continue
+		}
+		cmd, err := p.Cmdline()
+		if err != nil {
+			continue
+		}
+		if strings.Contains(cmd, "--webview") {
 			return p
 		}
 	}
-	return ""
+	return nil
 }
 
-func launchKioskChrome(chromePath, kioskURL string) {
-	cmd := exec.Command(chromePath, "--kiosk", kioskURL, "--no-first-run")
+func launchWebViewChild() {
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	cmd := exec.Command(exe, "--webview")
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
 	_ = cmd.Start()
 }
 
-// watchdogTick checks Chrome state and re-launches the kiosk URL if needed.
-// Mirrors the logic of the original Luach Kiosk Watchdog PowerShell script.
-func watchdogTick(chromePath, kioskURL string) {
-	if chromePath == "" {
-		return
-	}
-	procs, err := process.Processes()
-	if err != nil {
-		return
-	}
-	var chromeProcs []*process.Process
-	kioskAlive := false
-	for _, p := range procs {
-		name, _ := p.Name()
-		if !strings.EqualFold(name, "chrome.exe") {
-			continue
-		}
-		chromeProcs = append(chromeProcs, p)
-		cmd, cerr := p.Cmdline()
-		if cerr != nil {
-			continue
-		}
-		if strings.Contains(cmd, "--kiosk") && strings.Contains(cmd, kioskURL) {
-			kioskAlive = true
-		}
-	}
-	if len(chromeProcs) == 0 {
-		launchKioskChrome(chromePath, kioskURL)
-		return
-	}
-	if !kioskAlive {
-		for _, p := range chromeProcs {
-			_ = p.Kill()
-		}
-		time.Sleep(2 * time.Second)
-		launchKioskChrome(chromePath, kioskURL)
+func killWebViewChild() {
+	if p := findOurWebViewChild(); p != nil {
+		_ = p.Kill()
 	}
 }
 
-func runWatchdog(kioskURL string) {
-	chromePath := findChrome()
+func watchdogTick() {
+	if filterMode.Load() && !isPaused() {
+		if findOurWebViewChild() == nil {
+			launchWebViewChild()
+		}
+	} else {
+		killWebViewChild()
+	}
+}
+
+func runWatchdog() {
 	ticker := time.NewTicker(watchdogInterval)
 	defer ticker.Stop()
-	// Fire one immediately so kiosk Chrome appears as soon as filter mode
-	// is enabled, rather than waiting up to 30s.
-	if filterMode.Load() && !isPaused() {
-		watchdogTick(chromePath, kioskURL)
-	}
+	watchdogTick()
 	for range ticker.C {
-		if filterMode.Load() && !isPaused() {
-			watchdogTick(chromePath, kioskURL)
-		}
+		watchdogTick()
 	}
 }
 
@@ -570,11 +690,10 @@ func autoReenableFilterMode() {
 	saveFilterModeToDisk(true)
 	setPauseUntil(time.Time{})
 	applyLockdown()
+	watchdogTick()
 	showTimedInfo("Pause expired.\nFilter mode is back ON.")
 }
 
-// askPauseDuration shows a radio-list of pause options and returns the
-// chosen duration. Zero return means "indefinite" (no auto-re-enable).
 func askPauseDuration() (time.Duration, bool) {
 	choices := []string{
 		"5 minutes",
@@ -590,7 +709,6 @@ func askPauseDuration() (time.Duration, bool) {
 		zenity.Title("kiosk-exit-guard — pause"),
 	)
 	if err != nil {
-		// User cancelled the pause prompt — don't toggle filter mode.
 		return 0, false
 	}
 	switch choice {
@@ -603,32 +721,18 @@ func askPauseDuration() (time.Duration, bool) {
 	case choices[3]:
 		return time.Hour, true
 	case choices[4]:
-		return 0, true // indefinite
+		return 0, true
 	}
 	return 5 * time.Minute, true
 }
 
 // ---------- hook callback ----------
 
-// isModifierVK reports whether vk is itself a modifier key. Modifier-only
-// presses (just Ctrl, just Alt, just Win, just Shift) should pass through
-// so that downstream checks see them and so the kiosk app's normal text
-// selection / accessibility features keep working when filter mode is off.
-func isModifierVK(vk uint32) bool {
-	switch vk {
-	case vkLCtrl, vkRCtrl, vkLMenu, vkRMenu, vkLWin, vkRWin, vkLShift, vkRShift:
-		return true
-	}
-	return false
-}
-
 func hookCallback(nCode int32, wParam uintptr, lParam uintptr) uintptr {
 	if nCode >= 0 && (wParam == wmKeyDown || wParam == wmSysKeyDown) {
 		kb := (*kbdLLHookStruct)(unsafe.Pointer(lParam))
 		injected := (kb.Flags & llkhfInject) != 0
 		if !injected {
-			// Toggle hotkey always works in either mode so the admin can
-			// always flip the lockdown.
 			if kb.VkCode == vkK && ctrlDown() && shiftDown() && altDown() {
 				if !promptOpen.Load() {
 					go promptAndToggleFilterMode()
@@ -636,19 +740,12 @@ func hookCallback(nCode int32, wParam uintptr, lParam uintptr) uintptr {
 				return 1
 			}
 			if filterMode.Load() {
-				// Alt+F4 = password-gated window close.
 				if kb.VkCode == vkF4 && altDown() {
 					if !promptOpen.Load() {
 						go promptAndMaybeExit()
 					}
 					return 1
 				}
-				// Blanket block: any non-modifier keystroke held with
-				// Ctrl, Win, or Alt is swallowed. This covers Ctrl+F4,
-				// Ctrl+W, Alt+Tab, Win+anything, etc. — every common
-				// keyboard escape from a kiosk app at once. Plain Shift
-				// is allowed so case-shift still works for any input
-				// fields the kiosk URL exposes.
 				if !isModifierVK(kb.VkCode) && (ctrlDown() || winDown() || altDown()) {
 					return 1
 				}
@@ -702,7 +799,6 @@ func promptAndToggleFilterMode() {
 	}
 	newState := !current
 	if !newState {
-		// Going OFF — ask for pause duration before flipping.
 		dur, accepted := askPauseDuration()
 		if !accepted {
 			return
@@ -715,7 +811,6 @@ func promptAndToggleFilterMode() {
 			cancelPauseExpiry()
 		}
 	} else {
-		// Going ON — clear any pending pause.
 		setPauseUntil(time.Time{})
 		cancelPauseExpiry()
 	}
@@ -723,9 +818,11 @@ func promptAndToggleFilterMode() {
 	saveFilterModeToDisk(newState)
 	if newState {
 		applyLockdown()
-		showTimedInfo("Filter mode ON.\nKiosk Chrome will launch and auto-restart.\nTask Manager, Run dialog, and escape shortcuts are blocked.")
+		watchdogTick()
+		showTimedInfo("Filter mode ON.\nKiosk window will launch.\nTask Manager, Run dialog, and escape shortcuts are blocked.")
 	} else {
 		removeLockdown()
+		killWebViewChild()
 		if pauseUntilNano.Load() != 0 {
 			showTimedInfo(fmt.Sprintf(
 				"Filter mode OFF.\nAuto-re-enable at %s.",
@@ -740,21 +837,28 @@ func promptAndToggleFilterMode() {
 // ---------- main ----------
 
 func main() {
-	// Migrate any v0.2.x password.hash file before anything else, so the
-	// hash is in HKLM by the time we need to verify a password.
+	// IFEO redirect handler: if Windows invoked us as the Debugger for a
+	// blocked exe, we get --silent-exit as argv[1] and the blocked exe's
+	// path appended. Exit silently so the user's launch attempt just
+	// fails with no error window.
+	if len(os.Args) > 1 && os.Args[1] == "--silent-exit" {
+		return
+	}
+
+	// WebView2 child mode — render the kiosk window and exit when closed.
+	if len(os.Args) > 1 && os.Args[1] == "--webview" {
+		runWebViewKiosk(loadKioskURL())
+		return
+	}
+
 	migrateLegacyHash()
 
 	switch {
 	case len(os.Args) > 1 && os.Args[1] == "--reset":
-		// Recovery flag — restores Task Manager / Run dialog and clears
-		// filter-mode state. Now password-gated so a curious kiosk user
-		// can't trigger it from a shortcut. If no password is configured,
-		// fail closed; an admin should wipe HKLM\Software\KioskExitGuard
-		// via regedit and re-run first-run setup.
 		hash, err := loadHash()
 		if err != nil || len(hash) == 0 {
 			_ = zenity.Error(
-				"No password configured. --reset requires a configured password.\n\nIf the exe is in a broken state, an admin can wipe HKLM\\Software\\KioskExitGuard via regedit and re-run kiosk-exit-guard.exe to start over.",
+				"No password configured. Wipe HKLM\\Software\\KioskExitGuard via regedit and re-run if needed.",
 				zenity.Title("kiosk-exit-guard"),
 			)
 			os.Exit(1)
@@ -765,10 +869,12 @@ func main() {
 			os.Exit(1)
 		}
 		removeLockdown()
+		removeIFEOBlock("chrome.exe")
+		removeIFEOBlock("msedge.exe")
 		saveFilterModeToDisk(false)
 		setPauseUntil(time.Time{})
 		_ = zenity.Info(
-			"Reset complete.\nLockdown cleared, filter mode reset to OFF.",
+			"Reset complete.\nRegistry lockdown cleared, browser IFEO blocks removed, filter mode reset.",
 			zenity.Title("kiosk-exit-guard"),
 		)
 		return
@@ -794,7 +900,7 @@ func main() {
 	firstRun := err != nil || len(hash) == 0
 	if firstRun {
 		_ = zenity.Info(
-			"First run. We'll create the admin password and then ask you which URL Chrome should open in kiosk mode.",
+			"First run.\n\nWe'll:\n  1. Set an admin password\n  2. Set the kiosk URL\n  3. Uninstall Chrome (if present)\n  4. Block Chrome and Edge launches via Image File Execution Options\n  5. Register a startup task",
 			zenity.Title("kiosk-exit-guard — first run"),
 		)
 		if perr := setPassword(); perr != nil {
@@ -808,33 +914,36 @@ func main() {
 		}
 		if _, perr := promptForKioskURL(); perr != nil {
 			_ = zenity.Warning(
-				fmt.Sprintf("Kiosk URL not saved:\n%v\n\nWill fall back to the default URL. You can change it later with --set-url.", perr),
+				fmt.Sprintf("Kiosk URL not saved: %v\nFalling back to default. Change later with --set-url.", perr),
 				zenity.Title("kiosk-exit-guard"),
 			)
 		}
+		_ = uninstallChrome()
+		applyBrowserBlocks()
 		if instErr := installStartupTask(); instErr != nil {
 			_ = zenity.Warning(
-				fmt.Sprintf("Auto-start install failed:\n%v\n\nThe exe is configured but won't launch automatically until you set up a Task Scheduler entry manually.", instErr),
+				fmt.Sprintf("Auto-start install failed: %v\nThe exe is configured but won't launch automatically until you create a Task Scheduler entry manually.", instErr),
 				zenity.Title("kiosk-exit-guard"),
 			)
 		} else {
 			_ = zenity.Info(
-				"Setup complete.\n\nA scheduled task named \""+taskName+"\" will launch kiosk-exit-guard at every user logon.\n\nUse Ctrl+Shift+Alt+K to toggle filter mode.\nFilter mode starts OFF.",
+				"Setup complete.\n\nChrome uninstalled.\nChrome and Edge launches are blocked at the OS level.\nScheduled task \""+taskName+"\" launches kiosk-exit-guard at every user logon.\n\nUse Ctrl+Shift+Alt+K to toggle filter mode.\nFilter mode starts OFF.",
 				zenity.Title("kiosk-exit-guard"),
 			)
 		}
+	} else {
+		// Make sure IFEO blocks survive — re-apply on every launch in case
+		// they were somehow cleared (e.g. by a Windows feature update).
+		applyBrowserBlocks()
 	}
 	storedHash = hash
 
-	// Restore persisted state.
 	filterMode.Store(loadFilterModeFromDisk())
 	if pu := loadPauseFromDisk(); !pu.IsZero() {
 		if time.Now().Before(pu) {
 			pauseUntilNano.Store(pu.UnixNano())
 			schedulePauseExpiry(time.Until(pu))
 		} else {
-			// Stored pause already expired during downtime — fire the
-			// auto-re-enable path so registry + state line up.
 			autoReenableFilterMode()
 		}
 	}
@@ -843,13 +952,12 @@ func main() {
 	}
 	defer removeLockdown()
 	defer cancelPauseExpiry()
+	defer killWebViewChild()
 
-	// Start the Chrome kiosk watchdog. It checks filterMode + pause state
-	// on every tick so it only acts when filter mode is actually engaged.
-	go runWatchdog(loadKioskURL())
+	go runWatchdog()
 
 	cb := syscall.NewCallback(hookCallback)
-	h, _, callErr := procSetWindowsHookExW.Call(uintptr(whKeyboardLL), cb, 0, 0)
+	h, _, callErr := procSetWindowHookExW.Call(uintptr(whKeyboardLL), cb, 0, 0)
 	if h == 0 {
 		removeLockdown()
 		_ = zenity.Error(
