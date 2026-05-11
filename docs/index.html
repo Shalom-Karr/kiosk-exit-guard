@@ -36,7 +36,6 @@
     padding: 0.2rem 0.7rem; border-radius: 999px; font-size: 0.78rem; font-weight: 600;
     margin-left: 0.6rem; vertical-align: middle; letter-spacing: 0.02em; }
 
-  /* Hero CTA */
   .download-card {
     background: linear-gradient(180deg, var(--panel-2), var(--panel));
     border: 1px solid var(--border);
@@ -59,14 +58,12 @@
   .btn:active { transform: translateY(0); }
   .btn svg { width: 18px; height: 18px; }
 
-  /* TOC across the top */
   .toc { display: flex; flex-wrap: wrap; gap: 0.5rem 1.25rem;
     font-size: 0.875rem; color: var(--muted); margin: 0 0 3rem;
     padding-bottom: 1.25rem; border-bottom: 1px solid var(--border); }
   .toc a { color: var(--muted); text-decoration: none; }
   .toc a:hover { color: var(--accent); }
 
-  /* Sections */
   h2 { font-size: 1.5rem; margin: 3rem 0 1rem; letter-spacing: -0.015em; }
   h2:first-of-type { margin-top: 0; }
   h3 { font-size: 1.1rem; margin: 1.75rem 0 0.65rem; color: var(--ink); }
@@ -85,7 +82,6 @@
   p code, li code, td code, th code { background: rgba(255,255,255,0.07);
     padding: 0.1rem 0.4rem; border-radius: 4px; font-size: 0.88em; }
 
-  /* Feature grid */
   .feature-grid { display: grid; gap: 0.85rem; grid-template-columns: 1fr; margin: 0 0 1.5rem; }
   @media (min-width: 640px) { .feature-grid { grid-template-columns: 1fr 1fr; } }
   .feature {
@@ -96,8 +92,9 @@
   .feature p { margin: 0; font-size: 0.875rem; color: var(--muted); }
   .feature .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); display: inline-block; }
   .feature .dot.new { background: var(--good); box-shadow: 0 0 0 4px rgba(34, 197, 94, 0.15); }
+  .feature .badge { font-size: 0.7rem; font-weight: 700; color: var(--good); letter-spacing: 0.04em;
+    text-transform: uppercase; margin-left: auto; }
 
-  /* State table */
   .state-table { width: 100%; border-collapse: collapse;
     margin: 0 0 1rem; font-size: 0.92rem;
     background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
@@ -110,7 +107,6 @@
   .state-off { color: var(--muted); }
   .state-blocked { color: var(--bad); }
 
-  /* Architecture diagram blocks */
   .arch { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
     padding: 1.25rem; margin: 0 0 1rem; }
   .arch-row { display: flex; align-items: center; gap: 0.85rem; margin: 0 0 0.65rem; flex-wrap: wrap; }
@@ -122,14 +118,32 @@
   .arch-box.bad { border-color: rgba(239, 68, 68, 0.5); color: var(--bad); }
   .arch-arrow { color: var(--muted); font-family: var(--mono); font-size: 0.85em; }
 
-  /* Callout boxes */
   .callout { padding: 0.95rem 1.15rem; border-radius: 9px; margin: 1rem 0; font-size: 0.92rem; }
   .callout-warn { background: rgba(245, 158, 11, 0.08); border: 1px solid rgba(245, 158, 11, 0.32); color: var(--ink-soft); }
   .callout-info { background: rgba(56, 189, 248, 0.07); border: 1px solid rgba(56, 189, 248, 0.3); color: var(--ink-soft); }
+  .callout-good { background: rgba(34, 197, 94, 0.07); border: 1px solid rgba(34, 197, 94, 0.3); color: var(--ink-soft); }
 
   kbd { display: inline-block; padding: 0.1rem 0.45rem; border-radius: 4px;
     background: rgba(255,255,255,0.08); border: 1px solid var(--border);
     font-family: var(--mono); font-size: 0.82em; line-height: 1.4; }
+
+  /* Modal preview mock */
+  .modal-preview { background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 1.5rem 1.75rem; max-width: 480px; margin: 1rem 0; box-shadow: 0 20px 60px rgba(0,0,0,0.4); }
+  .modal-preview .lock { width: 44px; height: 44px; border-radius: 10px;
+    background: linear-gradient(135deg, rgba(56, 189, 248, 0.2), rgba(56, 189, 248, 0.06));
+    border: 1px solid rgba(56, 189, 248, 0.35); display: inline-flex; align-items: center; justify-content: center;
+    color: var(--accent); margin-bottom: 0.85rem; }
+  .modal-preview .brand { color: var(--accent); font-size: 0.7rem; font-weight: 700;
+    letter-spacing: 0.12em; text-transform: uppercase; margin: 0; }
+  .modal-preview .modal-title { font-size: 1.15rem; font-weight: 700; margin: 0.15rem 0 0.35rem; }
+  .modal-preview .modal-sub { color: #cbd5e1; font-size: 0.88rem; margin: 0 0 1rem; }
+  .modal-preview .modal-input { background: rgba(11, 18, 32, 0.7); border: 1px solid rgba(148, 163, 184, 0.3);
+    border-radius: 8px; padding: 0.7rem 0.95rem; color: var(--muted); font-size: 0.85rem; }
+  .modal-preview .modal-actions { display: flex; gap: 0.6rem; justify-content: flex-end; margin-top: 1.1rem; }
+  .modal-preview .modal-btn { padding: 0.55rem 1.2rem; border-radius: 7px; font-weight: 700; font-size: 0.85rem; }
+  .modal-preview .modal-btn.p { background: var(--accent); color: #0b1220; }
+  .modal-preview .modal-btn.s { background: transparent; color: var(--muted); border: 1px solid rgba(148, 163, 184, 0.3); }
 
   .links { margin-top: 3.5rem; font-size: 0.92rem; color: var(--muted);
     border-top: 1px solid var(--border); padding-top: 1.5rem; }
@@ -141,8 +155,8 @@
 <div class="wrap">
 
 <header>
-  <h1>kiosk-exit-guard <span class="version-pill">v0.4.0</span></h1>
-  <p class="tagline">Single-binary kiosk lockdown for Windows 11 Home. WebView2 kiosk window, password-gated escape, Chrome uninstalled, Edge launches blocked at the OS level — all from one exe.</p>
+  <h1>kiosk-exit-guard <span class="version-pill">v0.5.x</span></h1>
+  <p class="tagline">Single-binary kiosk lockdown for Windows 11 Home. Embedded WebView2 kiosk window, password-gated keyboard, Chrome uninstalled, Edge launches blocked at the OS level — all from one exe.</p>
 </header>
 
 <div class="download-card">
@@ -151,7 +165,7 @@
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
       Download <code>kiosk-exit-guard.exe</code>
     </a>
-    <div class="meta">Latest release · Windows&nbsp;11&nbsp;Home · amd64 · ~4.0&nbsp;MB · unsigned · requires UAC consent on first launch</div>
+    <div class="meta">Latest release · Windows&nbsp;11&nbsp;Home · amd64 · ~7.6&nbsp;MB · unsigned · UAC consent required on first launch</div>
   </div>
   <div class="meta">
     Source on <a href="https://github.com/Shalom-Karr/kiosk-exit-guard" style="color:var(--accent);">GitHub</a> · all <a href="https://github.com/Shalom-Karr/kiosk-exit-guard/releases" style="color:var(--accent);">releases</a>
@@ -159,6 +173,7 @@
 </div>
 
 <nav class="toc">
+  <a href="#whats-new">What's new</a>
   <a href="#features">Features</a>
   <a href="#how">How it works</a>
   <a href="#flow">Filter mode flow</a>
@@ -168,33 +183,60 @@
   <a href="#build">Build</a>
 </nav>
 
-<h2 id="features">Features</h2>
+<h2 id="whats-new">What's new in v0.5.x</h2>
 
 <div class="feature-grid">
-  <div class="feature"><h4><span class="dot new"></span>WebView2 kiosk window <small style="color:var(--good);font-weight:500;">— new in v0.4.0</small></h4><p>The kiosk page lives in <strong>this exe</strong>, not a Chrome subprocess. Fullscreen, topmost, frameless, JS-locked to refuse navigation away from the kiosk URL.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Chrome uninstalled on first run</h4><p>The exe reads Chrome's <code>UninstallString</code> from the registry and runs the official Chrome uninstaller with <code>--force-uninstall</code>. Clean removal, idempotent if Chrome isn't installed.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Edge launches blocked at the OS</h4><p>Sets <code>HKLM\…\Image File Execution Options\msedge.exe\Debugger</code> to redirect launches back to this exe with <code>--silent-exit</code>. Same for <code>chrome.exe</code>. Re-applied every launch in case Windows Update restores them.</p></div>
-  <div class="feature"><h4><span class="dot"></span>UAC elevation</h4><p>Embedded manifest. Every launch requests admin consent cleanly. The Task Scheduler entry uses HIGHEST run level, so logon launches are silent.</p></div>
-  <div class="feature"><h4><span class="dot"></span>First-run setup wizard</h4><p>No flags needed. Set password, set kiosk URL, then setup uninstalls Chrome, applies IFEO blocks, and registers the startup task — all in sequence.</p></div>
-  <div class="feature"><h4><span class="dot"></span>HKLM password storage</h4><p>Bcrypt hash in <code>HKLM\Software\KioskExitGuard\PasswordHash</code>. Admin-write only — a standard kiosk user can't bypass by deleting a config file.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>Branded password modal<span class="badge">new</span></h4><p>WebView2 dialog with autofocused input. Header reads <em>"This command has been locked by the SK Filter"</em>. Replaces the small zenity prompt.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>Re-injection on success<span class="badge">new</span></h4><p>Every blocked Ctrl/Win/Alt combo (not just Alt+F4) now opens the password prompt. Correct password re-sends the original combo via <code>SendInput</code> so the user's intended action goes through.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>WebView2 Runtime auto-install<span class="badge">new</span></h4><p>If the runtime is missing (Server SKUs, stripped images), the exe downloads the evergreen bootstrapper from <code>go.microsoft.com</code> and runs it silently on first launch.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>Desktop shortcut<span class="badge">new</span></h4><p>First-run setup drops a <code>Kiosk Exit Guard.lnk</code> on the admin's desktop. Self-heals on subsequent launches if you delete it.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>Branded first-run wizard<span class="badge">new</span></h4><p>One WebView2 page collects password + URL with proper form validation. Replaces the chain of small zenity prompts from v0.4.x.</p></div>
+</div>
+
+<h3>What the password modal looks like</h3>
+
+<div class="modal-preview">
+  <div class="lock">
+    <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="3" y="11" width="18" height="11" rx="2"/>
+      <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+    </svg>
+  </div>
+  <p class="brand">SK Filter</p>
+  <h3 class="modal-title">This command has been locked</h3>
+  <p class="modal-sub">Please enter your password to continue.</p>
+  <div class="modal-input">••••••••••</div>
+  <div class="modal-actions">
+    <div class="modal-btn s">Cancel</div>
+    <div class="modal-btn p">Unlock</div>
+  </div>
+</div>
+
+<h2 id="features">All features</h2>
+
+<div class="feature-grid">
+  <div class="feature"><h4><span class="dot"></span>WebView2 kiosk window</h4><p>The kiosk page lives in this exe, not a Chrome subprocess. Fullscreen, topmost, frameless, JS-locked to refuse navigation away from the kiosk URL.</p></div>
+  <div class="feature"><h4><span class="dot"></span>Chrome uninstalled on first run</h4><p>Reads Chrome's <code>UninstallString</code> from the registry and runs the official uninstaller with <code>--force-uninstall</code>. Clean removal, idempotent if Chrome isn't installed.</p></div>
+  <div class="feature"><h4><span class="dot"></span>Edge launches blocked at the OS</h4><p>Sets <code>HKLM\…\Image File Execution Options\msedge.exe\Debugger</code> to redirect launches to <code>kiosk-exit-guard --silent-exit</code>. Same for <code>chrome.exe</code>. Re-applied every launch.</p></div>
+  <div class="feature"><h4><span class="dot"></span>UAC elevation</h4><p>Embedded manifest. Every launch requests admin consent cleanly. The Task Scheduler entry uses HIGHEST run level so logon launches are silent.</p></div>
+  <div class="feature"><h4><span class="dot"></span>HKLM password storage</h4><p>Bcrypt hash in <code>HKLM\Software\KioskExitGuard\PasswordHash</code>. Admin-write only — a standard kiosk user can't bypass by deleting a file.</p></div>
   <div class="feature"><h4><span class="dot"></span>Filter mode hotkey</h4><p><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Alt</kbd>+<kbd>K</kbd> → password → flips ON/OFF. State persists across reboots.</p></div>
-  <div class="feature"><h4><span class="dot"></span>Pause duration prompt</h4><p>Toggling OFF asks "5m / 15m / 30m / 1h / Indefinite". Anything but Indefinite auto-re-enables when the timer fires.</p></div>
-  <div class="feature"><h4><span class="dot"></span>Broad keystroke block</h4><p>Filter mode ON: <kbd>Alt</kbd>+<kbd>F4</kbd> password-gated; every other Ctrl/Win/Alt combo (<kbd>Ctrl+F4</kbd>, <kbd>Alt+Tab</kbd>, <kbd>Win+R/E/D</kbd>, …) silently swallowed.</p></div>
+  <div class="feature"><h4><span class="dot"></span>Pause duration prompt</h4><p>Toggling OFF asks "5m / 15m / 30m / 1h / Indefinite". Anything but Indefinite auto-re-enables.</p></div>
   <div class="feature"><h4><span class="dot"></span>Registry policy lockdown</h4><p>Filter mode ON: <code>DisableTaskMgr=1</code> and <code>NoRun=1</code> under HKCU. Cleared when flipped OFF or via <code>--reset</code>.</p></div>
 </div>
 
 <h2 id="how">How it works</h2>
 
-<p>One exe, three internal modes selected by the first command-line argument. The Task Scheduler entry only ever launches the controller; the other two are reached internally.</p>
+<p>One binary, three internal modes selected by the first command-line argument:</p>
 
 <div class="arch">
   <div class="arch-row">
     <span class="arch-box accent">Controller</span>
-    <span class="arch-arrow">— no args. Installed by Task Scheduler at logon. Owns the LL keyboard hook, the filter-mode state, the registry lockdown, and supervises the WebView2 child.</span>
+    <span class="arch-arrow">— launched by Task Scheduler at user logon. Owns the LL keyboard hook, filter-mode state, registry lockdown, and supervises the WebView2 kiosk child.</span>
   </div>
   <div class="arch-row">
     <span class="arch-box">--webview</span>
-    <span class="arch-arrow">— launched by the controller when filter mode flips ON. Opens the fullscreen WebView2 kiosk window. Exits when filter mode flips OFF (the controller kills it).</span>
+    <span class="arch-arrow">— spawned by the controller when filter mode flips ON. Renders the fullscreen WebView2 kiosk window. Dies when filter mode flips OFF.</span>
   </div>
   <div class="arch-row">
     <span class="arch-box bad">--silent-exit</span>
@@ -202,15 +244,19 @@
   </div>
 </div>
 
-<h3>Setup time (first run)</h3>
+<h3>Setup (first run)</h3>
 
 <div class="arch">
   <div class="arch-row">
     <span class="arch-box">1. UAC consent</span>
     <span class="arch-arrow">→</span>
-    <span class="arch-box">2. set password (HKLM)</span>
-    <span class="arch-arrow">→</span>
-    <span class="arch-box">3. set kiosk URL (HKLM)</span>
+    <span class="arch-box">2. WebView2 auto-install (if missing)</span>
+  </div>
+  <div class="arch-row">
+    <span class="arch-arrow">↓</span>
+  </div>
+  <div class="arch-row">
+    <span class="arch-box accent">3. branded wizard: password + kiosk URL</span>
   </div>
   <div class="arch-row">
     <span class="arch-arrow">↓</span>
@@ -218,57 +264,49 @@
   <div class="arch-row">
     <span class="arch-box bad">4. uninstall Chrome silently</span>
     <span class="arch-arrow">→</span>
-    <span class="arch-box bad">5. set IFEO Debugger for chrome.exe + msedge.exe</span>
+    <span class="arch-box bad">5. IFEO redirects on chrome.exe + msedge.exe</span>
+  </div>
+  <div class="arch-row">
+    <span class="arch-arrow">↓</span>
+  </div>
+  <div class="arch-row">
+    <span class="arch-box good">6. desktop shortcut</span>
     <span class="arch-arrow">→</span>
-    <span class="arch-box good">6. install logon task</span>
+    <span class="arch-box good">7. logon task</span>
   </div>
 </div>
 
-<h3>Runtime — filter mode OFF (default)</h3>
+<h3>Pressing a blocked combo (filter mode ON)</h3>
 
 <div class="arch">
   <div class="arch-row">
-    <span class="arch-box accent">Controller running</span>
-    <span class="arch-arrow">→ keyboard hook installed but only watching for the toggle hotkey · IFEO blocks active · registry lockdown OFF · no WebView2 window</span>
+    <span class="arch-box">user presses Win+R</span>
+    <span class="arch-arrow">→</span>
+    <span class="arch-box accent">LL hook captures combo</span>
+    <span class="arch-arrow">→ swallows event</span>
+  </div>
+  <div class="arch-row">
+    <span class="arch-arrow">↓</span>
+  </div>
+  <div class="arch-row">
+    <span class="arch-box accent">branded password modal opens (autofocused input)</span>
+  </div>
+  <div class="arch-row">
+    <span class="arch-arrow">↓ correct password</span>
+  </div>
+  <div class="arch-row">
+    <span class="arch-box good">SendInput re-injects Win+R</span>
+    <span class="arch-arrow">→ Run dialog opens for real</span>
   </div>
 </div>
 
-<h3>Runtime — filter mode ON</h3>
-
-<div class="arch">
-  <div class="arch-row">
-    <span class="arch-box accent">Controller</span>
-    <span class="arch-arrow">spawns →</span>
-    <span class="arch-box">--webview child</span>
-    <span class="arch-arrow">(fullscreen WebView2 kiosk window)</span>
-  </div>
-  <div class="arch-row">
-    <span class="arch-box accent">Controller</span>
-    <span class="arch-arrow">applies →</span>
-    <span class="arch-box bad">HKCU DisableTaskMgr=1, NoRun=1</span>
-  </div>
-  <div class="arch-row">
-    <span class="arch-box accent">Controller</span>
-    <span class="arch-arrow">swallows →</span>
-    <span class="arch-box bad">Alt+F4 (→ password), Ctrl+anything, Win+anything, Alt+anything</span>
-  </div>
-  <div class="arch-row">
-    <span class="arch-box accent">Controller</span>
-    <span class="arch-arrow">watchdog (30s tick) ensures the --webview child is still running. Respawns if killed.</span>
-  </div>
-</div>
-
-<h3>Why not a child Chrome process anymore?</h3>
-
-<p>v0.3.0 launched <code>chrome.exe --kiosk</code> as a child. That worked, but it left Chrome installed and reachable as an escape vector — and uninstalling Chrome would break the whole thing. WebView2 is the same Chromium rendering engine packaged as an embeddable component instead of a standalone browser. By rendering the kiosk page through WebView2 inside our exe, we no longer depend on Chrome at all — so first-run can uninstall it and IFEO-block any reinstall.</p>
-
-<p>WebView2 Runtime is pre-installed on every Win11 box and most current Win10 boxes (via Windows Update / Edge install). The exe doesn't ship a copy.</p>
+<p>The re-injected events carry a marker in <code>ExtraInfo</code> so the LL hook recognizes them as our own and lets them through. Wrong password → keystroke stays swallowed, "Wrong password" toast appears.</p>
 
 <h2 id="flow">Filter mode flow</h2>
 
 <table class="state-table">
   <thead>
-    <tr><th>State</th><th>Keyboard</th><th>Task Manager</th><th>Run dialog</th><th>WebView2 child</th><th>Chrome / Edge</th></tr>
+    <tr><th>State</th><th>Keyboard</th><th>Task Manager</th><th>Run dialog</th><th>WebView2 kiosk</th><th>Chrome / Edge</th></tr>
   </thead>
   <tbody>
     <tr>
@@ -277,69 +315,65 @@
       <td class="state-on">Open</td>
       <td class="state-on">Open</td>
       <td>Not running</td>
-      <td class="state-blocked">Chrome gone; Edge launches blocked</td>
+      <td class="state-blocked">Chrome gone; Edge blocked</td>
     </tr>
     <tr>
       <td><span class="state-on">ON</span></td>
-      <td>
-        <kbd>Alt</kbd>+<kbd>F4</kbd> → password<br>
-        <span class="state-blocked">Other Ctrl/Win/Alt combos blocked</span>
-      </td>
+      <td>Any Ctrl/Win/Alt combo → SK Filter password modal → re-injected if correct</td>
       <td class="state-blocked">Disabled by policy</td>
       <td class="state-blocked">Disabled by policy</td>
       <td>Fullscreen, topmost, frameless</td>
-      <td class="state-blocked">Chrome gone; Edge launches blocked</td>
+      <td class="state-blocked">Chrome gone; Edge blocked</td>
     </tr>
   </tbody>
 </table>
 
-<p>The browser blocks (Chrome uninstall + Edge IFEO redirect) apply <strong>regardless of filter mode</strong> — they're a permanent property of the installation. Filter mode controls everything else.</p>
+<p>Chrome uninstall + Edge IFEO block apply <strong>regardless of filter mode</strong> — permanent property of the installation. Filter mode controls everything else.</p>
 
 <h2 id="setup">Setup</h2>
 
 <ol>
   <li><strong>Download</strong> the exe (button above) and place it in <code>C:\Program&nbsp;Files\KioskExitGuard\</code>.</li>
   <li><strong>Double-click</strong>. Approve the UAC prompt.</li>
-  <li><strong>Set a password</strong> in the two prompts.</li>
-  <li><strong>Set the kiosk URL</strong>. Pre-filled with <code>https://skluach.pages.dev/CMH/</code> — change it to your URL or accept the default.</li>
-  <li>The exe will then <strong>silently uninstall Chrome</strong> (if present), <strong>block Chrome and Edge launches</strong> via IFEO, and <strong>register a logon task</strong>.</li>
+  <li><strong>WebView2 Runtime</strong> auto-installs if missing (~30 seconds, silent).</li>
+  <li><strong>First-run wizard</strong> opens — enter password (twice), confirm or change the kiosk URL.</li>
+  <li>Setup then <strong>uninstalls Chrome</strong>, <strong>blocks Chrome+Edge launches</strong>, drops a <strong>desktop shortcut</strong>, and registers the <strong>logon task</strong>.</li>
   <li>Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Alt</kbd>+<kbd>K</kbd> to flip filter mode on when ready.</li>
 </ol>
 
 <div class="callout callout-warn">
-  <strong>SmartScreen warning on first launch.</strong> The exe is unsigned. Click <em>More info</em> → <em>Run anyway</em>. If Defender quarantines it, add the install directory to the exclusion list. (LL keyboard hook + unsigned exe matches keylogger heuristics — the alert is doing its job, but the exe is fine.)
+  <strong>SmartScreen on first launch.</strong> The exe is unsigned. Click <em>More info</em> → <em>Run anyway</em>. LL keyboard hook + unsigned exe matches keylogger heuristics — the alert is doing its job, but the exe is fine.
 </div>
 
-<div class="callout callout-info">
-  <strong>WebView2 Runtime requirement.</strong> Pre-installed on every Win11 box and most updated Win10 boxes. If the kiosk window fails to open with a "WebView2 Runtime is not installed" message, grab the evergreen installer from <a href="https://developer.microsoft.com/microsoft-edge/webview2/" style="color:var(--accent);">developer.microsoft.com/microsoft-edge/webview2</a>.
+<div class="callout callout-good">
+  <strong>Server 2022 / stripped images.</strong> WebView2 Runtime isn't pre-installed on Server SKUs. v0.5.x auto-detects and installs it before opening the wizard — no manual step needed.
 </div>
 
 <h2 id="flags">CLI flags</h2>
 
 <pre>kiosk-exit-guard.exe                  # normal — controller + hook + watchdog
-kiosk-exit-guard.exe --webview        # internal: renders the kiosk window (launched by controller)
+kiosk-exit-guard.exe --webview        # internal: renders the kiosk window
 kiosk-exit-guard.exe --silent-exit    # internal: IFEO Debugger redirect handler
 kiosk-exit-guard.exe --set-password   # change the password (UAC-elevated)
 kiosk-exit-guard.exe --set-url        # change the kiosk URL (UAC-elevated)
 kiosk-exit-guard.exe --reset          # password-gated — clears registry policies, IFEO blocks, filter mode</pre>
 
-<p><code>--reset</code> requires the configured password. If you've lost it entirely, an admin can wipe <code>HKLM\Software\KioskExitGuard</code> via <code>regedit</code> to fully reset the install and start over.</p>
+<p><code>--reset</code> requires the configured password. If lost entirely, an admin can wipe <code>HKLM\Software\KioskExitGuard</code> via <code>regedit</code> to fully reset.</p>
 
 <h2 id="limits">What it doesn't block</h2>
 
 <ul>
-  <li><kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Del</kbd> and <kbd>Win</kbd>+<kbd>L</kbd> are handled by Windows' Secure Attention Sequence, which sits below any user-mode hook. No user-mode tool can intercept them.</li>
+  <li><kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Del</kbd> and <kbd>Win</kbd>+<kbd>L</kbd> — Windows Secure Attention Sequence, below any user-mode hook.</li>
   <li>Booting from USB / safe mode bypasses everything. Set a BIOS password.</li>
-  <li>Another admin with an elevated terminal can still kill the exe. The Task Manager disable + IFEO blocks raise the bar for a standard kiosk user but don't stop another admin.</li>
-  <li>A third-party browser the kiosk user could somehow install would not be IFEO-blocked. (Standard accounts can't install software, so this is a low-probability path.)</li>
+  <li>Another admin with an elevated terminal can still kill the exe. The Task Manager disable + IFEO blocks raise the bar for a standard kiosk user.</li>
+  <li>Third-party browser installed by an admin would not be IFEO-blocked unless you add it.</li>
 </ul>
 
 <h2 id="build">Build from source</h2>
 
-<p>The CI workflow at <code>.github/workflows/release.yml</code> rebuilds the exe and creates a GitHub Release on every <code>v*</code> tag push.</p>
+<p>CI at <code>.github/workflows/release.yml</code> rebuilds + releases on every <code>v*</code> tag push.</p>
 
-<pre>git tag v0.4.0
-git push origin v0.4.0</pre>
+<pre>git tag v0.5.1 && git push origin v0.5.1</pre>
 
 <p>Local build:</p>
 
