@@ -6,97 +6,139 @@
 <title>kiosk-exit-guard — Windows 11 Home kiosk lockdown</title>
 <style>
   :root {
-    --bg: #0f172a;
-    --panel: #1e293b;
-    --panel-elev: #273449;
-    --ink: #f8fafc;
+    --bg: #0b1220;
+    --bg-grad: #131c30;
+    --panel: #1a2438;
+    --panel-2: #232f48;
+    --ink: #f1f5f9;
+    --ink-soft: rgba(241, 245, 249, 0.85);
     --muted: #94a3b8;
     --accent: #38bdf8;
-    --accent-hover: #7dd3fc;
-    --good: #4ade80;
-    --warn: #fbbf24;
+    --accent-hi: #7dd3fc;
+    --good: #22c55e;
+    --warn: #f59e0b;
+    --bad: #ef4444;
     --border: rgba(148, 163, 184, 0.18);
     --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   }
-  * { box-sizing: border-box; }
-  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--ink);
+  *,*::before,*::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background:
+    radial-gradient(ellipse at top, var(--bg-grad), var(--bg) 60%);
+    color: var(--ink);
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-    line-height: 1.55; -webkit-font-smoothing: antialiased; }
-  .wrap { max-width: 820px; margin: 0 auto; padding: 4rem 1.5rem 6rem; }
+    line-height: 1.6; -webkit-font-smoothing: antialiased; min-height: 100vh; }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 4rem 1.5rem 6rem; }
 
-  header { margin-bottom: 2rem; }
-  h1 { font-size: 2.5rem; margin: 0 0 0.25rem; letter-spacing: -0.025em; line-height: 1.1; }
-  .tagline { color: var(--muted); margin: 0; font-size: 1.05rem; }
-  .version-pill { display: inline-block; background: rgba(56, 189, 248, 0.15); color: var(--accent);
-    padding: 0.15rem 0.6rem; border-radius: 999px; font-size: 0.75rem; font-weight: 600;
-    margin-left: 0.5rem; vertical-align: middle; letter-spacing: 0.02em; }
+  header { margin-bottom: 2.5rem; }
+  h1 { font-size: 2.75rem; margin: 0 0 0.4rem; letter-spacing: -0.03em; line-height: 1.05; }
+  .tagline { color: var(--muted); margin: 0; font-size: 1.1rem; max-width: 60ch; }
+  .version-pill { display: inline-block; background: rgba(56, 189, 248, 0.16); color: var(--accent);
+    padding: 0.2rem 0.7rem; border-radius: 999px; font-size: 0.78rem; font-weight: 600;
+    margin-left: 0.6rem; vertical-align: middle; letter-spacing: 0.02em; }
 
+  /* Hero CTA */
   .download-card {
-    background: linear-gradient(180deg, var(--panel-elev), var(--panel));
+    background: linear-gradient(180deg, var(--panel-2), var(--panel));
     border: 1px solid var(--border);
     border-radius: 14px; padding: 1.75rem;
-    margin: 2.5rem 0;
+    margin: 2rem 0 3rem;
     display: flex; align-items: center; justify-content: space-between; gap: 1.5rem;
     flex-wrap: wrap;
   }
   .download-card .meta { font-size: 0.875rem; color: var(--muted); margin-top: 0.6rem; }
-  .download-card .meta code { background: rgba(255,255,255,0.06); padding: 0.1rem 0.4rem; border-radius: 4px; font-family: var(--mono); font-size: 0.85em; }
+  .download-card .meta code { background: rgba(255,255,255,0.06); padding: 0.1rem 0.4rem;
+    border-radius: 4px; font-family: var(--mono); font-size: 0.85em; }
   .btn {
     display: inline-flex; align-items: center; gap: 0.6rem;
-    background: var(--accent); color: #0f172a;
-    padding: 0.85rem 1.5rem; border-radius: 8px;
-    font-weight: 600; text-decoration: none;
-    transition: background 0.15s ease;
+    background: var(--accent); color: #0b1220;
+    padding: 0.95rem 1.7rem; border-radius: 9px;
+    font-weight: 700; text-decoration: none;
+    transition: background 0.15s ease, transform 0.1s ease;
   }
-  .btn:hover { background: var(--accent-hover); }
+  .btn:hover { background: var(--accent-hi); transform: translateY(-1px); }
+  .btn:active { transform: translateY(0); }
   .btn svg { width: 18px; height: 18px; }
 
-  h2 { font-size: 1.35rem; margin: 2.5rem 0 0.85rem; letter-spacing: -0.01em; }
+  /* TOC across the top */
+  .toc { display: flex; flex-wrap: wrap; gap: 0.5rem 1.25rem;
+    font-size: 0.875rem; color: var(--muted); margin: 0 0 3rem;
+    padding-bottom: 1.25rem; border-bottom: 1px solid var(--border); }
+  .toc a { color: var(--muted); text-decoration: none; }
+  .toc a:hover { color: var(--accent); }
+
+  /* Sections */
+  h2 { font-size: 1.5rem; margin: 3rem 0 1rem; letter-spacing: -0.015em; }
   h2:first-of-type { margin-top: 0; }
-  h3 { font-size: 1.05rem; margin: 1.5rem 0 0.5rem; color: var(--ink); }
-  p { margin: 0 0 1rem; color: rgba(248, 250, 252, 0.92); }
-  ul, ol { margin: 0 0 1rem; padding-left: 1.25rem; color: rgba(248, 250, 252, 0.92); }
+  h3 { font-size: 1.1rem; margin: 1.75rem 0 0.65rem; color: var(--ink); }
+  p { margin: 0 0 1rem; color: var(--ink-soft); }
+  ul, ol { margin: 0 0 1rem; padding-left: 1.5rem; color: var(--ink-soft); }
   li { margin-bottom: 0.4rem; }
+  ul ul, ol ul, ul ol, ol ol { margin: 0.3rem 0; }
+  strong { color: var(--ink); }
+
   code, pre { font-family: var(--mono); font-size: 0.875rem; }
   pre {
     background: var(--panel); border: 1px solid var(--border);
-    border-radius: 8px; padding: 1rem 1.25rem; overflow-x: auto;
-    color: #e2e8f0; line-height: 1.5;
+    border-radius: 9px; padding: 1rem 1.25rem; overflow-x: auto;
+    color: #e2e8f0; line-height: 1.55;
   }
-  table {
-    width: 100%; border-collapse: collapse;
-    margin: 0 0 1rem; font-size: 0.9rem;
-  }
-  th, td { text-align: left; padding: 0.7rem 0.75rem; border-bottom: 1px solid var(--border); vertical-align: top; }
-  th { color: var(--muted); font-weight: 500; }
-  .check { color: var(--good); }
-  .x { color: var(--warn); }
+  p code, li code, td code, th code { background: rgba(255,255,255,0.07);
+    padding: 0.1rem 0.4rem; border-radius: 4px; font-size: 0.88em; }
 
-  .feature-grid { display: grid; gap: 0.85rem; grid-template-columns: 1fr; margin-bottom: 2rem; }
-  @media (min-width: 600px) { .feature-grid { grid-template-columns: 1fr 1fr; } }
+  /* Feature grid */
+  .feature-grid { display: grid; gap: 0.85rem; grid-template-columns: 1fr; margin: 0 0 1.5rem; }
+  @media (min-width: 640px) { .feature-grid { grid-template-columns: 1fr 1fr; } }
   .feature {
     background: var(--panel); border: 1px solid var(--border);
-    border-radius: 10px; padding: 1rem 1.15rem;
+    border-radius: 10px; padding: 1.05rem 1.2rem;
   }
-  .feature h4 { margin: 0 0 0.4rem; font-size: 0.95rem; }
+  .feature h4 { margin: 0 0 0.4rem; font-size: 0.95rem; color: var(--ink); display: flex; align-items: center; gap: 0.4rem; }
   .feature p { margin: 0; font-size: 0.875rem; color: var(--muted); }
+  .feature .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); display: inline-block; }
 
-  .links { margin-top: 3rem; font-size: 0.9rem; color: var(--muted); border-top: 1px solid var(--border); padding-top: 1.5rem; }
+  /* State table */
+  .state-table { width: 100%; border-collapse: collapse;
+    margin: 0 0 1rem; font-size: 0.92rem;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  .state-table th, .state-table td { text-align: left; padding: 0.8rem 1rem;
+    border-bottom: 1px solid var(--border); vertical-align: top; }
+  .state-table thead th { color: var(--muted); font-weight: 600; background: rgba(255,255,255,0.02); font-size: 0.78rem;
+    text-transform: uppercase; letter-spacing: 0.05em; }
+  .state-table tr:last-child td { border-bottom: none; }
+  .state-on { color: var(--good); font-weight: 600; }
+  .state-off { color: var(--muted); }
+  .state-blocked { color: var(--bad); }
+
+  /* Flow */
+  .flow-step {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 9px; padding: 0.85rem 1.15rem;
+    margin: 0 0 0.5rem; font-size: 0.92rem;
+  }
+  .flow-step strong { color: var(--accent); font-family: var(--mono); font-size: 0.85em; margin-right: 0.5rem; }
+  .flow-arrow { color: var(--muted); margin: 0.25rem 0 0.25rem 1rem; font-family: var(--mono); font-size: 0.85em; }
+
+  /* Callout boxes */
+  .callout { padding: 0.95rem 1.15rem; border-radius: 9px; margin: 1rem 0; font-size: 0.92rem; }
+  .callout-warn { background: rgba(245, 158, 11, 0.08); border: 1px solid rgba(245, 158, 11, 0.32); color: var(--ink-soft); }
+  .callout-info { background: rgba(56, 189, 248, 0.07); border: 1px solid rgba(56, 189, 248, 0.3); color: var(--ink-soft); }
+
+  kbd { display: inline-block; padding: 0.1rem 0.45rem; border-radius: 4px;
+    background: rgba(255,255,255,0.08); border: 1px solid var(--border);
+    font-family: var(--mono); font-size: 0.82em; line-height: 1.4; }
+
+  .links { margin-top: 3.5rem; font-size: 0.92rem; color: var(--muted);
+    border-top: 1px solid var(--border); padding-top: 1.5rem; }
   .links a { color: var(--accent); text-decoration: none; }
   .links a:hover { text-decoration: underline; }
-  .warn-box { background: rgba(251, 191, 36, 0.08); border: 1px solid rgba(251, 191, 36, 0.3);
-    border-radius: 8px; padding: 0.85rem 1.1rem; margin: 1rem 0; font-size: 0.9rem; color: rgba(248,250,252,0.9); }
-  kbd { display: inline-block; padding: 0.1rem 0.4rem; border-radius: 4px;
-    background: rgba(255,255,255,0.07); border: 1px solid var(--border);
-    font-family: var(--mono); font-size: 0.8em; }
 </style>
 </head>
 <body>
 <div class="wrap">
 
 <header>
-  <h1>kiosk-exit-guard <span class="version-pill">v0.2.0</span></h1>
-  <p class="tagline">Single-binary kiosk lockdown for Windows 11 Home. Hotkey-toggleable filter mode that blocks every common escape path.</p>
+  <h1>kiosk-exit-guard <span class="version-pill">v0.3.0</span></h1>
+  <p class="tagline">Single-binary kiosk lockdown for Windows 11 Home. Hotkey-toggleable filter mode locks down keyboard escapes, disables Task Manager, and keeps Chrome pinned to a kiosk URL.</p>
 </header>
 
 <div class="download-card">
@@ -105,70 +147,113 @@
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
       Download <code>kiosk-exit-guard.exe</code>
     </a>
-    <div class="meta">Latest · Windows&nbsp;11&nbsp;Home · amd64 · ~2.97&nbsp;MB · unsigned · requires UAC consent on first launch</div>
+    <div class="meta">Latest release · Windows&nbsp;11&nbsp;Home · amd64 · ~3.3&nbsp;MB · unsigned · requires UAC consent on first launch</div>
   </div>
   <div class="meta">
     Source on <a href="https://github.com/Shalom-Karr/kiosk-exit-guard" style="color:var(--accent);">GitHub</a> · all <a href="https://github.com/Shalom-Karr/kiosk-exit-guard/releases" style="color:var(--accent);">releases</a>
   </div>
 </div>
 
-<h2>What's in v0.2.0</h2>
+<nav class="toc">
+  <a href="#what">What it does</a>
+  <a href="#flow">Filter mode flow</a>
+  <a href="#setup">Setup</a>
+  <a href="#flags">CLI flags</a>
+  <a href="#limits">Limits</a>
+  <a href="#build">Build</a>
+</nav>
+
+<h2 id="what">What it does</h2>
+
 <div class="feature-grid">
-  <div class="feature"><h4>UAC manifest</h4><p>Embedded into the exe — every launch requests admin elevation cleanly.</p></div>
-  <div class="feature"><h4>First-run modal</h4><p>No flags needed. Drop the exe, double-click, set the password in the prompts.</p></div>
-  <div class="feature"><h4>Self-install at startup</h4><p>Registers a Task Scheduler entry that re-launches the exe at every user logon with HIGHEST run level.</p></div>
-  <div class="feature"><h4>Filter mode hotkey</h4><p><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Alt</kbd>+<kbd>K</kbd> → password → filter mode flips on/off. State persists across reboots.</p></div>
-  <div class="feature"><h4>Keystroke blocks</h4><p><kbd>Win</kbd>+<kbd>R</kbd>, <kbd>Win</kbd>+<kbd>E</kbd>, <kbd>Win</kbd>+<kbd>D</kbd>, <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Esc</kbd> silently swallowed when filter mode is on.</p></div>
-  <div class="feature"><h4>Registry policy lockdown</h4><p>Sets <code>DisableTaskMgr</code> and <code>NoRun</code> under HKCU. Restored automatically when filter mode is off.</p></div>
+  <div class="feature"><h4><span class="dot"></span>UAC elevation</h4><p>Embedded manifest. Every launch requests admin consent cleanly. The Task Scheduler entry uses HIGHEST run level, so logon launches are silent.</p></div>
+  <div class="feature"><h4><span class="dot"></span>First-run setup</h4><p>No flags needed. Drop the exe, double-click, set a password, pick the kiosk URL. The exe self-installs the startup task.</p></div>
+  <div class="feature"><h4><span class="dot"></span>HKLM password storage</h4><p>Bcrypt hash lives in <code>HKLM\Software\KioskExitGuard\PasswordHash</code>. Admin-write only — a standard kiosk user can't delete it.</p></div>
+  <div class="feature"><h4><span class="dot"></span>Filter mode hotkey</h4><p><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Alt</kbd>+<kbd>K</kbd> → password → flips ON/OFF. State persists across reboots.</p></div>
+  <div class="feature"><h4><span class="dot"></span>Pause duration prompt</h4><p>Toggling OFF asks for a pause length. 5m / 15m / 30m / 1h / Indefinite. Auto re-enables when the timer fires.</p></div>
+  <div class="feature"><h4><span class="dot"></span>Chrome kiosk watchdog</h4><p>30-second tick. If Chrome isn't running, launches <code>chrome.exe --kiosk &lt;url&gt;</code>. If Chrome is running but not the kiosk URL, kills and relaunches.</p></div>
+  <div class="feature"><h4><span class="dot"></span>Keystroke blocks</h4><p>Filter mode ON: <kbd>Alt</kbd>+<kbd>F4</kbd> password-gated. Every other Ctrl/Win/Alt combo (Ctrl+F4, Alt+Tab, Win+R/E/D, Ctrl+Shift+Esc, …) silently swallowed.</p></div>
+  <div class="feature"><h4><span class="dot"></span>Registry policy lockdown</h4><p>Filter mode ON: sets <code>DisableTaskMgr=1</code> and <code>NoRun=1</code> under HKCU. Cleared automatically when you flip OFF.</p></div>
 </div>
 
-<h2>How filter mode works</h2>
+<h2 id="flow">Filter mode flow</h2>
 
-<table>
-  <tr><th>Filter mode</th><th>What happens</th></tr>
-  <tr><td><strong>OFF</strong> (default)</td><td>All keys pass through. Registry policies are clean. The hook is installed but only listens for the toggle hotkey.</td></tr>
-  <tr><td><strong>ON</strong></td><td>Alt+F4 prompts for the password. Win+R/E/D and Ctrl+Shift+Esc are dropped. Task Manager refuses to launch ("disabled by your administrator"). Run dialog refuses to open.</td></tr>
+<table class="state-table">
+  <thead>
+    <tr><th>State</th><th>Keyboard</th><th>Task Manager</th><th>Run dialog</th><th>Chrome watchdog</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><span class="state-off">OFF</span> <em>(default)</em></td>
+      <td>All keys pass through</td>
+      <td class="state-on">Open</td>
+      <td class="state-on">Open</td>
+      <td>Paused</td>
+    </tr>
+    <tr>
+      <td><span class="state-on">ON</span></td>
+      <td>
+        <kbd>Alt</kbd>+<kbd>F4</kbd> → password<br>
+        <span class="state-blocked">Other Ctrl/Win/Alt combos blocked</span>
+      </td>
+      <td class="state-blocked">Disabled by policy</td>
+      <td class="state-blocked">Disabled by policy</td>
+      <td>30s tick — relaunches Chrome at kiosk URL</td>
+    </tr>
+  </tbody>
 </table>
 
-<p>The toggle hotkey is <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Alt</kbd>+<kbd>K</kbd>. Pressing it any time — in either mode — opens a password prompt. Correct password flips the mode and persists the state to <code>filter_mode.state</code> next to the exe.</p>
+<div class="flow-step"><strong>start</strong> Filter mode OFF (default at first launch)</div>
+<div class="flow-arrow">↓ press Ctrl+Shift+Alt+K · enter password</div>
+<div class="flow-step"><strong>on</strong> Filter mode ON — kiosk Chrome auto-launches, all blocks active</div>
+<div class="flow-arrow">↓ press Ctrl+Shift+Alt+K · enter password · pick pause duration</div>
+<div class="flow-step"><strong>off</strong> Filter mode OFF for N minutes (timer running)</div>
+<div class="flow-arrow">↓ timer fires</div>
+<div class="flow-step"><strong>on</strong> Filter mode auto-re-enables — back to lockdown</div>
 
-<h2>Setup</h2>
+<h2 id="setup">Setup</h2>
 
 <ol>
-  <li>Download the exe (button above) and drop it in <code>C:\Program&nbsp;Files\KioskExitGuard\</code>.</li>
-  <li>Double-click it. Approve the UAC prompt.</li>
-  <li>Set a password in the two prompts that appear.</li>
-  <li>The exe auto-installs a Task Scheduler entry. From now on it relaunches at every user logon.</li>
-  <li>Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Alt</kbd>+<kbd>K</kbd> to turn filter mode on whenever you want the kiosk locked down.</li>
+  <li><strong>Download</strong> the exe (button above) and place it in <code>C:\Program&nbsp;Files\KioskExitGuard\</code>.</li>
+  <li><strong>Double-click</strong>. Approve the UAC prompt.</li>
+  <li><strong>Set a password</strong> in the two prompts.</li>
+  <li><strong>Set the kiosk URL</strong>. Pre-filled with <code>https://skluach.pages.dev/CMH/</code> — change it to your URL or accept the default.</li>
+  <li>The exe <strong>self-installs</strong> a Task Scheduler entry named <code>KioskExitGuard</code> that re-launches at every user logon with HIGHEST run level.</li>
+  <li>Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Alt</kbd>+<kbd>K</kbd> any time to flip filter mode on or off.</li>
 </ol>
 
-<div class="warn-box">
-  <strong>SmartScreen warning on first launch.</strong> The exe is unsigned. Click <em>More info</em> → <em>Run anyway</em>. If Defender quarantines it, add the install directory to the exclusion list.
+<div class="callout callout-warn">
+  <strong>SmartScreen warning on first launch.</strong> The exe is unsigned. Click <em>More info</em> → <em>Run anyway</em>. If Defender quarantines it, add the install directory to the exclusion list. (Unsigned exes with low-level keyboard hooks share a profile with keyloggers — the heuristic is doing its job.)
 </div>
 
-<h2>What it doesn't block</h2>
+<h2 id="flags">CLI flags</h2>
+
+<pre>kiosk-exit-guard.exe                  # normal run — restores state, installs hook, starts watchdog
+kiosk-exit-guard.exe --set-password   # change the password (UAC-elevated)
+kiosk-exit-guard.exe --set-url        # change the kiosk URL (UAC-elevated)
+kiosk-exit-guard.exe --reset          # password-gated — clears registry policies + resets filter mode</pre>
+
+<p><code>--reset</code> requires the password. If you've lost the password entirely, an admin can wipe the registry key <code>HKLM\Software\KioskExitGuard</code> via <code>regedit</code> to fully reset the install.</p>
+
+<h2 id="limits">What it doesn't block</h2>
+
 <ul>
-  <li><kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Del</kbd> and <kbd>Win</kbd>+<kbd>L</kbd> go through Windows' Secure Attention Sequence, which sits below any user-mode hook. No user-mode tool can intercept them. A determined user can always reach the SAS menu or lock screen.</li>
-  <li>Booting from USB / safe mode — set a BIOS password to prevent this.</li>
-  <li>An admin with an elevated terminal can still kill the exe. The Task Manager disable makes this a much higher bar for a standard kiosk user.</li>
+  <li><kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Del</kbd> and <kbd>Win</kbd>+<kbd>L</kbd> are handled by Windows' Secure Attention Sequence, which sits below any user-mode hook. No user-mode tool can intercept them.</li>
+  <li>Booting from USB / safe mode bypasses everything. Set a BIOS password.</li>
+  <li>An admin with an elevated terminal can still kill the exe. The Task Manager disable raises the bar for a standard kiosk user but doesn't stop another admin.</li>
 </ul>
 
-<h2>CLI flags</h2>
+<h2 id="build">Build from source</h2>
 
-<pre>kiosk-exit-guard.exe                  # normal run — restores filter-mode state and installs hook
-kiosk-exit-guard.exe --set-password   # change the password
-kiosk-exit-guard.exe --reset          # restore registry, reset filter-mode to OFF (recovery)</pre>
+<p>The CI workflow at <code>.github/workflows/release.yml</code> rebuilds the exe and creates a GitHub Release on every <code>v*</code> tag push.</p>
 
-<h2>Build from source</h2>
+<pre>git tag v0.3.0
+git push origin v0.3.0</pre>
 
-<pre>git clone https://github.com/Shalom-Karr/kiosk-exit-guard.git
-cd kiosk-exit-guard
+<p>Local build:</p>
 
-# Regenerate the UAC manifest .syso
-go install github.com/josephspurrier/goversioninfo/cmd/goversioninfo@latest
+<pre>go install github.com/josephspurrier/goversioninfo/cmd/goversioninfo@latest
 goversioninfo -64 versioninfo.json
-
-# Build the windowless exe
 go build -ldflags="-H windowsgui -s -w" -o kiosk-exit-guard.exe</pre>
 
 <p class="links">

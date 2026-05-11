@@ -1,0 +1,44 @@
+name: Build and release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Install goversioninfo
+        run: go install github.com/josephspurrier/goversioninfo/cmd/goversioninfo@latest
+
+      - name: Generate UAC manifest .syso
+        shell: pwsh
+        run: |
+          $env:PATH = "$env:PATH;$(go env GOPATH)\bin"
+          goversioninfo -64 versioninfo.json
+
+      - name: Build kiosk-exit-guard.exe
+        env:
+          GOOS: windows
+          GOARCH: amd64
+        run: go build -ldflags="-H windowsgui -s -w" -o kiosk-exit-guard.exe .
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: kiosk-exit-guard.exe
+          generate_release_notes: true
+          name: ${{ github.ref_name }}
