@@ -2,7 +2,8 @@
 
 // kiosk-exit-guard intercepts Alt+F4 system-wide and only allows the keypress
 // to reach the foreground window after the user enters the configured password.
-// Wrong password = key is silently swallowed.
+// Wrong password or cancel = key is swallowed and a brief "Failed" toast is
+// shown that auto-dismisses after two seconds.
 //
 // Usage:
 //
@@ -14,12 +15,14 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/ncruces/zenity"
@@ -151,6 +154,20 @@ func hookCallback(nCode int32, wParam uintptr, lParam uintptr) uintptr {
 	return ret
 }
 
+// showFailedToast renders a brief auto-dismissing notification. Used for both
+// wrong-password and dialog-cancel paths so the user gets confirmation that
+// the Alt+F4 was caught and rejected, rather than wondering whether the key
+// was even seen.
+func showFailedToast() {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = zenity.Info(
+		"Wrong password.",
+		zenity.Title("kiosk-exit-guard"),
+		zenity.Context(ctx),
+	)
+}
+
 func promptAndMaybeExit() {
 	if !promptOpen.CompareAndSwap(false, true) {
 		return
@@ -166,10 +183,12 @@ func promptAndMaybeExit() {
 		zenity.HideText(),
 	)
 	if err != nil {
-		// User cancelled or dialog failed — treat as wrong password.
+		// User cancelled or dialog failed.
+		showFailedToast()
 		return
 	}
 	if bcrypt.CompareHashAndPassword(storedHash, []byte(pw)) != nil {
+		showFailedToast()
 		return
 	}
 	// Password matched. Politely ask the previously-focused window to close.

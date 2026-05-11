@@ -27,7 +27,7 @@ Intended for Windows 11 Home kiosk setups where Assigned Access isn't available 
 | Key combo | What happens |
 |---|---|
 | Alt+F4 (correct password entered) | Forwards `WM_CLOSE` to the previously-focused window — closes the browser / kiosk app |
-| Alt+F4 (wrong password / cancel) | Silently swallowed; nothing happens |
+| Alt+F4 (wrong password / cancel) | Keypress is swallowed; a "Wrong password" toast appears and auto-dismisses after 2 seconds |
 | Any other key | Untouched — normal behavior |
 
 The password prompt is a native Win32 input box (via [ncruces/zenity](https://github.com/ncruces/zenity)) with masked input. It runs in a separate goroutine so the low-level hook stays responsive.
