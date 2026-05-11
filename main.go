@@ -959,7 +959,7 @@ func firstRunWithWizard() bool {
 		)
 	}
 	_ = zenity.Info(
-		"Setup complete.\n\n• Password and kiosk URL saved\n• Chrome uninstalled\n• Chrome and Edge launches blocked\n• Desktop shortcut created\n• Auto-start task installed\n\nUse Ctrl+Shift+Alt+K to toggle filter mode.\nFilter mode starts OFF.",
+		"Setup complete.\n\n• Password and kiosk URL saved\n• Chrome uninstalled\n• Chrome and Edge launches blocked\n• Desktop shortcut created\n• Auto-start task installed\n\nThe SK Filter is ON by default and will start enforcing immediately.\nUse Ctrl+Shift+Alt+K to pause it for 1–100 minutes when needed.",
 		zenity.Title("kiosk-exit-guard"),
 	)
 	return true
@@ -1106,6 +1106,9 @@ func cancelPauseExpiry() {
 	}
 }
 
+// autoReenableFilterMode runs when a pause timer fires. Restores everything
+// the pause turned off: IFEO Edge/Chrome block, registry lockdown, kiosk
+// WebView2 window.
 func autoReenableFilterMode() {
 	if filterMode.Load() {
 		return
@@ -1114,40 +1117,74 @@ func autoReenableFilterMode() {
 	saveFilterModeToDisk(true)
 	setPauseUntil(time.Time{})
 	applyLockdown()
-	watchdogTick()
-	showTimedInfo("Pause expired.\nFilter mode is back ON.")
+	applyBrowserBlocks() // re-apply Edge/Chrome IFEO redirect
+	watchdogTick()       // launches the WebView2 kiosk child
+	showTimedInfo("Pause ended.\nSK Filter is back on.")
 }
 
 func askPauseDuration() (time.Duration, bool) {
 	choices := []string{
+		"1 minute",
 		"5 minutes",
-		"15 minutes",
+		"10 minutes",
+		"20 minutes",
 		"30 minutes",
-		"1 hour",
-		"Indefinitely (re-enable manually)",
+		"45 minutes",
+		"Custom (1–100 minutes)",
 	}
 	choice, err := zenity.List(
-		"How long should kiosk mode stay OFF?\nFilter mode will auto-re-enable after this time.",
+		"Pause the SK Filter for how long?\nEdge will be allowed and the kiosk will close during the pause. The filter resumes automatically when the timer ends.",
 		choices,
 		zenity.RadioList(),
-		zenity.Title("kiosk-exit-guard — pause"),
+		zenity.Title("SK Filter — pause"),
 	)
 	if err != nil {
 		return 0, false
 	}
 	switch choice {
 	case choices[0]:
-		return 5 * time.Minute, true
+		return 1 * time.Minute, true
 	case choices[1]:
-		return 15 * time.Minute, true
+		return 5 * time.Minute, true
 	case choices[2]:
-		return 30 * time.Minute, true
+		return 10 * time.Minute, true
 	case choices[3]:
-		return time.Hour, true
+		return 20 * time.Minute, true
 	case choices[4]:
-		return 0, true
+		return 30 * time.Minute, true
+	case choices[5]:
+		return 45 * time.Minute, true
+	case choices[6]:
+		return askCustomMinutes()
 	}
 	return 5 * time.Minute, true
+}
+
+// askCustomMinutes prompts for a custom pause length, validating it falls
+// in the 1–100 minute range. Re-prompts on invalid input until the user
+// either enters a valid number or cancels.
+func askCustomMinutes() (time.Duration, bool) {
+	for {
+		raw, err := zenity.Entry(
+			"How many minutes should the pause last?\nMust be a whole number between 1 and 100.",
+			zenity.Title("SK Filter — custom pause"),
+			zenity.EntryText("15"),
+		)
+		if err != nil {
+			return 0, false
+		}
+		raw = strings.TrimSpace(raw)
+		var n int
+		_, scanErr := fmt.Sscanf(raw, "%d", &n)
+		if scanErr != nil || n < 1 || n > 100 {
+			_ = zenity.Warning(
+				"Please enter a whole number between 1 and 100.",
+				zenity.Title("SK Filter"),
+			)
+			continue
+		}
+		return time.Duration(n) * time.Minute, true
+	}
 }
 
 // ---------- hook callback ----------
@@ -1162,7 +1199,7 @@ func hookCallback(nCode int32, wParam uintptr, lParam uintptr) uintptr {
 		if !injected && !ourInjection {
 			if kb.VkCode == vkK && ctrlDown() && shiftDown() && altDown() {
 				if !promptOpen.Load() {
-					go promptAndToggleFilterMode()
+					go promptAndPause()
 				}
 				return 1
 			}
@@ -1198,60 +1235,87 @@ const passwordPromptHTML = `<!DOCTYPE html><html lang="en"><head><meta charset="
 <style>
   *,*::before,*::after { box-sizing: border-box; }
   html, body { margin: 0; padding: 0;
-    background: radial-gradient(ellipse at top, #131c30, #0b1220 65%);
+    background: radial-gradient(ellipse at top left, #1e293b, #0b1220 70%);
     color: #f1f5f9; font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
     height: 100vh; -webkit-font-smoothing: antialiased; overflow: hidden; }
-  .wrap { height: 100vh; display: flex; align-items: center; justify-content: center; padding: 1rem; }
-  .card { background: linear-gradient(180deg, #232f48, #1a2438);
-    border: 1px solid rgba(148, 163, 184, 0.22); border-radius: 14px;
-    padding: 1.5rem 1.75rem; width: 100%; box-shadow: 0 20px 60px rgba(0,0,0,0.45); }
-  h1 { font-size: 1.05rem; margin: 0 0 0.35rem; letter-spacing: -0.01em; }
-  .subtitle { color: #94a3b8; font-size: 0.85rem; margin: 0 0 1.1rem; }
-  input { width: 100%; padding: 0.75rem 1rem; border-radius: 8px;
-    border: 1px solid rgba(148, 163, 184, 0.3); background: rgba(15, 23, 42, 0.7);
-    color: #f1f5f9; font-size: 0.95rem; font-family: inherit;
+  .wrap { height: 100vh; display: flex; align-items: center; justify-content: center; padding: 1.25rem; }
+  .card { background: linear-gradient(180deg, rgba(35, 47, 72, 0.95), rgba(26, 36, 56, 0.95));
+    border: 1px solid rgba(148, 163, 184, 0.22); border-radius: 16px;
+    padding: 2rem 2.25rem; width: 100%;
+    box-shadow: 0 30px 70px rgba(0,0,0,0.6); backdrop-filter: blur(8px); }
+  .header { display: flex; align-items: center; gap: 0.9rem; margin: 0 0 1.5rem; }
+  .lock-icon { width: 48px; height: 48px; border-radius: 12px;
+    background: linear-gradient(135deg, rgba(56, 189, 248, 0.18), rgba(56, 189, 248, 0.06));
+    border: 1px solid rgba(56, 189, 248, 0.32); display: flex; align-items: center;
+    justify-content: center; flex-shrink: 0; }
+  .lock-icon svg { width: 22px; height: 22px; color: #38bdf8; }
+  .brand { color: #38bdf8; font-size: 0.7rem; font-weight: 700;
+    letter-spacing: 0.12em; text-transform: uppercase; margin: 0; }
+  h1 { font-size: 1.25rem; margin: 0.15rem 0 0; letter-spacing: -0.015em;
+    line-height: 1.25; font-weight: 700; }
+  .subtitle { color: #cbd5e1; font-size: 0.92rem; margin: 0 0 1.25rem;
+    line-height: 1.5; }
+  label { display: block; font-size: 0.72rem; color: #94a3b8;
+    margin-bottom: 0.4rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.08em; }
+  input { width: 100%; padding: 0.85rem 1.05rem; border-radius: 9px;
+    border: 1px solid rgba(148, 163, 184, 0.3); background: rgba(11, 18, 32, 0.7);
+    color: #f1f5f9; font-size: 1rem; font-family: inherit;
     transition: border-color 0.15s, box-shadow 0.15s; }
   input:focus { outline: none; border-color: #38bdf8;
-    box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.18); }
-  .err { color: #fca5a5; font-size: 0.82rem; margin: 0.55rem 0 0;
-    background: rgba(239, 68, 68, 0.08); border: 1px solid rgba(239, 68, 68, 0.28);
-    padding: 0.45rem 0.65rem; border-radius: 6px; display: none; }
+    box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.2); }
+  .err { color: #fca5a5; font-size: 0.85rem; margin: 0.65rem 0 0;
+    background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.32);
+    padding: 0.55rem 0.8rem; border-radius: 7px; display: none; }
   .err.show { display: block; }
-  .actions { display: flex; gap: 0.6rem; justify-content: flex-end; margin-top: 1.1rem; }
-  button { padding: 0.6rem 1.3rem; border-radius: 7px; border: 0; cursor: pointer;
-    font-weight: 600; font-size: 0.9rem; font-family: inherit; transition: background 0.15s; }
+  .actions { display: flex; gap: 0.6rem; justify-content: flex-end; margin-top: 1.4rem; }
+  button { padding: 0.7rem 1.5rem; border-radius: 8px; border: 0; cursor: pointer;
+    font-weight: 700; font-size: 0.92rem; font-family: inherit;
+    transition: background 0.15s, transform 0.05s; }
+  button:active { transform: translateY(1px); }
   .btn-primary { background: #38bdf8; color: #0b1220; }
   .btn-primary:hover { background: #7dd3fc; }
   .btn-secondary { background: transparent; color: #94a3b8;
     border: 1px solid rgba(148, 163, 184, 0.3); }
-  .btn-secondary:hover { color: #f1f5f9; border-color: rgba(148, 163, 184, 0.5); }
+  .btn-secondary:hover { color: #f1f5f9; border-color: rgba(148, 163, 184, 0.55); }
 </style></head>
 <body>
 <div class="wrap"><div class="card">
-  <h1 id="title">Enter password</h1>
-  <p class="subtitle" id="subtitle">Required to continue.</p>
+  <div class="header">
+    <div class="lock-icon" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3" y="11" width="18" height="11" rx="2"/>
+        <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+      </svg>
+    </div>
+    <div>
+      <p class="brand">SK Filter</p>
+      <h1 id="title">This command has been locked</h1>
+    </div>
+  </div>
+  <p class="subtitle" id="subtitle">Please enter your password to continue.</p>
+  <label for="pw">Password</label>
   <input type="password" id="pw" />
   <div class="err" id="err"></div>
   <div class="actions">
     <button class="btn-secondary" onclick="cancel()">Cancel</button>
-    <button class="btn-primary" onclick="submit()">OK</button>
+    <button class="btn-primary" onclick="submit()">Unlock</button>
   </div>
 </div></div>
 <script>
-  document.getElementById('title').textContent = window.__title || 'Enter password';
-  document.getElementById('subtitle').textContent = window.__subtitle || '';
+  if (window.__title)    document.getElementById('title').textContent    = window.__title;
+  if (window.__subtitle) document.getElementById('subtitle').textContent = window.__subtitle;
   var input = document.getElementById('pw');
-  // Autofocus — both via attribute and explicit call to handle the
-  // race between WebView2's first paint and the focus event.
+  // Autofocus — belt and suspenders to handle the race between WebView2's
+  // first paint and document focus events. Both work; one is enough.
   setTimeout(function() { input.focus(); input.select(); }, 0);
-  window.addEventListener('load', function() { input.focus(); });
+  window.addEventListener('load',          function() { input.focus(); });
+  document.addEventListener('DOMContentLoaded', function() { input.focus(); });
   input.addEventListener('keydown', function(e) {
-    if (e.key === 'Enter') { e.preventDefault(); submit(); }
+    if (e.key === 'Enter')  { e.preventDefault(); submit(); }
     if (e.key === 'Escape') { e.preventDefault(); cancel(); }
   });
-  function submit() {
-    window.kgSubmit(input.value);
-  }
+  function submit() { window.kgSubmit(input.value); }
   function cancel() { window.kgCancel(); }
 </script>
 </body></html>`
@@ -1274,9 +1338,9 @@ func askPasswordModal(title, subtitle string) bool {
 		Debug:     false,
 		AutoFocus: true,
 		WindowOptions: webview2.WindowOptions{
-			Title:  "kiosk-exit-guard",
-			Width:  440,
-			Height: 280,
+			Title:  "SK Filter — password required",
+			Width:  520,
+			Height: 360,
 			Center: true,
 		},
 	})
@@ -1284,7 +1348,7 @@ func askPasswordModal(title, subtitle string) bool {
 		// WebView2 unavailable — fall back to zenity so the prompt still
 		// works on stripped-down machines that haven't auto-installed it.
 		pw, err := zenity.Entry(title+"\n"+subtitle,
-			zenity.Title("kiosk-exit-guard"), zenity.HideText())
+			zenity.Title("SK Filter"), zenity.HideText())
 		if err != nil {
 			return false
 		}
@@ -1331,8 +1395,8 @@ func promptAndReinject() {
 	}
 
 	verified := askPasswordModal(
-		"Enter password to allow this shortcut.",
-		"The keystroke is blocked while filter mode is on. Enter the admin password to let it through.",
+		"This command has been locked by the SK Filter",
+		"Please enter your password to continue. The keystroke will go through once you unlock.",
 	)
 
 	// Clear the pending combo regardless of outcome.
@@ -1350,55 +1414,56 @@ func promptAndReinject() {
 	sendKeyCombo(pc.modifiers, pc.vk)
 }
 
-func promptAndToggleFilterMode() {
+// promptAndPause is the hotkey handler in v0.5.1+. The SK Filter is
+// always on by default; pressing the hotkey starts a *pause* for a chosen
+// duration, after which the filter resumes automatically. There is no
+// "turn off" path — every pause has an explicit duration.
+//
+// If the filter is currently paused, the hotkey just shows the remaining
+// time and exits. (Ending a pause early would defeat the point.)
+func promptAndPause() {
 	if !promptOpen.CompareAndSwap(false, true) {
 		return
 	}
 	defer promptOpen.Store(false)
-	current := filterMode.Load()
-	verb := "ON"
-	if current {
-		verb = "OFF"
+
+	// Already paused → status read-out, no toggle.
+	if !filterMode.Load() {
+		remain := time.Until(time.Unix(0, pauseUntilNano.Load())).Round(time.Second)
+		showTimedInfo(fmt.Sprintf("SK Filter is paused.\nResumes in %s.", remain))
+		return
 	}
-	if !askPassword(fmt.Sprintf("Enter password to turn filter mode %s.", verb)) {
+
+	if !askPasswordModal(
+		"Pause the SK Filter?",
+		"Edge will be allowed and the kiosk will close for the duration you choose. The filter resumes automatically when the timer ends.",
+	) {
 		showFailedToast()
 		return
 	}
-	newState := !current
-	if !newState {
-		dur, accepted := askPauseDuration()
-		if !accepted {
-			return
-		}
-		if dur > 0 {
-			setPauseUntil(time.Now().Add(dur))
-			schedulePauseExpiry(dur)
-		} else {
-			setPauseUntil(time.Time{})
-			cancelPauseExpiry()
-		}
-	} else {
-		setPauseUntil(time.Time{})
-		cancelPauseExpiry()
+	dur, accepted := askPauseDuration()
+	if !accepted {
+		return
 	}
-	filterMode.Store(newState)
-	saveFilterModeToDisk(newState)
-	if newState {
-		applyLockdown()
-		watchdogTick()
-		showTimedInfo("Filter mode ON.\nKiosk window will launch.\nTask Manager, Run dialog, and escape shortcuts are blocked.")
-	} else {
-		removeLockdown()
-		killWebViewChild()
-		if pauseUntilNano.Load() != 0 {
-			showTimedInfo(fmt.Sprintf(
-				"Filter mode OFF.\nAuto-re-enable at %s.",
-				time.Unix(0, pauseUntilNano.Load()).Format("3:04 PM"),
-			))
-		} else {
-			showTimedInfo("Filter mode OFF (indefinitely).\nPress Ctrl+Shift+Alt+K to turn it back on.")
-		}
+	if dur <= 0 {
+		return
 	}
+
+	setPauseUntil(time.Now().Add(dur))
+	schedulePauseExpiry(dur)
+	filterMode.Store(false)
+	saveFilterModeToDisk(false)
+
+	// Tear everything down for the pause window:
+	removeLockdown()
+	removeIFEOBlock("chrome.exe")
+	removeIFEOBlock("msedge.exe")
+	killWebViewChild()
+
+	showTimedInfo(fmt.Sprintf(
+		"SK Filter paused.\nEdge is allowed; kiosk closed.\nResumes at %s.",
+		time.Unix(0, pauseUntilNano.Load()).Format("3:04 PM"),
+	))
 }
 
 // ---------- main ----------
@@ -1431,7 +1496,10 @@ func main() {
 			os.Exit(1)
 		}
 		storedHash = hash
-		if !askPassword("Enter password to clear lockdown and reset filter mode.") {
+		if !askPasswordModal(
+			"Reset SK Filter",
+			"Enter your password to clear the registry lockdown, the Chrome/Edge IFEO blocks, and the filter-mode state.",
+		) {
 			showFailedToast()
 			os.Exit(1)
 		}
@@ -1487,25 +1555,36 @@ func main() {
 			os.Exit(1)
 		}
 	} else {
-		// Make sure IFEO blocks survive — re-apply on every launch in case
-		// they were cleared (e.g. by a Windows feature update). Same for
-		// the desktop shortcut (cheap; silently overwrites).
-		applyBrowserBlocks()
+		// Desktop shortcut is cheap to re-create; silently overwrites if
+		// it already exists. (IFEO blocks are reapplied below in the
+		// state-restoration step instead of here so they get cleared
+		// correctly during a paused state.)
 		_ = createDesktopShortcut()
 	}
 	storedHash = hash
 
-	filterMode.Store(loadFilterModeFromDisk())
-	if pu := loadPauseFromDisk(); !pu.IsZero() {
-		if time.Now().Before(pu) {
-			pauseUntilNano.Store(pu.UnixNano())
-			schedulePauseExpiry(time.Until(pu))
-		} else {
-			autoReenableFilterMode()
-		}
-	}
-	if filterMode.Load() {
+	// Default state in v0.5.1+: SK Filter is ON. The only persisted state
+	// is the pause window (pause_until.state). If a pause is in-flight
+	// and hasn't expired, restore it; otherwise the filter is active.
+	pu := loadPauseFromDisk()
+	if !pu.IsZero() && time.Now().Before(pu) {
+		// Pause still active — keep filter off until timer fires.
+		pauseUntilNano.Store(pu.UnixNano())
+		schedulePauseExpiry(time.Until(pu))
+		filterMode.Store(false)
+		saveFilterModeToDisk(false)
+		// Ensure the registry/IFEO state matches "paused" — don't apply
+		// the kiosk lockdown or browser blocks until the pause ends.
+		removeLockdown()
+		removeIFEOBlock("chrome.exe")
+		removeIFEOBlock("msedge.exe")
+	} else {
+		// Default: filter is ON. Wipe any stale pause file.
+		setPauseUntil(time.Time{})
+		filterMode.Store(true)
+		saveFilterModeToDisk(true)
 		applyLockdown()
+		applyBrowserBlocks()
 	}
 	defer removeLockdown()
 	defer cancelPauseExpiry()
