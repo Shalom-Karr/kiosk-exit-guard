@@ -1,2 +1,4 @@
 *.exe
 password.hash
+filter_mode.state
+resource.syso

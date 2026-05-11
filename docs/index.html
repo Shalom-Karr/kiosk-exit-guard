@@ -3,33 +3,44 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>kiosk-exit-guard — Alt+F4 password gate for Windows kiosks</title>
+<title>kiosk-exit-guard — Windows 11 Home kiosk lockdown</title>
 <style>
   :root {
     --bg: #0f172a;
     --panel: #1e293b;
+    --panel-elev: #273449;
     --ink: #f8fafc;
     --muted: #94a3b8;
     --accent: #38bdf8;
     --accent-hover: #7dd3fc;
-    --border: rgba(148, 163, 184, 0.15);
+    --good: #4ade80;
+    --warn: #fbbf24;
+    --border: rgba(148, 163, 184, 0.18);
     --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; background: var(--bg); color: var(--ink);
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
     line-height: 1.55; -webkit-font-smoothing: antialiased; }
-  .wrap { max-width: 760px; margin: 0 auto; padding: 4rem 1.5rem 6rem; }
-  h1 { font-size: 2.25rem; margin: 0 0 0.25rem; letter-spacing: -0.02em; }
-  .tagline { color: var(--muted); margin: 0 0 2.5rem; }
+  .wrap { max-width: 820px; margin: 0 auto; padding: 4rem 1.5rem 6rem; }
+
+  header { margin-bottom: 2rem; }
+  h1 { font-size: 2.5rem; margin: 0 0 0.25rem; letter-spacing: -0.025em; line-height: 1.1; }
+  .tagline { color: var(--muted); margin: 0; font-size: 1.05rem; }
+  .version-pill { display: inline-block; background: rgba(56, 189, 248, 0.15); color: var(--accent);
+    padding: 0.15rem 0.6rem; border-radius: 999px; font-size: 0.75rem; font-weight: 600;
+    margin-left: 0.5rem; vertical-align: middle; letter-spacing: 0.02em; }
+
   .download-card {
-    background: var(--panel); border: 1px solid var(--border);
-    border-radius: 12px; padding: 1.75rem; margin: 0 0 2.5rem;
+    background: linear-gradient(180deg, var(--panel-elev), var(--panel));
+    border: 1px solid var(--border);
+    border-radius: 14px; padding: 1.75rem;
+    margin: 2.5rem 0;
     display: flex; align-items: center; justify-content: space-between; gap: 1.5rem;
     flex-wrap: wrap;
   }
-  .download-card .meta { font-size: 0.875rem; color: var(--muted); }
-  .download-card .meta code { background: rgba(255,255,255,0.05); padding: 0.1rem 0.4rem; border-radius: 4px; font-family: var(--mono); font-size: 0.85em; }
+  .download-card .meta { font-size: 0.875rem; color: var(--muted); margin-top: 0.6rem; }
+  .download-card .meta code { background: rgba(255,255,255,0.06); padding: 0.1rem 0.4rem; border-radius: 4px; font-family: var(--mono); font-size: 0.85em; }
   .btn {
     display: inline-flex; align-items: center; gap: 0.6rem;
     background: var(--accent); color: #0f172a;
@@ -39,10 +50,12 @@
   }
   .btn:hover { background: var(--accent-hover); }
   .btn svg { width: 18px; height: 18px; }
-  h2 { font-size: 1.25rem; margin: 2rem 0 0.75rem; letter-spacing: -0.01em; }
+
+  h2 { font-size: 1.35rem; margin: 2.5rem 0 0.85rem; letter-spacing: -0.01em; }
   h2:first-of-type { margin-top: 0; }
-  p { margin: 0 0 1rem; color: rgba(248, 250, 252, 0.9); }
-  ul, ol { margin: 0 0 1rem; padding-left: 1.25rem; color: rgba(248, 250, 252, 0.9); }
+  h3 { font-size: 1.05rem; margin: 1.5rem 0 0.5rem; color: var(--ink); }
+  p { margin: 0 0 1rem; color: rgba(248, 250, 252, 0.92); }
+  ul, ol { margin: 0 0 1rem; padding-left: 1.25rem; color: rgba(248, 250, 252, 0.92); }
   li { margin-bottom: 0.4rem; }
   code, pre { font-family: var(--mono); font-size: 0.875rem; }
   pre {
@@ -54,79 +67,113 @@
     width: 100%; border-collapse: collapse;
     margin: 0 0 1rem; font-size: 0.9rem;
   }
-  th, td { text-align: left; padding: 0.6rem 0.75rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th, td { text-align: left; padding: 0.7rem 0.75rem; border-bottom: 1px solid var(--border); vertical-align: top; }
   th { color: var(--muted); font-weight: 500; }
-  .links { margin-top: 3rem; font-size: 0.9rem; color: var(--muted); }
+  .check { color: var(--good); }
+  .x { color: var(--warn); }
+
+  .feature-grid { display: grid; gap: 0.85rem; grid-template-columns: 1fr; margin-bottom: 2rem; }
+  @media (min-width: 600px) { .feature-grid { grid-template-columns: 1fr 1fr; } }
+  .feature {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 1rem 1.15rem;
+  }
+  .feature h4 { margin: 0 0 0.4rem; font-size: 0.95rem; }
+  .feature p { margin: 0; font-size: 0.875rem; color: var(--muted); }
+
+  .links { margin-top: 3rem; font-size: 0.9rem; color: var(--muted); border-top: 1px solid var(--border); padding-top: 1.5rem; }
   .links a { color: var(--accent); text-decoration: none; }
   .links a:hover { text-decoration: underline; }
-  .warn { background: rgba(251, 191, 36, 0.08); border: 1px solid rgba(251, 191, 36, 0.3);
-    border-radius: 8px; padding: 0.75rem 1rem; margin: 1rem 0; font-size: 0.9rem; }
+  .warn-box { background: rgba(251, 191, 36, 0.08); border: 1px solid rgba(251, 191, 36, 0.3);
+    border-radius: 8px; padding: 0.85rem 1.1rem; margin: 1rem 0; font-size: 0.9rem; color: rgba(248,250,252,0.9); }
+  kbd { display: inline-block; padding: 0.1rem 0.4rem; border-radius: 4px;
+    background: rgba(255,255,255,0.07); border: 1px solid var(--border);
+    font-family: var(--mono); font-size: 0.8em; }
 </style>
 </head>
 <body>
 <div class="wrap">
 
-  <h1>kiosk-exit-guard</h1>
-  <p class="tagline">A tiny Windows utility that password-gates <code>Alt+F4</code> for kiosk setups where Assigned Access isn't available.</p>
+<header>
+  <h1>kiosk-exit-guard <span class="version-pill">v0.2.0</span></h1>
+  <p class="tagline">Single-binary kiosk lockdown for Windows 11 Home. Hotkey-toggleable filter mode that blocks every common escape path.</p>
+</header>
 
-  <div class="download-card">
-    <div>
-      <a class="btn" href="https://github.com/Shalom-Karr/kiosk-exit-guard/releases/latest/download/kiosk-exit-guard.exe">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-        Download <code>kiosk-exit-guard.exe</code>
-      </a>
-      <div class="meta" style="margin-top:0.75rem;">Latest release · Windows&nbsp;10/11 · amd64 · ~2.7&nbsp;MB · unsigned</div>
-    </div>
-    <div class="meta">
-      View on <a href="https://github.com/Shalom-Karr/kiosk-exit-guard" style="color:var(--accent);">GitHub</a> · all <a href="https://github.com/Shalom-Karr/kiosk-exit-guard/releases" style="color:var(--accent);">releases</a>
-    </div>
+<div class="download-card">
+  <div>
+    <a class="btn" href="https://github.com/Shalom-Karr/kiosk-exit-guard/releases/latest/download/kiosk-exit-guard.exe">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+      Download <code>kiosk-exit-guard.exe</code>
+    </a>
+    <div class="meta">Latest · Windows&nbsp;11&nbsp;Home · amd64 · ~2.97&nbsp;MB · unsigned · requires UAC consent on first launch</div>
   </div>
-
-  <h2>What it does</h2>
-  <p>Installs a low-level keyboard hook. When you press <code>Alt+F4</code>, instead of closing the focused window, you get a password prompt. Right password closes the window; wrong password (or cancel) shows a brief "Wrong password" toast and the keystroke is dropped.</p>
-
-  <table>
-    <tr><th>Keypress</th><th>Behavior</th></tr>
-    <tr><td><code>Alt+F4</code> + correct password</td><td>Forwards <code>WM_CLOSE</code> to the previously-focused window</td></tr>
-    <tr><td><code>Alt+F4</code> + wrong password or cancel</td><td>Keystroke swallowed; auto-dismissing "Wrong password" toast (2s)</td></tr>
-    <tr><td>Anything else</td><td>Untouched — normal behavior</td></tr>
-  </table>
-
-  <h2>Quick setup</h2>
-  <ol>
-    <li>Download the exe (button above) and place it in <code>C:\Program&nbsp;Files\KioskExitGuard\</code> (admin write, user read).</li>
-    <li>Run once as admin to set the password:
-      <pre>"C:\Program Files\KioskExitGuard\kiosk-exit-guard.exe" --set-password</pre>
-      This writes a bcrypt hash to <code>password.hash</code> next to the exe.
-    </li>
-    <li>Auto-launch on the kiosk user's login via Task Scheduler:
-      <pre>$action = New-ScheduledTaskAction -Execute "C:\Program Files\KioskExitGuard\kiosk-exit-guard.exe"
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User "luach"
-Register-ScheduledTask -TaskName "KioskExitGuard" -Action $action -Trigger $trigger -RunLevel Limited</pre>
-    </li>
-  </ol>
-
-  <div class="warn">
-    First run will hit <strong>Microsoft Defender SmartScreen</strong> because the binary is unsigned. Click <em>More info</em> → <em>Run anyway</em>. Add the install directory to Defender exclusions if needed.
+  <div class="meta">
+    Source on <a href="https://github.com/Shalom-Karr/kiosk-exit-guard" style="color:var(--accent);">GitHub</a> · all <a href="https://github.com/Shalom-Karr/kiosk-exit-guard/releases" style="color:var(--accent);">releases</a>
   </div>
+</div>
 
-  <h2>What it doesn't do</h2>
-  <p>This is a single-key guard. It does <strong>not</strong> block <code>Win+R</code>, <code>Win+E</code>, <code>Ctrl+Shift+Esc</code>, or other escape paths — lock those down via Group Policy or registry. And because the guard runs in user space, anyone who reaches Task Manager can kill it; pair with a standard (non-admin) kiosk account and a disabled Task Manager policy.</p>
+<h2>What's in v0.2.0</h2>
+<div class="feature-grid">
+  <div class="feature"><h4>UAC manifest</h4><p>Embedded into the exe — every launch requests admin elevation cleanly.</p></div>
+  <div class="feature"><h4>First-run modal</h4><p>No flags needed. Drop the exe, double-click, set the password in the prompts.</p></div>
+  <div class="feature"><h4>Self-install at startup</h4><p>Registers a Task Scheduler entry that re-launches the exe at every user logon with HIGHEST run level.</p></div>
+  <div class="feature"><h4>Filter mode hotkey</h4><p><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Alt</kbd>+<kbd>K</kbd> → password → filter mode flips on/off. State persists across reboots.</p></div>
+  <div class="feature"><h4>Keystroke blocks</h4><p><kbd>Win</kbd>+<kbd>R</kbd>, <kbd>Win</kbd>+<kbd>E</kbd>, <kbd>Win</kbd>+<kbd>D</kbd>, <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Esc</kbd> silently swallowed when filter mode is on.</p></div>
+  <div class="feature"><h4>Registry policy lockdown</h4><p>Sets <code>DisableTaskMgr</code> and <code>NoRun</code> under HKCU. Restored automatically when filter mode is off.</p></div>
+</div>
 
-  <h2>How it works</h2>
-  <ul>
-    <li><code>SetWindowsHookExW(WH_KEYBOARD_LL)</code> — global low-level keyboard hook</li>
-    <li>Detects <code>Alt+F4</code> via <code>GetAsyncKeyState</code> + virtual-key code <code>0x73</code></li>
-    <li>Password prompt is a native Win32 input box (masked) via <a href="https://github.com/ncruces/zenity" style="color:var(--accent);">ncruces/zenity</a></li>
-    <li>On correct password, posts <code>WM_CLOSE</code> to the previously-focused window (cleaner than re-injecting Alt+F4)</li>
-    <li>Password stored as a <code>bcrypt</code> hash at cost 10 in <code>password.hash</code></li>
-    <li>Built with <code>-ldflags="-H windowsgui -s -w"</code> so it runs invisibly without a console window</li>
-  </ul>
+<h2>How filter mode works</h2>
 
-  <p class="links">
-    Source · <a href="https://github.com/Shalom-Karr/kiosk-exit-guard">github.com/Shalom-Karr/kiosk-exit-guard</a><br>
-    MIT licensed.
-  </p>
+<table>
+  <tr><th>Filter mode</th><th>What happens</th></tr>
+  <tr><td><strong>OFF</strong> (default)</td><td>All keys pass through. Registry policies are clean. The hook is installed but only listens for the toggle hotkey.</td></tr>
+  <tr><td><strong>ON</strong></td><td>Alt+F4 prompts for the password. Win+R/E/D and Ctrl+Shift+Esc are dropped. Task Manager refuses to launch ("disabled by your administrator"). Run dialog refuses to open.</td></tr>
+</table>
+
+<p>The toggle hotkey is <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Alt</kbd>+<kbd>K</kbd>. Pressing it any time — in either mode — opens a password prompt. Correct password flips the mode and persists the state to <code>filter_mode.state</code> next to the exe.</p>
+
+<h2>Setup</h2>
+
+<ol>
+  <li>Download the exe (button above) and drop it in <code>C:\Program&nbsp;Files\KioskExitGuard\</code>.</li>
+  <li>Double-click it. Approve the UAC prompt.</li>
+  <li>Set a password in the two prompts that appear.</li>
+  <li>The exe auto-installs a Task Scheduler entry. From now on it relaunches at every user logon.</li>
+  <li>Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Alt</kbd>+<kbd>K</kbd> to turn filter mode on whenever you want the kiosk locked down.</li>
+</ol>
+
+<div class="warn-box">
+  <strong>SmartScreen warning on first launch.</strong> The exe is unsigned. Click <em>More info</em> → <em>Run anyway</em>. If Defender quarantines it, add the install directory to the exclusion list.
+</div>
+
+<h2>What it doesn't block</h2>
+<ul>
+  <li><kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Del</kbd> and <kbd>Win</kbd>+<kbd>L</kbd> go through Windows' Secure Attention Sequence, which sits below any user-mode hook. No user-mode tool can intercept them. A determined user can always reach the SAS menu or lock screen.</li>
+  <li>Booting from USB / safe mode — set a BIOS password to prevent this.</li>
+  <li>An admin with an elevated terminal can still kill the exe. The Task Manager disable makes this a much higher bar for a standard kiosk user.</li>
+</ul>
+
+<h2>CLI flags</h2>
+
+<pre>kiosk-exit-guard.exe                  # normal run — restores filter-mode state and installs hook
+kiosk-exit-guard.exe --set-password   # change the password
+kiosk-exit-guard.exe --reset          # restore registry, reset filter-mode to OFF (recovery)</pre>
+
+<h2>Build from source</h2>
+
+<pre>git clone https://github.com/Shalom-Karr/kiosk-exit-guard.git
+cd kiosk-exit-guard
+
+# Regenerate the UAC manifest .syso
+go install github.com/josephspurrier/goversioninfo/cmd/goversioninfo@latest
+goversioninfo -64 versioninfo.json
+
+# Build the windowless exe
+go build -ldflags="-H windowsgui -s -w" -o kiosk-exit-guard.exe</pre>
+
+<p class="links">
+  Source · <a href="https://github.com/Shalom-Karr/kiosk-exit-guard">github.com/Shalom-Karr/kiosk-exit-guard</a> · MIT
+</p>
 
 </div>
 </body>
