@@ -144,6 +144,7 @@ var (
 	procSetWindowPos        = user32.NewProc("SetWindowPos")
 	procGetSystemMetrics    = user32.NewProc("GetSystemMetrics")
 	procShowWindow          = user32.NewProc("ShowWindow")
+	procSendInput           = user32.NewProc("SendInput")
 
 	storedHash []byte
 	promptOpen atomic.Bool
@@ -529,6 +530,97 @@ func isModifierVK(vk uint32) bool {
 	return false
 }
 
+// ---------- SendInput re-injection ----------
+
+// INPUT on x64 is 40 bytes: 4 (type) + 4 (alignment pad) + 32 (largest
+// union member is MOUSEINPUT, padded to 32 for ULONG_PTR alignment).
+type winInput struct {
+	Type uint32
+	_    uint32
+	U    [32]byte
+}
+
+type keybdInput struct {
+	Vk        uint16
+	Scan      uint16
+	Flags     uint32
+	Time      uint32
+	ExtraInfo uintptr
+}
+
+const (
+	inputKeyboard   = 1
+	keyeventfKeyUp  = 0x0002
+	kioskMarkerCode = 0xC0DE
+)
+
+// buildKey constructs an INPUT for a single key event. The kiosk marker
+// is stuffed into ExtraInfo so our own hook recognizes these as our own
+// re-injection and lets them through.
+func buildKey(vk uint32, up bool) winInput {
+	var in winInput
+	in.Type = inputKeyboard
+	k := (*keybdInput)(unsafe.Pointer(&in.U[0]))
+	k.Vk = uint16(vk)
+	if up {
+		k.Flags = keyeventfKeyUp
+	}
+	k.ExtraInfo = uintptr(kioskMarkerCode)
+	return in
+}
+
+// sendKeyCombo replays the given key combo via SendInput. Modifiers are
+// pressed in order, the main key is press/released, then modifiers are
+// released in reverse. The kiosk-exit-guard marker in ExtraInfo means
+// our own hook callback won't re-block these.
+func sendKeyCombo(modifiers []uint32, vk uint32) {
+	if procSendInput.Find() != nil {
+		return
+	}
+	inputs := make([]winInput, 0, 2*len(modifiers)+2)
+	for _, m := range modifiers {
+		inputs = append(inputs, buildKey(m, false))
+	}
+	inputs = append(inputs, buildKey(vk, false), buildKey(vk, true))
+	for i := len(modifiers) - 1; i >= 0; i-- {
+		inputs = append(inputs, buildKey(modifiers[i], true))
+	}
+	procSendInput.Call(
+		uintptr(len(inputs)),
+		uintptr(unsafe.Pointer(&inputs[0])),
+		unsafe.Sizeof(inputs[0]),
+	)
+}
+
+// pendingCombo captures the key + modifier state we swallowed, waiting on
+// password verification before re-injecting.
+type pendingCombo struct {
+	vk        uint32
+	modifiers []uint32
+}
+
+var (
+	pendingComboMu sync.Mutex
+	pendingComboV  *pendingCombo
+)
+
+func capturedModifiers() []uint32 {
+	mods := make([]uint32, 0, 4)
+	if ctrlDown() {
+		mods = append(mods, vkLCtrl)
+	}
+	if shiftDown() {
+		mods = append(mods, vkLShift)
+	}
+	if altDown() {
+		mods = append(mods, vkLMenu)
+	}
+	if winDown() {
+		mods = append(mods, vkLWin)
+	}
+	return mods
+}
+
 // ---------- toast helpers ----------
 
 func showTimedInfo(text string) {
@@ -649,6 +741,228 @@ func ensureWebView2Installed() error {
 		return fmt.Errorf("bootstrapper exited cleanly but runtime still not detected")
 	}
 	return nil
+}
+
+// ---------- desktop shortcut ----------
+
+// createDesktopShortcut drops a .lnk on the current user's desktop pointing
+// at this exe. Idempotent. Run as part of first-run setup so the admin has
+// a one-click launcher next to whatever else they use.
+func createDesktopShortcut() error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	exeQ := strings.ReplaceAll(exe, `'`, `''`)
+	workDir := strings.ReplaceAll(filepath.Dir(exe), `'`, `''`)
+	ps := fmt.Sprintf(`
+$ws = New-Object -ComObject WScript.Shell
+$desktop = [Environment]::GetFolderPath('Desktop')
+$lnk = $ws.CreateShortcut(("$desktop\Kiosk Exit Guard.lnk"))
+$lnk.TargetPath = '%s'
+$lnk.WorkingDirectory = '%s'
+$lnk.IconLocation = ('%s' + ',0')
+$lnk.Description = 'Kiosk Exit Guard - kiosk lockdown utility'
+$lnk.Save()
+`, exeQ, workDir, exeQ)
+	cmd := exec.Command("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps)
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("shortcut create failed: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// ---------- first-run wizard (WebView2-backed) ----------
+
+const firstRunHTML = `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<style>
+  *,*::before,*::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: radial-gradient(ellipse at top, #131c30, #0b1220 65%);
+    color: #f1f5f9; font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
+    line-height: 1.55; height: 100vh; overflow: hidden; -webkit-font-smoothing: antialiased; }
+  .wrap { height: 100vh; display: flex; align-items: center; justify-content: center; padding: 1.5rem; }
+  .card { background: linear-gradient(180deg, #232f48, #1a2438);
+    border: 1px solid rgba(148, 163, 184, 0.22); border-radius: 16px;
+    padding: 2.25rem 2.5rem; width: 520px; max-width: 100%;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.45); }
+  h1 { font-size: 1.65rem; margin: 0 0 0.5rem; letter-spacing: -0.02em; font-weight: 700; }
+  .pill { display: inline-block; background: rgba(56, 189, 248, 0.15); color: #38bdf8;
+    padding: 0.15rem 0.6rem; border-radius: 999px; font-size: 0.7rem; font-weight: 700;
+    margin-left: 0.5rem; vertical-align: middle; letter-spacing: 0.04em; text-transform: uppercase; }
+  .subtitle { color: #94a3b8; font-size: 0.95rem; margin: 0 0 1.75rem; max-width: 44ch; }
+  .field { margin-bottom: 1.15rem; }
+  label { display: block; font-size: 0.78rem; color: #94a3b8; margin-bottom: 0.4rem;
+    font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }
+  input { width: 100%; padding: 0.75rem 1rem; border-radius: 8px;
+    border: 1px solid rgba(148, 163, 184, 0.25); background: rgba(15, 23, 42, 0.7);
+    color: #f1f5f9; font-size: 0.95rem; font-family: inherit; transition: border-color 0.15s; }
+  input:focus { outline: none; border-color: #38bdf8; box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.15); }
+  .help { color: #64748b; font-size: 0.8rem; margin: 0.35rem 0 0; }
+  .error { color: #ef4444; font-size: 0.85rem; min-height: 1.2em; margin: 0.65rem 0 0;
+    background: rgba(239, 68, 68, 0.08); border: 1px solid rgba(239, 68, 68, 0.25);
+    padding: 0.5rem 0.75rem; border-radius: 6px; display: none; }
+  .error.show { display: block; }
+  .actions { display: flex; gap: 0.6rem; justify-content: flex-end; margin-top: 1.65rem; }
+  button { padding: 0.75rem 1.7rem; border-radius: 9px; border: 0; cursor: pointer;
+    font-weight: 700; font-size: 0.95rem; font-family: inherit; transition: background 0.15s, transform 0.1s; }
+  button:disabled { opacity: 0.55; cursor: not-allowed; }
+  .btn-primary { background: #38bdf8; color: #0b1220; }
+  .btn-primary:hover:not(:disabled) { background: #7dd3fc; }
+  .btn-primary:active:not(:disabled) { transform: translateY(1px); }
+  .steps { display: flex; gap: 1rem; margin-bottom: 1.5rem; padding: 0.85rem 1rem;
+    background: rgba(15, 23, 42, 0.5); border-radius: 8px; border: 1px solid rgba(148, 163, 184, 0.12);
+    font-size: 0.78rem; color: #94a3b8; }
+  .steps strong { color: #f1f5f9; display: block; font-size: 0.8rem; margin-bottom: 0.15rem; font-weight: 600; }
+  .step { flex: 1; }
+  .step.done { opacity: 0.55; }
+  .step.done strong::before { content: '✓ '; color: #22c55e; }
+</style></head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <h1>kiosk-exit-guard <span class="pill">first run</span></h1>
+    <p class="subtitle">Set an admin password and the kiosk URL. Setup will then uninstall Chrome, block Edge launches, and install the auto-start task.</p>
+
+    <div class="steps">
+      <div class="step"><strong>1 · Password</strong>Used to exit kiosk &amp; toggle filter mode</div>
+      <div class="step"><strong>2 · Kiosk URL</strong>The page WebView2 will display</div>
+      <div class="step"><strong>3 · System setup</strong>Chrome / Edge / startup task</div>
+    </div>
+
+    <div class="field">
+      <label for="pw1">Admin password</label>
+      <input type="password" id="pw1" autofocus />
+    </div>
+    <div class="field">
+      <label for="pw2">Confirm password</label>
+      <input type="password" id="pw2" />
+    </div>
+    <div class="field">
+      <label for="url">Kiosk URL</label>
+      <input type="text" id="url" value="" />
+      <p class="help">Pre-filled with the most recent value. Anything you can open in a browser works.</p>
+    </div>
+
+    <div class="error" id="error"></div>
+
+    <div class="actions">
+      <button class="btn-primary" id="submit" onclick="submit()">Continue</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  document.getElementById('url').value = window.__defaultURL || 'https://skluach.pages.dev/CMH/';
+  function showErr(msg) {
+    var el = document.getElementById('error');
+    el.textContent = msg;
+    el.classList.add('show');
+  }
+  function clearErr() {
+    document.getElementById('error').classList.remove('show');
+  }
+  function submit() {
+    var pw1 = document.getElementById('pw1').value;
+    var pw2 = document.getElementById('pw2').value;
+    var url = document.getElementById('url').value.trim();
+    if (!pw1) { showErr('Password is required.'); return; }
+    if (pw1 !== pw2) { showErr('Passwords do not match.'); return; }
+    if (!url) { showErr('Kiosk URL is required.'); return; }
+    clearErr();
+    var btn = document.getElementById('submit');
+    btn.disabled = true;
+    btn.textContent = 'Saving…';
+    window.kgSubmit(pw1, url);
+  }
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') { e.preventDefault(); submit(); }
+  });
+</script>
+</body></html>`
+
+type firstRunInput struct {
+	password string
+	url      string
+	ok       bool
+}
+
+// runFirstRunWizard opens a branded WebView2 window with the first-run
+// setup form. Blocks until the user clicks Continue (or closes the window).
+// Returns the entered password + URL, or ok=false if the window was closed
+// without submitting.
+func runFirstRunWizard() *firstRunInput {
+	result := &firstRunInput{}
+	w := webview2.NewWithOptions(webview2.WebViewOptions{
+		Debug:     false,
+		AutoFocus: true,
+		WindowOptions: webview2.WindowOptions{
+			Title:  "kiosk-exit-guard — first run",
+			Width:  620,
+			Height: 680,
+			Center: true,
+		},
+	})
+	if w == nil {
+		return nil // caller falls back to zenity
+	}
+	defer w.Destroy()
+
+	w.Bind("kgSubmit", func(pw, url string) {
+		result.password = pw
+		result.url = strings.TrimSpace(url)
+		result.ok = true
+		w.Terminate()
+	})
+
+	// Inject the default URL via a window-level global before the page
+	// runs so the input's value is correct on first paint.
+	w.Init(fmt.Sprintf(`window.__defaultURL = %q;`, loadKioskURL()))
+	w.SetHtml(firstRunHTML)
+	w.Run()
+	return result
+}
+
+// firstRunWithWizard runs the full first-run sequence using the WebView2
+// wizard for password + URL, then performs the system-setup steps
+// (Chrome uninstall, IFEO blocks, Task Scheduler, desktop shortcut).
+// Returns whether setup completed cleanly.
+func firstRunWithWizard() bool {
+	input := runFirstRunWizard()
+	if input == nil || !input.ok {
+		return false
+	}
+
+	hash, err := bcrypt.GenerateFromPassword([]byte(input.password), bcrypt.DefaultCost)
+	if err != nil {
+		_ = zenity.Error(err.Error(), zenity.Title("kiosk-exit-guard"))
+		return false
+	}
+	if err := saveHashToRegistry(hash); err != nil {
+		_ = zenity.Error("Could not save password: "+err.Error(), zenity.Title("kiosk-exit-guard"))
+		return false
+	}
+	if err := saveKioskURLToRegistry(input.url); err != nil {
+		_ = zenity.Error("Could not save URL: "+err.Error(), zenity.Title("kiosk-exit-guard"))
+		return false
+	}
+
+	_ = uninstallChrome()
+	applyBrowserBlocks()
+	_ = createDesktopShortcut()
+
+	taskErr := installStartupTask()
+	if taskErr != nil {
+		_ = zenity.Warning(
+			fmt.Sprintf("Auto-start install failed: %v\n\nThe exe is configured but won't launch automatically until you create a Task Scheduler entry manually.", taskErr),
+			zenity.Title("kiosk-exit-guard"),
+		)
+	}
+	_ = zenity.Info(
+		"Setup complete.\n\n• Password and kiosk URL saved\n• Chrome uninstalled\n• Chrome and Edge launches blocked\n• Desktop shortcut created\n• Auto-start task installed\n\nUse Ctrl+Shift+Alt+K to toggle filter mode.\nFilter mode starts OFF.",
+		zenity.Title("kiosk-exit-guard"),
+	)
+	return true
 }
 
 // ---------- WebView2 kiosk window ----------
@@ -842,7 +1156,10 @@ func hookCallback(nCode int32, wParam uintptr, lParam uintptr) uintptr {
 	if nCode >= 0 && (wParam == wmKeyDown || wParam == wmSysKeyDown) {
 		kb := (*kbdLLHookStruct)(unsafe.Pointer(lParam))
 		injected := (kb.Flags & llkhfInject) != 0
-		if !injected {
+		// Skip events we injected ourselves (carries our marker so SendInput
+		// re-injections after password verification pass through).
+		ourInjection := kb.DwExtraInfo == uintptr(kioskMarkerCode)
+		if !injected && !ourInjection {
 			if kb.VkCode == vkK && ctrlDown() && shiftDown() && altDown() {
 				if !promptOpen.Load() {
 					go promptAndToggleFilterMode()
@@ -850,13 +1167,19 @@ func hookCallback(nCode int32, wParam uintptr, lParam uintptr) uintptr {
 				return 1
 			}
 			if filterMode.Load() {
-				if kb.VkCode == vkF4 && altDown() {
-					if !promptOpen.Load() {
-						go promptAndMaybeExit()
-					}
-					return 1
-				}
 				if !isModifierVK(kb.VkCode) && (ctrlDown() || winDown() || altDown()) {
+					// Capture the combo, swallow this event, and prompt
+					// for the password. On verification, re-inject the
+					// original combo so the user's intended action lands.
+					if !promptOpen.Load() {
+						pendingComboMu.Lock()
+						pendingComboV = &pendingCombo{
+							vk:        kb.VkCode,
+							modifiers: capturedModifiers(),
+						}
+						pendingComboMu.Unlock()
+						go promptAndReinject()
+					}
 					return 1
 				}
 			}
@@ -868,29 +1191,163 @@ func hookCallback(nCode int32, wParam uintptr, lParam uintptr) uintptr {
 
 // ---------- password-gated actions ----------
 
-func askPassword(label string) bool {
-	pw, err := zenity.Entry(
-		label,
-		zenity.Title("kiosk-exit-guard"),
-		zenity.HideText(),
-	)
-	if err != nil {
+// passwordPromptHTML is a branded WebView2 dialog used wherever the user
+// has to enter the admin password. The input is autofocused so the user
+// can start typing the moment the window appears.
+const passwordPromptHTML = `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<style>
+  *,*::before,*::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0;
+    background: radial-gradient(ellipse at top, #131c30, #0b1220 65%);
+    color: #f1f5f9; font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
+    height: 100vh; -webkit-font-smoothing: antialiased; overflow: hidden; }
+  .wrap { height: 100vh; display: flex; align-items: center; justify-content: center; padding: 1rem; }
+  .card { background: linear-gradient(180deg, #232f48, #1a2438);
+    border: 1px solid rgba(148, 163, 184, 0.22); border-radius: 14px;
+    padding: 1.5rem 1.75rem; width: 100%; box-shadow: 0 20px 60px rgba(0,0,0,0.45); }
+  h1 { font-size: 1.05rem; margin: 0 0 0.35rem; letter-spacing: -0.01em; }
+  .subtitle { color: #94a3b8; font-size: 0.85rem; margin: 0 0 1.1rem; }
+  input { width: 100%; padding: 0.75rem 1rem; border-radius: 8px;
+    border: 1px solid rgba(148, 163, 184, 0.3); background: rgba(15, 23, 42, 0.7);
+    color: #f1f5f9; font-size: 0.95rem; font-family: inherit;
+    transition: border-color 0.15s, box-shadow 0.15s; }
+  input:focus { outline: none; border-color: #38bdf8;
+    box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.18); }
+  .err { color: #fca5a5; font-size: 0.82rem; margin: 0.55rem 0 0;
+    background: rgba(239, 68, 68, 0.08); border: 1px solid rgba(239, 68, 68, 0.28);
+    padding: 0.45rem 0.65rem; border-radius: 6px; display: none; }
+  .err.show { display: block; }
+  .actions { display: flex; gap: 0.6rem; justify-content: flex-end; margin-top: 1.1rem; }
+  button { padding: 0.6rem 1.3rem; border-radius: 7px; border: 0; cursor: pointer;
+    font-weight: 600; font-size: 0.9rem; font-family: inherit; transition: background 0.15s; }
+  .btn-primary { background: #38bdf8; color: #0b1220; }
+  .btn-primary:hover { background: #7dd3fc; }
+  .btn-secondary { background: transparent; color: #94a3b8;
+    border: 1px solid rgba(148, 163, 184, 0.3); }
+  .btn-secondary:hover { color: #f1f5f9; border-color: rgba(148, 163, 184, 0.5); }
+</style></head>
+<body>
+<div class="wrap"><div class="card">
+  <h1 id="title">Enter password</h1>
+  <p class="subtitle" id="subtitle">Required to continue.</p>
+  <input type="password" id="pw" />
+  <div class="err" id="err"></div>
+  <div class="actions">
+    <button class="btn-secondary" onclick="cancel()">Cancel</button>
+    <button class="btn-primary" onclick="submit()">OK</button>
+  </div>
+</div></div>
+<script>
+  document.getElementById('title').textContent = window.__title || 'Enter password';
+  document.getElementById('subtitle').textContent = window.__subtitle || '';
+  var input = document.getElementById('pw');
+  // Autofocus — both via attribute and explicit call to handle the
+  // race between WebView2's first paint and the focus event.
+  setTimeout(function() { input.focus(); input.select(); }, 0);
+  window.addEventListener('load', function() { input.focus(); });
+  input.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') { e.preventDefault(); submit(); }
+    if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+  });
+  function submit() {
+    window.kgSubmit(input.value);
+  }
+  function cancel() { window.kgCancel(); }
+</script>
+</body></html>`
+
+// askPasswordModal shows a branded, autofocused WebView2 password dialog.
+// Returns (ok=true) only if the user entered a password that matches the
+// stored bcrypt hash.
+func askPasswordModal(title, subtitle string) bool {
+	if !promptOpen.CompareAndSwap(false, true) {
 		return false
 	}
-	return bcrypt.CompareHashAndPassword(storedHash, []byte(pw)) == nil
+	defer promptOpen.Store(false)
+
+	var (
+		entered string
+		ok      bool
+	)
+
+	w := webview2.NewWithOptions(webview2.WebViewOptions{
+		Debug:     false,
+		AutoFocus: true,
+		WindowOptions: webview2.WindowOptions{
+			Title:  "kiosk-exit-guard",
+			Width:  440,
+			Height: 280,
+			Center: true,
+		},
+	})
+	if w == nil {
+		// WebView2 unavailable — fall back to zenity so the prompt still
+		// works on stripped-down machines that haven't auto-installed it.
+		pw, err := zenity.Entry(title+"\n"+subtitle,
+			zenity.Title("kiosk-exit-guard"), zenity.HideText())
+		if err != nil {
+			return false
+		}
+		return bcrypt.CompareHashAndPassword(storedHash, []byte(pw)) == nil
+	}
+	defer w.Destroy()
+
+	w.Bind("kgSubmit", func(pw string) {
+		entered = pw
+		ok = true
+		w.Terminate()
+	})
+	w.Bind("kgCancel", func() {
+		w.Terminate()
+	})
+
+	w.Init(fmt.Sprintf(`window.__title = %q; window.__subtitle = %q;`, title, subtitle))
+	w.SetHtml(passwordPromptHTML)
+	w.Run()
+
+	if !ok {
+		return false
+	}
+	return bcrypt.CompareHashAndPassword(storedHash, []byte(entered)) == nil
 }
 
-func promptAndMaybeExit() {
-	if !promptOpen.CompareAndSwap(false, true) {
+// Backwards-compatible alias used by the toggle and reset paths.
+func askPassword(label string) bool {
+	// Split the label on the first newline into title + subtitle for the
+	// modal layout. Callers like "Enter password to exit kiosk." pass a
+	// single line.
+	return askPasswordModal(label, "")
+}
+
+// promptAndReinject is the goroutine kicked off when the hook captures a
+// blocked combo. Verifies the password, then re-injects the original key
+// combo so the user's intended action goes through.
+func promptAndReinject() {
+	pendingComboMu.Lock()
+	pc := pendingComboV
+	pendingComboMu.Unlock()
+	if pc == nil {
 		return
 	}
-	defer promptOpen.Store(false)
-	hwnd, _, _ := procGetForegroundWindow.Call()
-	if !askPassword("Enter password to exit kiosk.") {
+
+	verified := askPasswordModal(
+		"Enter password to allow this shortcut.",
+		"The keystroke is blocked while filter mode is on. Enter the admin password to let it through.",
+	)
+
+	// Clear the pending combo regardless of outcome.
+	pendingComboMu.Lock()
+	pendingComboV = nil
+	pendingComboMu.Unlock()
+
+	if !verified {
 		showFailedToast()
 		return
 	}
-	procPostMessageW.Call(hwnd, uintptr(wmClose), 0, 0)
+	// Re-inject with a small delay so any in-flight key events the user
+	// has released (modifiers) settle before we replay.
+	time.Sleep(80 * time.Millisecond)
+	sendKeyCombo(pc.modifiers, pc.vk)
 }
 
 func promptAndToggleFilterMode() {
@@ -1020,12 +1477,8 @@ func main() {
 	hash, err := loadHash()
 	firstRun := err != nil || len(hash) == 0
 	if firstRun {
-		_ = zenity.Info(
-			"First run.\n\nWe'll:\n  1. Set an admin password\n  2. Set the kiosk URL\n  3. Uninstall Chrome (if present)\n  4. Block Chrome and Edge launches via Image File Execution Options\n  5. Register a startup task",
-			zenity.Title("kiosk-exit-guard — first run"),
-		)
-		if perr := setPassword(); perr != nil {
-			_ = zenity.Error(perr.Error(), zenity.Title("kiosk-exit-guard"))
+		if !firstRunWithWizard() {
+			// User cancelled the wizard or setup failed mid-flow. Bail.
 			os.Exit(1)
 		}
 		hash, err = loadHash()
@@ -1033,29 +1486,12 @@ func main() {
 			_ = zenity.Error("Password did not save. Aborting.", zenity.Title("kiosk-exit-guard"))
 			os.Exit(1)
 		}
-		if _, perr := promptForKioskURL(); perr != nil {
-			_ = zenity.Warning(
-				fmt.Sprintf("Kiosk URL not saved: %v\nFalling back to default. Change later with --set-url.", perr),
-				zenity.Title("kiosk-exit-guard"),
-			)
-		}
-		_ = uninstallChrome()
-		applyBrowserBlocks()
-		if instErr := installStartupTask(); instErr != nil {
-			_ = zenity.Warning(
-				fmt.Sprintf("Auto-start install failed: %v\nThe exe is configured but won't launch automatically until you create a Task Scheduler entry manually.", instErr),
-				zenity.Title("kiosk-exit-guard"),
-			)
-		} else {
-			_ = zenity.Info(
-				"Setup complete.\n\nChrome uninstalled.\nChrome and Edge launches are blocked at the OS level.\nScheduled task \""+taskName+"\" launches kiosk-exit-guard at every user logon.\n\nUse Ctrl+Shift+Alt+K to toggle filter mode.\nFilter mode starts OFF.",
-				zenity.Title("kiosk-exit-guard"),
-			)
-		}
 	} else {
 		// Make sure IFEO blocks survive — re-apply on every launch in case
-		// they were somehow cleared (e.g. by a Windows feature update).
+		// they were cleared (e.g. by a Windows feature update). Same for
+		// the desktop shortcut (cheap; silently overwrites).
 		applyBrowserBlocks()
+		_ = createDesktopShortcut()
 	}
 	storedHash = hash
 
