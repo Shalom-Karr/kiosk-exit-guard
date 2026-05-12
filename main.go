@@ -517,21 +517,37 @@ func uninstallChrome() error {
 
 // ---------- self-install via schtasks ----------
 
+// installStartupTask registers the controller's auto-launch via the
+// PowerShell ScheduledTasks module (more capable than schtasks CLI):
+//
+//   - Trigger 1: at logon of any user
+//   - Trigger 2: every 1 minute (watchdog — re-fires if controller died)
+//   - MultipleInstances=IgnoreNew → duplicate fires no-op when already running
+//   - AllowStartIfOnBatteries=true + DontStopIfGoingOnBatteries=true
+//   - StartWhenAvailable=true (catch up missed fires after sleep/reboot)
+//   - ExecutionTimeLimit=0 (no timeout — controller runs until killed)
+//   - RestartOnFailure: 3 retries, 1 minute apart
+//   - RunLevel=Highest (no UAC prompt at fire time; admin token from task)
+//
+// Idempotent: -Force replaces any existing task with the same name.
 func installStartupTask() error {
 	exe, err := os.Executable()
 	if err != nil {
 		return err
 	}
-	cmd := exec.Command(
-		"schtasks", "/Create", "/F",
-		"/TN", taskName,
-		"/TR", fmt.Sprintf(`"%s"`, exe),
-		"/SC", "ONLOGON",
-		"/RL", "HIGHEST",
-	)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("schtasks failed: %v: %s", err, strings.TrimSpace(string(out)))
+	exeQ := strings.ReplaceAll(exe, `'`, `''`)
+	ps := fmt.Sprintf(`
+$action  = New-ScheduledTaskAction -Execute '%s'
+$logon   = New-ScheduledTaskTrigger -AtLogOn
+$watch   = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration ([TimeSpan]::MaxValue)
+$settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -Hidden
+$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -RunLevel Highest -LogonType Interactive
+Register-ScheduledTask -TaskName '%s' -Action $action -Trigger @($logon,$watch) -Settings $settings -Principal $principal -Force | Out-Null
+`, exeQ, taskName)
+	cmd := exec.Command("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps)
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("Register-ScheduledTask failed: %v: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
@@ -593,6 +609,13 @@ func makeWindowTopmostFront(hwnd uintptr) {
 // password modal is then dismissable only through the in-page Cancel
 // button (or correct password). Critical to prevent killing the modal
 // from bypassing the password gate.
+//
+// Earlier revisions also called BringWindowToTop + SetForegroundWindow
+// here, but SetForegroundWindow has strict eligibility rules and on some
+// Windows builds the combination contributed to a modal hang ("not
+// responding" + blank white page). The combination of WS_POPUP + the
+// WS_EX_TOPMOST extended style + HWND_TOPMOST in SetWindowPos is enough
+// to put the modal above the kiosk without needing to steal foreground.
 func makeModalFrameless(hwnd uintptr) {
 	if hwnd == 0 {
 		return
@@ -604,16 +627,10 @@ func makeModalFrameless(hwnd uintptr) {
 		swpShow        = 0x0040
 		swpFrameChang  = 0x0020
 	)
-	// Replace the standard window style with WS_POPUP|WS_VISIBLE — no
-	// title bar, no min/max/close buttons, no resize grips.
 	procSetWindowLongPtrW.Call(hwnd, uintptr(gwlStyleU), uintptr(wsPopup|wsVisible))
-	// Topmost + tool-window (also hides from taskbar and Alt+Tab).
 	procSetWindowLongPtrW.Call(hwnd, uintptr(gwlExStyleU), uintptr(wsExTopmost|wsExToolWindow))
-	// Force a frame change so the style strip is repainted.
 	procSetWindowPos.Call(hwnd, hwndTopmost, 0, 0, 0, 0,
 		uintptr(swpNoMove|swpNoSize|swpShow|swpFrameChang))
-	procBringWindowToTop.Call(hwnd)
-	procSetForegroundWindow.Call(hwnd)
 }
 
 // ---------- SendInput re-injection ----------
@@ -936,22 +953,38 @@ $lnk2.IconLocation = ('%s' + ',0')
 $lnk2.Description = 'End the current pause and re-activate the SK Filter (no password needed)'
 $lnk2.Save()
 
-$lnk3 = $ws.CreateShortcut(("$desktop\Update SK Filter.lnk"))
+$lnk3 = $ws.CreateShortcut(("$desktop\Launch Kiosk.lnk"))
 $lnk3.TargetPath = '%s'
-$lnk3.Arguments = '--update'
+$lnk3.Arguments = '--launch-kiosk'
 $lnk3.WorkingDirectory = '%s'
 $lnk3.IconLocation = ('%s' + ',0')
-$lnk3.Description = 'Check GitHub for a new version of the SK Filter (password required to install)'
+$lnk3.Description = 'Re-open the kiosk window manually (no-op when filter is paused)'
 $lnk3.Save()
 
-$lnk4 = $ws.CreateShortcut(("$desktop\Uninstall SK Filter.lnk"))
+$lnk4 = $ws.CreateShortcut(("$desktop\Update SK Filter.lnk"))
 $lnk4.TargetPath = '%s'
-$lnk4.Arguments = '--uninstall'
+$lnk4.Arguments = '--update'
 $lnk4.WorkingDirectory = '%s'
 $lnk4.IconLocation = ('%s' + ',0')
-$lnk4.Description = 'Remove the SK Filter (password required)'
+$lnk4.Description = 'Check GitHub for a new version of the SK Filter (password required to install)'
 $lnk4.Save()
-`, exeQ, workDir, exeQ, exeQ, workDir, exeQ, exeQ, workDir, exeQ, exeQ, workDir, exeQ)
+
+$lnk5 = $ws.CreateShortcut(("$desktop\Change Kiosk URL.lnk"))
+$lnk5.TargetPath = '%s'
+$lnk5.Arguments = '--set-url'
+$lnk5.WorkingDirectory = '%s'
+$lnk5.IconLocation = ('%s' + ',0')
+$lnk5.Description = 'Change the URL the kiosk opens (password required)'
+$lnk5.Save()
+
+$lnk6 = $ws.CreateShortcut(("$desktop\Uninstall SK Filter.lnk"))
+$lnk6.TargetPath = '%s'
+$lnk6.Arguments = '--uninstall'
+$lnk6.WorkingDirectory = '%s'
+$lnk6.IconLocation = ('%s' + ',0')
+$lnk6.Description = 'Remove the SK Filter (password required)'
+$lnk6.Save()
+`, exeQ, workDir, exeQ, exeQ, workDir, exeQ, exeQ, workDir, exeQ, exeQ, workDir, exeQ, exeQ, workDir, exeQ, exeQ, workDir, exeQ)
 	cmd := exec.Command("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps)
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -1727,6 +1760,33 @@ func promptAndPause() {
 
 // ---------- desktop button handlers ----------
 
+// runLaunchKiosk is the entry point for the "Launch Kiosk" desktop
+// shortcut. It re-opens the WebView2 kiosk window manually — useful
+// after a crash or if the user closed the kiosk and wants it back
+// before the controller's 30s watchdog tick runs. Refuses while a
+// pause is active (otherwise the button would silently defeat the
+// pause; resume the filter first).
+func runLaunchKiosk() {
+	pu := loadPauseFromDisk()
+	if !pu.IsZero() && time.Now().Before(pu) {
+		_ = zenity.Info(
+			fmt.Sprintf(
+				"SK Filter is paused until %s.\n\nTo re-open the kiosk now, use the \"Resume SK Filter\" shortcut to end the pause.",
+				pu.Format("3:04 PM"),
+			),
+			zenity.Title("SK Filter"),
+		)
+		return
+	}
+	if findOurWebViewChild() != nil {
+		// Already running — bring its window to front and exit.
+		// (We don't have its HWND directly, so just no-op; the user
+		// can press Win-key area or use the kiosk normally.)
+		return
+	}
+	launchWebViewChild()
+}
+
 // runResumeInvocation is the entry point for `kiosk-exit-guard.exe --resume`,
 // wired to the "Resume SK Filter" desktop shortcut. Ending a pause early
 // makes the system more locked-down, not less, so this is intentionally
@@ -2064,7 +2124,7 @@ func runUpdateInvocation() {
 func removeDesktopShortcuts() {
 	ps := `
 $desktop = [Environment]::GetFolderPath('Desktop')
-foreach ($n in @('Kiosk Exit Guard.lnk','Pause SK Filter.lnk','Resume SK Filter.lnk','Update SK Filter.lnk','Uninstall SK Filter.lnk')) {
+foreach ($n in @('Kiosk Exit Guard.lnk','Pause SK Filter.lnk','Resume SK Filter.lnk','Launch Kiosk.lnk','Change Kiosk URL.lnk','Update SK Filter.lnk','Uninstall SK Filter.lnk')) {
     Remove-Item -Path (Join-Path $desktop $n) -Force -ErrorAction SilentlyContinue
 }
 `
@@ -2190,6 +2250,16 @@ func main() {
 		return
 	}
 
+	// --launch-kiosk: triggered by the "Launch Kiosk" desktop shortcut.
+	// Spawns a --webview child if the filter is currently active. If
+	// the filter is paused, refuses (otherwise the button would
+	// silently defeat the pause semantics — the kiosk would come back
+	// during a window the admin chose to keep it down).
+	if len(os.Args) > 1 && os.Args[1] == "--launch-kiosk" {
+		runLaunchKiosk()
+		return
+	}
+
 	// --update: triggered by the "Update SK Filter" desktop shortcut.
 	// Checks GitHub for a newer release. If found and confirmed, password
 	// prompts then downloads + atomic-renames the new exe in place and
@@ -2247,11 +2317,38 @@ func main() {
 		return
 
 	case len(os.Args) > 1 && os.Args[1] == "--set-url":
-		if _, err := promptForKioskURL(); err != nil {
-			_ = zenity.Error(err.Error(), zenity.Title("kiosk-exit-guard"))
+		// Password-gated since it's wired to a desktop shortcut. If the
+		// kiosk has been booted with the wrong URL, anyone who could
+		// click a shortcut would otherwise be able to redirect it.
+		hash, err := loadHash()
+		if err != nil || len(hash) == 0 {
+			_ = zenity.Error(
+				"SK Filter is not configured. Run first-run setup first.",
+				zenity.Title("SK Filter"),
+			)
 			os.Exit(1)
 		}
-		_ = zenity.Info("Kiosk URL updated.", zenity.Title("kiosk-exit-guard"))
+		storedHash = hash
+		if !askPasswordModal(
+			"Change the kiosk URL?",
+			"Enter the admin password to confirm.",
+		) {
+			showFailedToast()
+			os.Exit(1)
+		}
+		if _, err := promptForKioskURL(); err != nil {
+			_ = zenity.Error(err.Error(), zenity.Title("SK Filter"))
+			os.Exit(1)
+		}
+		// Restart the kiosk child so it loads the new URL immediately
+		// rather than waiting for the controller's next watchdog tick.
+		if p := findOurWebViewChild(); p != nil {
+			_ = p.Kill()
+		}
+		_ = zenity.Info(
+			"Kiosk URL updated.\nThe kiosk window will relaunch at the new URL within a few seconds.",
+			zenity.Title("SK Filter"),
+		)
 		return
 	}
 
@@ -2289,11 +2386,13 @@ func main() {
 			os.Exit(1)
 		}
 	} else {
-		// Desktop shortcut is cheap to re-create; silently overwrites if
-		// it already exists. (IFEO blocks are reapplied below in the
-		// state-restoration step instead of here so they get cleared
-		// correctly during a paused state.)
+		// Refresh the desktop shortcuts and the scheduled task on every
+		// non-first-run launch. Both are idempotent and cheap; this is
+		// how an installed v1.0.2 or earlier auto-upgrades to the new
+		// multi-trigger task definition in v1.0.3+ — they just need to
+		// launch the new exe once.
 		_ = createDesktopShortcut()
+		_ = installStartupTask()
 	}
 	storedHash = hash
 
