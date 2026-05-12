@@ -37,6 +37,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -53,7 +54,66 @@ import (
 
 // currentVersion must be kept in sync with versioninfo.json. Used by the
 // --update flow to compare against the latest GitHub release tag.
-const currentVersion = "1.0.2"
+const currentVersion = "1.0.4"
+
+// ---------- logging ----------
+
+const (
+	logFileName    = "kiosk-exit-guard.log"
+	logRotateBytes = 5 * 1024 * 1024 // 5 MB
+)
+
+var (
+	logFile *os.File
+	logMu   sync.Mutex
+)
+
+// initLogging opens kiosk-exit-guard.log next to the exe for append.
+// Best-effort — if the open fails (read-only directory, permissions),
+// logging silently no-ops and the rest of the controller keeps working.
+func initLogging() {
+	p, err := nextToExe(logFileName)
+	if err != nil {
+		return
+	}
+	// Naive size-based rotation: if the existing file is over the
+	// rotate threshold, rename to .old (overwriting any previous .old)
+	// and start a fresh file.
+	if fi, err := os.Stat(p); err == nil && fi.Size() > logRotateBytes {
+		_ = os.Remove(p + ".old")
+		_ = os.Rename(p, p+".old")
+	}
+	f, err := os.OpenFile(p, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
+	logFile = f
+	logf("--- start v%s pid=%d args=%v ---", currentVersion, os.Getpid(), os.Args[1:])
+}
+
+func logf(format string, args ...interface{}) {
+	if logFile == nil {
+		return
+	}
+	logMu.Lock()
+	defer logMu.Unlock()
+	line := fmt.Sprintf("[%s] %s\n",
+		time.Now().Format("2006-01-02 15:04:05.000"),
+		fmt.Sprintf(format, args...))
+	_, _ = logFile.WriteString(line)
+}
+
+// recoverAndLog is a deferred panic capture. Use as
+//
+//	defer recoverAndLog("label")
+//
+// in goroutines so panics make it to the log file instead of
+// disappearing into a stack trace nobody sees.
+func recoverAndLog(where string) {
+	if r := recover(); r != nil {
+		logf("PANIC in %s: %v\n%s", where, r, string(debug.Stack()))
+	}
+}
 
 // ---------- constants ----------
 
@@ -1351,6 +1411,7 @@ func autoReenableFilterMode() {
 	if filterMode.Load() {
 		return
 	}
+	logf("auto-resume: pause expired, restoring filter")
 	filterMode.Store(true)
 	saveFilterModeToDisk(true)
 	setPauseUntil(time.Time{})
@@ -1752,6 +1813,7 @@ func promptAndPause() {
 	removeIFEOBlock("msedge.exe")
 	killWebViewChild()
 
+	logf("pause started for %v (resumes at %s)", dur, time.Unix(0, pauseUntilNano.Load()).Format("3:04 PM"))
 	showTimedInfo(fmt.Sprintf(
 		"SK Filter paused.\nEdge is allowed; kiosk closed.\nResumes at %s.",
 		time.Unix(0, pauseUntilNano.Load()).Format("3:04 PM"),
@@ -2226,10 +2288,15 @@ func main() {
 	// IFEO redirect handler: if Windows invoked us as the Debugger for a
 	// blocked exe, we get --silent-exit as argv[1] and the blocked exe's
 	// path appended. Exit silently so the user's launch attempt just
-	// fails with no error window.
+	// fails with no error window. Logging not initialized in this path
+	// to keep the IFEO redirect fast.
 	if len(os.Args) > 1 && os.Args[1] == "--silent-exit" {
 		return
 	}
+
+	// Open the log file before anything else can panic. Best-effort.
+	initLogging()
+	defer recoverAndLog("main")
 
 	// WebView2 child mode — render the kiosk window and exit when closed.
 	if len(os.Args) > 1 && os.Args[1] == "--webview" {
@@ -2423,12 +2490,16 @@ func main() {
 	defer cancelPauseExpiry()
 	defer killWebViewChild()
 
-	go runWatchdog()
-	go syncFilterStateLoop()
+	logf("controller steady-state filterMode=%v paused=%v kioskURL=%q",
+		filterMode.Load(), pauseUntilNano.Load() != 0, loadKioskURL())
+
+	go func() { defer recoverAndLog("watchdog"); runWatchdog() }()
+	go func() { defer recoverAndLog("syncLoop"); syncFilterStateLoop() }()
 
 	cb := syscall.NewCallback(hookCallback)
 	h, _, callErr := procSetWindowHookExW.Call(uintptr(whKeyboardLL), cb, 0, 0)
 	if h == 0 {
+		logf("ERROR: SetWindowsHookEx failed: %v", callErr)
 		removeLockdown()
 		_ = zenity.Error(
 			fmt.Sprintf("SetWindowsHookEx failed: %v", callErr),
@@ -2436,6 +2507,7 @@ func main() {
 		)
 		os.Exit(1)
 	}
+	logf("LL keyboard hook installed (handle=%d)", h)
 	defer procUnhookWindowsHookEx.Call(h)
 
 	var m msgT

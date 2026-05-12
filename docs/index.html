@@ -155,7 +155,7 @@
 <div class="wrap">
 
 <header>
-  <h1>kiosk-exit-guard <span class="version-pill">v1.0.2</span></h1>
+  <h1>kiosk-exit-guard <span class="version-pill">v1.0.4</span></h1>
   <p class="tagline">Single-binary kiosk lockdown for Windows 11 Home. Embedded WebView2 kiosk, password-gated keyboard, Chrome uninstalled, Edge launches blocked at the OS level, self-installing, self-updating, all from one ~7&nbsp;MB exe.</p>
 </header>
 
@@ -192,6 +192,12 @@
 </div>
 
 <div class="feature-grid">
+  <div class="feature"><h4><span class="dot new"></span>Log file + panic recovery<span class="badge">v1.0.4</span></h4><p><code>kiosk-exit-guard.log</code> next to the exe captures controller startup, hook installation, pauses, auto-resumes, errors, and panic stack traces. 5 MB rotation (renames to <code>.log.old</code>).</p></div>
+  <div class="feature"><h4><span class="dot new"></span>Modal hang fix<span class="badge">v1.0.3</span></h4><p>Stripped <code>SetForegroundWindow</code> and <code>BringWindowToTop</code> from the topmost path — they have eligibility rules that caused the modal to render blank white and go "Not Responding" on Server SKUs.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>Per-monitor DPI awareness<span class="badge">v1.0.3</span></h4><p>Manifest now declares <code>PerMonitorV2</code> awareness. <code>GetSystemMetrics(SM_CXSCREEN)</code> returns physical pixels on 4K — kiosk window covers the full native resolution instead of scaled logical area.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>Multi-trigger Task Scheduler<span class="badge">v1.0.3</span></h4><p>LogonTrigger + every-1-min watchdog + <code>RestartOnFailure</code>. If the controller dies mid-session, it comes back within 1 minute instead of waiting for re-logon. Auto-upgrades existing installs on next launch.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>"Launch Kiosk" shortcut<span class="badge">v1.0.3</span></h4><p>Re-spawn the WebView2 child manually. Refuses during pause so it can't silently defeat pause semantics.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>"Change Kiosk URL" shortcut<span class="badge">v1.0.3</span></h4><p>Password-gated. After saving, the kiosk child is killed so the watchdog respawns at the new URL within seconds.</p></div>
   <div class="feature"><h4><span class="dot new"></span>Taskbar right-click disabled<span class="badge">v1.0.0</span></h4><p><code>NoTrayContextMenu=1</code> + <code>NoViewContextMenu=1</code> under HKCU when the filter is active. Closes the "Win → right-click taskbar → Close Window" bypass that worked even with our Windows-key gate.</p></div>
   <div class="feature"><h4><span class="dot new"></span>Clean-slate install<span class="badge">v1.0.0</span></h4><p>First-run now purges anything a prior install might have left behind — zombie controller processes, stale IFEO blocks, dangling Task Scheduler entries, half-deleted shortcuts, orphan state files — before the wizard. Reinstall always starts from zero.</p></div>
   <div class="feature"><h4><span class="dot new"></span>Anti-zombie controller kill<span class="badge">v1.0.0</span></h4><p>Controller startup now kills any other kiosk-exit-guard.exe instance found running. Prevents the "previous controller still enforcing with a stale in-memory password hash" issue that bit v0.5.4 uninstalls.</p></div>
