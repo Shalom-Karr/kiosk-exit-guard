@@ -62,7 +62,7 @@ import (
 
 // currentVersion must be kept in sync with versioninfo.json. Used by the
 // --update flow to compare against the latest GitHub release tag.
-const currentVersion = "1.1.9"
+const currentVersion = "1.1.10"
 
 // ---------- logging ----------
 
@@ -552,6 +552,19 @@ func tightenHKLMConfigDACL() {
 		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
 		nil, nil, dacl, nil,
 	); err != nil {
+		// v1.1.10: silence ERROR_FILE_NOT_FOUND. The HKLM key is only
+		// created the first time saveHashToRegistry runs (i.e. after
+		// the user completes the first-run wizard). v1.1.8 placed this
+		// tighten call at controller startup ALSO — before any save —
+		// so on a fresh install we'd hit "The system cannot find the
+		// file specified." every launch. The next saveHashToRegistry
+		// call applies the same DACL anyway, so the key gets tightened
+		// when it actually exists. Only noisy log lines suppressed —
+		// any other error (access denied, invalid SDDL, etc.) still
+		// surfaces.
+		if errors.Is(err, syscall.ERROR_FILE_NOT_FOUND) {
+			return
+		}
 		logf("tightenHKLMConfigDACL: SetNamedSecurityInfo(%s) failed: %v", objName, err)
 	}
 }

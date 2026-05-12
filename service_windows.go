@@ -34,7 +34,6 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/shirou/gopsutil/v4/process"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
@@ -89,10 +88,59 @@ const (
 // destroyEnvironmentBlock is needed but not exported by x/sys/windows;
 // CreateEnvironmentBlock is exported but its destroy companion isn't, so we
 // reach into userenv.dll directly.
+//
+// wtsapi32 plumbing (v1.1.10): the v1.1.3 explorer-token fallback enumerated
+// processes via gopsutil's process.Processes(). On the user's affected
+// machine that path returned an empty (or filtered) list when called from
+// the Session-0 LocalSystem service — so the supervisor logged
+// "no explorer.exe found in session 1 (is a user logged in?)" every 2s
+// even though the user WAS logged in and running the kiosk. The kernel
+// can see across sessions just fine for LocalSystem (SeDebugPrivilege),
+// but gopsutil's underlying snapshot API was missing them. Switching to
+// WTSEnumerateProcessesExW — the Win32 API explicitly designed for
+// service-side cross-session enumeration — fixes the enumeration
+// reliably.
 var (
 	userenvDLL                  = windows.NewLazySystemDLL("userenv.dll")
 	procDestroyEnvironmentBlock = userenvDLL.NewProc("DestroyEnvironmentBlock")
+
+	wtsapi32DLL                  = windows.NewLazySystemDLL("wtsapi32.dll")
+	procWTSEnumerateProcessesExW = wtsapi32DLL.NewProc("WTSEnumerateProcessesExW")
+	procWTSFreeMemoryExW         = wtsapi32DLL.NewProc("WTSFreeMemoryExW")
 )
+
+// WTS constants for the level-0 process info enumeration. wtsAnySession is
+// the documented sentinel meaning "all sessions"; we pass the target
+// session ID instead so the kernel filters for us.
+const (
+	wtsCurrentServerHandle   = 0
+	wtsTypeProcessInfoLevel0 = 0
+	wtsAnySession            = ^uint32(0) // (DWORD)-1
+)
+
+// wtsProcessInfoW mirrors the Win32 WTS_PROCESS_INFO_EXW (level 0) on
+// amd64. The struct is 32 bytes per entry with natural 8-byte alignment;
+// the two uint32 padding fields are inserted by MSVC to align the next
+// pointer field on an 8-byte boundary. Verified at runtime with
+// unsafe.Sizeof at the call site.
+//
+// typedef struct _WTS_PROCESS_INFOW {
+//     DWORD  SessionId;
+//     DWORD  ProcessId;
+//     LPWSTR pProcessName;
+//     PSID   pUserSid;
+// } WTS_PROCESS_INFOW;
+//
+// (The "Ex" variant at level 0 has the same on-disk layout as
+// WTS_PROCESS_INFOW per MS docs — both are 32 bytes on x64.)
+type wtsProcessInfoW struct {
+	SessionId   uint32
+	_           uint32 // padding to 8-byte align ProcessName pointer
+	ProcessId   uint32
+	_           uint32 // padding
+	ProcessName *uint16
+	UserSid     uintptr // PSID
+}
 
 func destroyEnvironmentBlock(env *uint16) {
 	if env == nil {
@@ -417,12 +465,12 @@ func (s *kioskExitGuardService) spawnControllerInSession(sessionID uint32) (wind
 	var userToken windows.Token
 	wtsErr := windows.WTSQueryUserToken(sessionID, &userToken)
 	if wtsErr != nil {
-		fallback, fbErr := tokenFromExplorerInSession(sessionID)
+		fallback, candidateName, fbErr := tokenFromUserSessionProcess(sessionID)
 		if fbErr != nil {
-			return 0, fmt.Errorf("WTSQueryUserToken(%d): %w; explorer fallback: %v", sessionID, wtsErr, fbErr)
+			return 0, fmt.Errorf("WTSQueryUserToken(%d): %w; user-session-process fallback: %v", sessionID, wtsErr, fbErr)
 		}
 		userToken = fallback
-		logf("service: WTSQueryUserToken failed (%v); using explorer.exe token fallback for session %d", wtsErr, sessionID)
+		logf("service: WTSQueryUserToken failed (%v); user-session-process fallback found <%s> in session %d", wtsErr, candidateName, sessionID)
 	}
 	defer userToken.Close()
 
@@ -504,124 +552,238 @@ func (s *kioskExitGuardService) spawnControllerInSession(sessionID uint32) (wind
 	return pi.Process, nil
 }
 
-// tokenFromExplorerInSession finds an explorer.exe instance running in the
-// target console session, opens its primary token, and returns it. If
-// explorer.exe is running under a user with UAC enabled, OpenProcessToken
-// returns the *limited* half of the UAC-split token — kiosk-exit-guard
-// needs admin (HKLM writes, IFEO, etc.) so we unwrap the limited token
-// to its linked elevated counterpart via GetTokenInformation(TokenLinkedToken).
+// userSessionCandidate names a well-known system-trusted process whose
+// token represents the interactive console user. The image must live at
+// the canonical path — we reject anything else so an attacker can't
+// drop a `sihost.exe` in a writable directory and have the Service
+// unwrap its linked elevated token.
 //
-// This is the standard workaround for WTSQueryUserToken returning
-// ERROR_NO_TOKEN on machines where the documented path inexplicably fails
-// (observed on Win11 Home in the field — see v1.1.3 changelog).
-func tokenFromExplorerInSession(sessionID uint32) (windows.Token, error) {
-	procs, err := process.Processes()
-	if err != nil {
-		return 0, fmt.Errorf("enumerate processes: %w", err)
-	}
-
-	var lastErr error
-	for _, p := range procs {
-		name, nerr := p.Name()
-		if nerr != nil || !strings.EqualFold(name, "explorer.exe") {
-			continue
-		}
-		pid := uint32(p.Pid)
-
-		// ProcessIdToSessionId tells us which session this explorer.exe
-		// is running in. We only want one whose session matches the
-		// active console session — there can be multiple explorer.exe
-		// processes (RDP, fast-user-switch, etc.).
-		var procSession uint32
-		if sErr := windows.ProcessIdToSessionId(pid, &procSession); sErr != nil {
-			lastErr = sErr
-			continue
-		}
-		if procSession != sessionID {
-			continue
-		}
-
-		hProc, oErr := windows.OpenProcess(windows.PROCESS_QUERY_INFORMATION, false, pid)
-		if oErr != nil {
-			lastErr = oErr
-			continue
-		}
-
-		// v1.1.8 HIGH#3 + MEDIUM#6: validate the process image path
-		// before trusting its token. gopsutil's Name() returns the
-		// process name from a user-readable enumeration that doesn't
-		// authenticate identity — a kiosk user can spawn a renamed-
-		// to-explorer.exe binary, and on the next supervisor tick we'd
-		// open its token, unwrap to the linked elevated half, and
-		// CreateProcessAsUser attacker code as the admin user. By
-		// calling QueryFullProcessImageName on the same handle we used
-		// for OpenProcessToken we re-derive the image from the kernel
-		// at the moment of token capture, which also closes the PID-
-		// recycle race (the OS guarantees the handle still refers to
-		// the originally-opened process for the lifetime of the
-		// handle). Reject anything that isn't %SystemRoot%\explorer.exe.
-		if !isLegitimateExplorerHandle(hProc) {
-			logf("service: rejecting non-system explorer.exe pid=%d (image path mismatch)", pid)
-			_ = windows.CloseHandle(hProc)
-			continue
-		}
-
-		var token windows.Token
-		tErr := windows.OpenProcessToken(
-			hProc,
-			windows.TOKEN_DUPLICATE|windows.TOKEN_QUERY|windows.TOKEN_ASSIGN_PRIMARY|windows.TOKEN_IMPERSONATE,
-			&token,
-		)
-		_ = windows.CloseHandle(hProc)
-		if tErr != nil {
-			lastErr = tErr
-			continue
-		}
-
-		// If this is a UAC-split limited token, swap to its elevated
-		// linked counterpart. kiosk-exit-guard needs admin to do its
-		// job — a non-elevated controller can't write HKLM, register
-		// IFEO debugger keys, or restart Explorer.
-		if elevated, eErr := elevatedLinkedToken(token); eErr == nil && elevated != 0 {
-			_ = token.Close()
-			return elevated, nil
-		}
-		// Either elevation type is "Default" (UAC off / built-in admin)
-		// or "Full" (already elevated) — use the token as-is.
-		return token, nil
-	}
-
-	if lastErr != nil {
-		return 0, fmt.Errorf("no usable explorer.exe in session %d (last error: %v)", sessionID, lastErr)
-	}
-	return 0, fmt.Errorf("no explorer.exe found in session %d (is a user logged in?)", sessionID)
+// Priority order is preserved by candidateOrder: explorer.exe is the
+// most common interactive-user token (it's what every standard logon
+// produces), but a custom kiosk shell or a v1.1.x'd Explorer restart
+// path that failed to respawn it can leave a session with no explorer.
+// In that case sihost/taskhostw/RuntimeBroker/StartMenuExperienceHost
+// are all auto-spawned by Windows under the interactive user's token
+// and serve the same purpose.
+type userSessionCandidate struct {
+	name         string // e.g. "explorer.exe" (case-insensitive match)
+	expectedPath string // canonical full path (case-insensitive compare)
+	priority     int    // lower = preferred; 0 = explorer.exe
 }
 
-// isLegitimateExplorerHandle reports whether the process referred to by
-// hProc has an image path equal to %SystemRoot%\explorer.exe (case-
-// insensitive). Called inside tokenFromExplorerInSession right after a
-// successful OpenProcess so we authenticate the process by its on-disk
-// image — not by its enumerable name — before unwrapping its token.
-//
-// Closes v1.1.8 HIGH#3 (kiosk user spawns renamed-to-explorer.exe to
-// have the Service unwrap its linked elevated token and execute
-// attacker code) and v1.1.8 MEDIUM#6 (PID-recycle race: between
-// gopsutil's enumeration and OpenProcess the PID could in theory have
-// been recycled — but the open handle pins the original kernel object,
-// so QueryFullProcessImageName on that handle returns the image of
-// whatever-the-kernel-currently-knows-as that handle, which is the
-// process we opened, not a recycled one).
-func isLegitimateExplorerHandle(hProc windows.Handle) bool {
+func candidateProcessList() []userSessionCandidate {
 	systemRoot := os.Getenv("SystemRoot")
 	if systemRoot == "" {
 		systemRoot = `C:\Windows`
 	}
-	expected := strings.ToLower(systemRoot + `\explorer.exe`)
+	return []userSessionCandidate{
+		{name: "explorer.exe", expectedPath: systemRoot + `\explorer.exe`, priority: 0},
+		{name: "sihost.exe", expectedPath: systemRoot + `\System32\sihost.exe`, priority: 1},
+		{name: "taskhostw.exe", expectedPath: systemRoot + `\System32\taskhostw.exe`, priority: 2},
+		{name: "RuntimeBroker.exe", expectedPath: systemRoot + `\System32\RuntimeBroker.exe`, priority: 3},
+		{name: "StartMenuExperienceHost.exe", expectedPath: systemRoot + `\SystemApps\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\StartMenuExperienceHost.exe`, priority: 4},
+	}
+}
 
+// tokenFromUserSessionProcess (v1.1.10, was tokenFromExplorerInSession in
+// v1.1.3–v1.1.9) finds a system-trusted user-session process running in
+// the target console session, opens its primary token, and returns it.
+// If the process is running under a user with UAC enabled,
+// OpenProcessToken returns the *limited* half of the UAC-split token —
+// kiosk-exit-guard needs admin (HKLM writes, IFEO, etc.) so we unwrap
+// the limited token to its linked elevated counterpart via
+// GetTokenInformation(TokenLinkedToken).
+//
+// This is the standard workaround for WTSQueryUserToken returning
+// ERROR_NO_TOKEN on machines where the documented path inexplicably
+// fails (observed on Win11 Home in the field — see v1.1.3 changelog).
+//
+// v1.1.10 changes vs. v1.1.9:
+//   - Enumerates via WTSEnumerateProcessesExW (wtsapi32) instead of
+//     gopsutil. The user's affected machine had gopsutil returning an
+//     empty list across sessions when invoked from LocalSystem; the
+//     WTS API is the Win32-blessed path for service-side cross-session
+//     enumeration and works reliably from Session 0.
+//   - Accepts any of the well-known system-trusted user-session
+//     processes (explorer.exe, sihost.exe, taskhostw.exe,
+//     RuntimeBroker.exe, StartMenuExperienceHost.exe), prioritizing
+//     explorer when present.
+//
+// Returns the token, the matched candidate name (for the log line in
+// spawnControllerInSession), and an error.
+func tokenFromUserSessionProcess(sessionID uint32) (windows.Token, string, error) {
+	candidates := candidateProcessList()
+
+	type match struct {
+		pid      uint32
+		cand     userSessionCandidate
+	}
+	var best *match
+
+	processWTSResults := func(infos []wtsProcessInfoW) {
+		for i := range infos {
+			pi := &infos[i]
+			if pi.SessionId != sessionID {
+				continue
+			}
+			if pi.ProcessName == nil {
+				continue
+			}
+			name := windows.UTF16PtrToString(pi.ProcessName)
+			for _, c := range candidates {
+				if !strings.EqualFold(name, c.name) {
+					continue
+				}
+				if best != nil && best.cand.priority <= c.priority {
+					// Already have an equal- or higher-priority match.
+					continue
+				}
+				best = &match{pid: pi.ProcessId, cand: c}
+				break
+			}
+		}
+	}
+
+	if err := enumerateWTSProcesses(sessionID, processWTSResults); err != nil {
+		return 0, "", fmt.Errorf("WTSEnumerateProcessesExW: %w", err)
+	}
+
+	if best == nil {
+		return 0, "", fmt.Errorf("no candidate process in session %d", sessionID)
+	}
+
+	hProc, oErr := windows.OpenProcess(windows.PROCESS_QUERY_INFORMATION, false, best.pid)
+	if oErr != nil {
+		return 0, "", fmt.Errorf("OpenProcess(pid=%d, name=%s): %w", best.pid, best.cand.name, oErr)
+	}
+
+	// v1.1.8 HIGH#3 + MEDIUM#6: validate the process image path before
+	// trusting its token. The WTS enumeration returns a process name
+	// that doesn't authenticate identity — a kiosk user with write
+	// access SOMEWHERE could spawn a renamed-to-sihost.exe binary, and
+	// on the next supervisor tick we'd open its token, unwrap to the
+	// linked elevated half, and CreateProcessAsUser attacker code as
+	// the admin user. By calling QueryFullProcessImageName on the same
+	// handle we used for OpenProcessToken we re-derive the image from
+	// the kernel at the moment of token capture, which also closes the
+	// PID-recycle race (the OS guarantees the handle still refers to
+	// the originally-opened process for the lifetime of the handle).
+	// Reject anything whose image path doesn't match the canonical
+	// system path for the candidate.
+	if !isLegitimateCandidateHandle(hProc, best.cand.expectedPath) {
+		logf("service: rejecting non-canonical %s pid=%d (image path mismatch)", best.cand.name, best.pid)
+		_ = windows.CloseHandle(hProc)
+		return 0, "", fmt.Errorf("candidate %s pid=%d failed image-path validation", best.cand.name, best.pid)
+	}
+
+	var token windows.Token
+	tErr := windows.OpenProcessToken(
+		hProc,
+		windows.TOKEN_DUPLICATE|windows.TOKEN_QUERY|windows.TOKEN_ASSIGN_PRIMARY|windows.TOKEN_IMPERSONATE,
+		&token,
+	)
+	_ = windows.CloseHandle(hProc)
+	if tErr != nil {
+		return 0, "", fmt.Errorf("OpenProcessToken(pid=%d, name=%s): %w", best.pid, best.cand.name, tErr)
+	}
+
+	// If this is a UAC-split limited token, swap to its elevated linked
+	// counterpart. kiosk-exit-guard needs admin to do its job — a
+	// non-elevated controller can't write HKLM, register IFEO debugger
+	// keys, or restart Explorer.
+	if elevated, eErr := elevatedLinkedToken(token); eErr == nil && elevated != 0 {
+		_ = token.Close()
+		return elevated, best.cand.name, nil
+	}
+	// Either elevation type is "Default" (UAC off / built-in admin) or
+	// "Full" (already elevated) — use the token as-is.
+	return token, best.cand.name, nil
+}
+
+// enumerateWTSProcesses calls WTSEnumerateProcessesExW filtered to the
+// given session ID and invokes cb with the resulting slice. The buffer
+// is freed via WTSFreeMemoryExW before cb returns control to the
+// caller's caller — critical because this runs every 2 seconds in the
+// supervisor loop and leaks would compound.
+//
+// pLevel is in/out: we request level 0, the API confirms by writing 0
+// back. We pass the target sessionID directly so the kernel filters for
+// us (cheaper than enumerating every session and discarding).
+func enumerateWTSProcesses(sessionID uint32, cb func([]wtsProcessInfoW)) error {
+	level := uint32(wtsTypeProcessInfoLevel0)
+	var pInfo *wtsProcessInfoW
+	var count uint32
+
+	r1, _, err := procWTSEnumerateProcessesExW.Call(
+		uintptr(wtsCurrentServerHandle),
+		uintptr(unsafe.Pointer(&level)),
+		uintptr(sessionID),
+		uintptr(unsafe.Pointer(&pInfo)),
+		uintptr(unsafe.Pointer(&count)),
+	)
+	if r1 == 0 {
+		return err
+	}
+	if pInfo == nil || count == 0 {
+		// Free even on empty result — the API may have allocated a
+		// zero-length buffer.
+		if pInfo != nil {
+			_, _, _ = procWTSFreeMemoryExW.Call(
+				uintptr(wtsTypeProcessInfoLevel0),
+				uintptr(unsafe.Pointer(pInfo)),
+				uintptr(count),
+			)
+		}
+		cb(nil)
+		return nil
+	}
+
+	// Defensive: validate the on-disk struct size matches what we
+	// declared. The user's amd64 layout is 32 bytes; if Go's compiler
+	// laid it out differently we'd dereference garbage.
+	const expectedSize = 32
+	if got := unsafe.Sizeof(wtsProcessInfoW{}); got != expectedSize {
+		_, _, _ = procWTSFreeMemoryExW.Call(
+			uintptr(wtsTypeProcessInfoLevel0),
+			uintptr(unsafe.Pointer(pInfo)),
+			uintptr(count),
+		)
+		return fmt.Errorf("wtsProcessInfoW size mismatch: got %d, expected %d", got, expectedSize)
+	}
+
+	// Build a Go slice over the C buffer without copying.
+	infos := unsafe.Slice(pInfo, int(count))
+	cb(infos)
+
+	_, _, _ = procWTSFreeMemoryExW.Call(
+		uintptr(wtsTypeProcessInfoLevel0),
+		uintptr(unsafe.Pointer(pInfo)),
+		uintptr(count),
+	)
+	return nil
+}
+
+// isLegitimateCandidateHandle reports whether the process referred to by
+// hProc has an image path equal to the candidate's canonical path
+// (case-insensitive). Called inside tokenFromUserSessionProcess right
+// after a successful OpenProcess so we authenticate the process by its
+// on-disk image — not by its enumerable name — before unwrapping its
+// token.
+//
+// Closes v1.1.8 HIGH#3 (kiosk user spawns renamed-to-<candidate>.exe to
+// have the Service unwrap its linked elevated token and execute
+// attacker code) and v1.1.8 MEDIUM#6 (PID-recycle race: between WTS
+// enumeration and OpenProcess the PID could in theory have been
+// recycled — but the open handle pins the original kernel object, so
+// QueryFullProcessImageName on that handle returns the image of
+// whatever-the-kernel-currently-knows-as that handle, which is the
+// process we opened, not a recycled one).
+func isLegitimateCandidateHandle(hProc windows.Handle, expectedPath string) bool {
+	expected := strings.ToLower(expectedPath)
 	buf := make([]uint16, windows.MAX_PATH)
 	size := uint32(len(buf))
 	if err := windows.QueryFullProcessImageName(hProc, 0, &buf[0], &size); err != nil {
-		logf("isLegitimateExplorerHandle: QueryFullProcessImageName failed: %v", err)
+		logf("isLegitimateCandidateHandle: QueryFullProcessImageName failed: %v", err)
 		return false
 	}
 	actual := strings.ToLower(windows.UTF16ToString(buf[:size]))
@@ -825,6 +987,18 @@ func parentProcessImagePath() (string, bool) {
 
 	hProc, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, parentPID)
 	if err != nil {
+		// v1.1.10: don't log the v1.1.8 relocate-and-reexec normal case.
+		// After the first-run relocate-from-Downloads-to-ProgramFiles
+		// flow, the ORIGINAL parent exits before the re-execed child
+		// runs the parent lookup. Windows returns ERROR_INVALID_PARAMETER
+		// (87) for "PID no longer alive" and ERROR_ACCESS_DENIED (5)
+		// for protected processes — both are expected and harmless
+		// here; the caller falls back to the env-var hint, which is
+		// the documented v1.1.0 behavior. Any other error still
+		// surfaces so we can spot genuine failures.
+		if errors.Is(err, syscall.Errno(windows.ERROR_INVALID_PARAMETER)) || errors.Is(err, syscall.Errno(windows.ERROR_ACCESS_DENIED)) {
+			return "", false
+		}
 		logf("parentProcessImagePath: OpenProcess(parent=%d) failed: %v", parentPID, err)
 		return "", false
 	}
