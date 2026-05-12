@@ -2,6 +2,13 @@
 
 Single-binary kiosk lockdown utility for **Windows 11 Home** (no Assigned Access). One ~7 MB exe contains an embedded WebView2 kiosk window, a low-level keyboard hook with re-injection, an HKLM-backed password store, Chrome / Edge launch blocks at the OS level, a Chrome uninstaller, a self-installer, a self-updater, and four desktop shortcuts for the admin.
 
+## What's in v1.1.3
+
+Two production-reported bugs the v1.1.0–v1.1.2 line missed:
+
+- **Password modal panic in the controller.** Fresh install, press Win once → modal flickers, panics, kiosk bypassed. Same root cause as v1.1.1 / v1.1.2: `go-webview2` panics on a process's second WebView2 instantiation. The controller's first WebView2 is `firstRunWithWizard`; the next one (`askPasswordModal` via the LL hook callback) crashed it. Fix: `askPasswordModal` now spawns a `--ask-password` child process and reads its exit code. The child's WebView2 is always its first.
+- **Service couldn't spawn its child controller** — "the filter only runs when I re-click the exe." `WTSQueryUserToken` returned `ERROR_NO_TOKEN` for the entire session on the affected machine. Fix: fall back to stealing `explorer.exe`'s token in the active session, unwrapping the UAC-split limited half to its elevated linked token. The supervisor now spawns a working controller even when the documented WTS API fails.
+
 ## What's in v1.1.2
 
 - **Pause-expiry crash fix.** Symptom: Resume shortcut said "SK Filter is already active" but the Win key wasn't actually blocked. Root cause: `autoReenableFilterMode`'s "Pause ended." toast was the controller's second in-process WebView2, which `go-webview2` panics on (same bug class as v1.1.1's `--update` fix). The panic ran on `time.AfterFunc`'s goroutine with no `recover` — the controller crashed and the LL hook went with it. Same path bit any flow pairing `askPasswordModal` with `showFailedToast` on wrong-password. Fix: all toasts now route through a `--show-toast` child process, so the caller never instantiates a second WebView2. See [docs/CHANGELOG.md](docs/CHANGELOG.md) for the full diagnosis.

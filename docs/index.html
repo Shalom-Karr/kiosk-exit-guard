@@ -155,7 +155,7 @@
 <div class="wrap">
 
 <header>
-  <h1>kiosk-exit-guard <span class="version-pill">v1.1.2</span></h1>
+  <h1>kiosk-exit-guard <span class="version-pill">v1.1.3</span></h1>
   <p class="tagline">Single-binary kiosk lockdown for Windows 11 Home. Embedded WebView2 kiosk, password-gated keyboard, Chrome uninstalled, Edge launches blocked at the OS level, self-installing, self-updating, all from one ~7&nbsp;MB exe.</p>
 </header>
 
@@ -186,7 +186,17 @@
   <a href="#build">Build</a>
 </nav>
 
-<h2 id="whats-new">v1.1.2 — what's in the box</h2>
+<h2 id="whats-new">v1.1.3 — what's in the box</h2>
+
+<div class="callout callout-good">
+  <strong>Two field-reported bugs the v1.1.0–v1.1.2 line missed.</strong>
+  <ul style="margin: 0.6rem 0 0; padding-left: 1.25rem;">
+    <li><strong>Controller crashed when the LL hook tried to open the password modal.</strong> Symptom: fresh install, press Win once, modal flickers, panic, kiosk bypassed. Same bug class as v1.1.1 / v1.1.2 — <code>go-webview2</code> panics on a process's second <code>NewWithOptions</code> call (<code>chromium.go:131</code>). The controller's first WebView2 is <code>firstRunWithWizard</code>; the next one (<code>askPasswordModal</code> via the hook callback) panics. v1.1.2 fixed <code>showTimedInfo</code> but I missed this call site, which is the bigger one because the hook callback uses it on every Win/Ctrl/Alt press. Fix: <code>askPasswordModal</code> now spawns <code>kiosk-exit-guard.exe --ask-password &lt;title&gt; &lt;subtitle&gt;</code> as a child process and reads its exit code (0=OK, 1=Wrong, 2=Cancel). The child's WebView2 is always its first; the controller's WebView2 budget stays at 1 for the life of the process.</li>
+    <li><strong>Service couldn't spawn its child controller — "the filter only runs when I re-click the exe."</strong> <code>WTSQueryUserToken</code> returned <code>ERROR_NO_TOKEN</code> every 2 seconds for the entire session on the affected machine. The supervisor never got a primary token for the console user, so <code>CreateProcessAsUserW</code> never ran. After a reboot the kiosk had zero protection until the admin manually launched the exe. Fix: <code>spawnControllerInSession</code> now falls back to stealing <code>explorer.exe</code>'s primary token in the same session when <code>WTSQueryUserToken</code> fails. To handle UAC-on admin users (where explorer runs with the limited half of a split token), the fallback unwraps to the linked elevated token via <code>GetTokenInformation(TokenLinkedToken)</code> — the controller needs admin to write HKLM, set IFEO debugger keys, and restart Explorer.</li>
+  </ul>
+</div>
+
+<h2 id="v112">v1.1.2 — pause-expiry crash fix</h2>
 
 <div class="callout callout-good">
   <strong>Win key fell through to Explorer after a pause auto-expired — root-caused and fixed.</strong> Users hit a "SK Filter is already active" message from the Resume shortcut while the Windows key wasn't actually being blocked. Root cause: <code>showTimedInfo</code> still rendered the toast in-process via <code>go-webview2</code>. The controller had already used WebView2 once during the first-run wizard, so when <code>autoReenableFilterMode</code> fired at pause expiry, its <code>showTimedInfo("Pause ended.")</code> call was the second <code>NewWithOptions</code> in the controller's process. <code>go-webview2</code> panics on the second instance per process (<code>chromium.go:131</code>, same bug class as v1.1.1's <code>--update</code> fix). The panic ran on the <code>time.AfterFunc</code> timer goroutine with no <code>recover</code> — the entire controller crashed. The supervising Service respawned it within ~1 s, but in that window the LL keyboard hook was gone and Win / Ctrl / Alt combos leaked through to Explorer. The same path bit every flow that paired <code>askPasswordModal</code> with a follow-up <code>showFailedToast</code> on wrong password (<code>--pause</code>, <code>--update</code>, <code>--uninstall</code>, <code>--set-url</code>, <code>--reset</code>).
@@ -227,6 +237,8 @@
 <p style="margin: 1rem 0 1.5rem;">For the full release-by-release breakdown, see the <a href="https://github.com/Shalom-Karr/kiosk-exit-guard/blob/main/docs/CHANGELOG.md" style="color: var(--accent);">changelog</a>.</p>
 
 <div class="feature-grid">
+  <div class="feature"><h4><span class="dot new"></span>Password modal via child process<span class="badge">v1.1.3</span></h4><p><code>askPasswordModal</code> now exec's <code>kiosk-exit-guard.exe --ask-password &lt;title&gt; &lt;subtitle&gt;</code> as a child and reads its exit code (0 / 1 / 2 = OK / Wrong / Cancel). The child's WebView2 is always its first instance, so the controller (which already used WebView2 for <code>firstRunWithWizard</code>) never crashes on the LL-hook-triggered password modal. Closes the "fresh install, press Win once, kiosk bypassed" failure path.</p></div>
+  <div class="feature"><h4><span class="dot new"></span><code>explorer.exe</code> token fallback<span class="badge">v1.1.3</span></h4><p>When <code>WTSQueryUserToken</code> returns <code>ERROR_NO_TOKEN</code> (observed in production on Win11 Home), the supervisor falls back to finding <code>explorer.exe</code> in the active console session via <code>ProcessIdToSessionId</code>, calling <code>OpenProcessToken</code>, and (if UAC is on) unwrapping the limited half of the split token to the elevated linked token via <code>GetTokenInformation(TokenLinkedToken)</code>. Closes the "filter only runs when I re-click the exe" failure path.</p></div>
   <div class="feature"><h4><span class="dot new"></span>Toasts via child process<span class="badge">v1.1.2</span></h4><p><code>showTimedInfo</code> always spawns <code>kiosk-exit-guard.exe --show-toast</code> as a fire-and-forget child. The caller's process is never the one to instantiate a second WebView2, structurally eliminating the <code>go-webview2</code> double-instance panic that crashed the controller every time a pause auto-expired (and dropped the LL keyboard hook for ~1 s while the Service respawned).</p></div>
   <div class="feature"><h4><span class="dot new"></span>Pause-expiry crash fix<span class="badge">v1.1.2</span></h4><p>Symptom users hit: Resume shortcut said "SK Filter is already active" but the Win key wasn't blocked. Root cause: <code>autoReenableFilterMode</code>'s "Pause ended." toast was the controller's second in-process WebView2, panic'd on the <code>time.AfterFunc</code> goroutine (no <code>recover</code>), killed the controller. Same path bit every flow pairing <code>askPasswordModal</code> with <code>showFailedToast</code>. Fix in v1.1.2 routes all toasts through a separate process.</p></div>
   <div class="feature"><h4><span class="dot new"></span><code>--update</code> panic fix<span class="badge">v1.1.1</span></h4><p><code>runUpdateInvocation</code> called <code>showTimedInfo("Checking GitHub for updates…")</code> then <code>askPasswordModal</code> in the same process — two WebView2 instances, panic at <code>chromium.go:131</code>. v1.1.1 spawned the toast as a separate process; v1.1.2 generalizes this to every toast call site.</p></div>

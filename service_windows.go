@@ -35,6 +35,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/shirou/gopsutil/v4/process"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
@@ -351,11 +352,23 @@ func (s *kioskExitGuardService) spawnControllerInSession(sessionID uint32) (wind
 		return 0, fmt.Errorf("Executable: %w", err)
 	}
 
-	// 1. WTSQueryUserToken: get an impersonation token for the user in
-	// that session. Requires SE_TCB_NAME, which LocalSystem has.
+	// 1. Get a user token for the target session. Try WTSQueryUserToken
+	// first — that's the documented path and works on most installs.
+	// When it fails (observed on Win11 Home: returns ERROR_NO_TOKEN even
+	// for a fully-logged-in interactive session), fall back to stealing
+	// explorer.exe's primary token in the same session. That's the
+	// standard workaround for the WTSQueryUserToken NO_TOKEN behavior:
+	// explorer.exe is guaranteed to exist whenever the user has logged
+	// in to a desktop, and its token represents the user's identity.
 	var userToken windows.Token
-	if err := windows.WTSQueryUserToken(sessionID, &userToken); err != nil {
-		return 0, fmt.Errorf("WTSQueryUserToken(%d): %w", sessionID, err)
+	wtsErr := windows.WTSQueryUserToken(sessionID, &userToken)
+	if wtsErr != nil {
+		fallback, fbErr := tokenFromExplorerInSession(sessionID)
+		if fbErr != nil {
+			return 0, fmt.Errorf("WTSQueryUserToken(%d): %w; explorer fallback: %v", sessionID, wtsErr, fbErr)
+		}
+		userToken = fallback
+		logf("service: WTSQueryUserToken failed (%v); using explorer.exe token fallback for session %d", wtsErr, sessionID)
 	}
 	defer userToken.Close()
 
@@ -435,6 +448,115 @@ func (s *kioskExitGuardService) spawnControllerInSession(sessionID uint32) (wind
 
 	logf("service: spawned controller pid=%d in session %d", pi.ProcessId, sessionID)
 	return pi.Process, nil
+}
+
+// tokenFromExplorerInSession finds an explorer.exe instance running in the
+// target console session, opens its primary token, and returns it. If
+// explorer.exe is running under a user with UAC enabled, OpenProcessToken
+// returns the *limited* half of the UAC-split token — kiosk-exit-guard
+// needs admin (HKLM writes, IFEO, etc.) so we unwrap the limited token
+// to its linked elevated counterpart via GetTokenInformation(TokenLinkedToken).
+//
+// This is the standard workaround for WTSQueryUserToken returning
+// ERROR_NO_TOKEN on machines where the documented path inexplicably fails
+// (observed on Win11 Home in the field — see v1.1.3 changelog).
+func tokenFromExplorerInSession(sessionID uint32) (windows.Token, error) {
+	procs, err := process.Processes()
+	if err != nil {
+		return 0, fmt.Errorf("enumerate processes: %w", err)
+	}
+
+	var lastErr error
+	for _, p := range procs {
+		name, nerr := p.Name()
+		if nerr != nil || !strings.EqualFold(name, "explorer.exe") {
+			continue
+		}
+		pid := uint32(p.Pid)
+
+		// ProcessIdToSessionId tells us which session this explorer.exe
+		// is running in. We only want one whose session matches the
+		// active console session — there can be multiple explorer.exe
+		// processes (RDP, fast-user-switch, etc.).
+		var procSession uint32
+		if sErr := windows.ProcessIdToSessionId(pid, &procSession); sErr != nil {
+			lastErr = sErr
+			continue
+		}
+		if procSession != sessionID {
+			continue
+		}
+
+		hProc, oErr := windows.OpenProcess(windows.PROCESS_QUERY_INFORMATION, false, pid)
+		if oErr != nil {
+			lastErr = oErr
+			continue
+		}
+
+		var token windows.Token
+		tErr := windows.OpenProcessToken(
+			hProc,
+			windows.TOKEN_DUPLICATE|windows.TOKEN_QUERY|windows.TOKEN_ASSIGN_PRIMARY|windows.TOKEN_IMPERSONATE,
+			&token,
+		)
+		_ = windows.CloseHandle(hProc)
+		if tErr != nil {
+			lastErr = tErr
+			continue
+		}
+
+		// If this is a UAC-split limited token, swap to its elevated
+		// linked counterpart. kiosk-exit-guard needs admin to do its
+		// job — a non-elevated controller can't write HKLM, register
+		// IFEO debugger keys, or restart Explorer.
+		if elevated, eErr := elevatedLinkedToken(token); eErr == nil && elevated != 0 {
+			_ = token.Close()
+			return elevated, nil
+		}
+		// Either elevation type is "Default" (UAC off / built-in admin)
+		// or "Full" (already elevated) — use the token as-is.
+		return token, nil
+	}
+
+	if lastErr != nil {
+		return 0, fmt.Errorf("no usable explorer.exe in session %d (last error: %v)", sessionID, lastErr)
+	}
+	return 0, fmt.Errorf("no explorer.exe found in session %d (is a user logged in?)", sessionID)
+}
+
+// elevatedLinkedToken returns the elevated counterpart of a UAC-split
+// limited token. Returns (0, nil) if the token is not split (i.e.
+// elevation type is Default or Full — there's nothing to swap to). The
+// returned token, when non-zero, must be Close()'d by the caller.
+func elevatedLinkedToken(limited windows.Token) (windows.Token, error) {
+	// TokenElevationType returns a DWORD: 1=Default, 2=Full, 3=Limited.
+	var elevType uint32
+	var retLen uint32
+	if err := windows.GetTokenInformation(
+		limited, windows.TokenElevationType,
+		(*byte)(unsafe.Pointer(&elevType)),
+		uint32(unsafe.Sizeof(elevType)),
+		&retLen,
+	); err != nil {
+		return 0, fmt.Errorf("GetTokenInformation(TokenElevationType): %w", err)
+	}
+	const tokenElevationTypeLimited = 3
+	if elevType != tokenElevationTypeLimited {
+		return 0, nil
+	}
+
+	// TokenLinkedToken returns a TOKEN_LINKED_TOKEN struct which is a
+	// single HANDLE (8 bytes on amd64).
+	var linked windows.Token
+	if err := windows.GetTokenInformation(
+		limited, windows.TokenLinkedToken,
+		(*byte)(unsafe.Pointer(&linked)),
+		uint32(unsafe.Sizeof(linked)),
+		&retLen,
+	); err != nil {
+		return 0, fmt.Errorf("GetTokenInformation(TokenLinkedToken): %w", err)
+	}
+	return linked, nil
 }
 
 // appendEnvVar copies the env block CreateEnvironmentBlock produced and

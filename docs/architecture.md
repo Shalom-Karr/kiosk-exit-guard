@@ -8,7 +8,9 @@ Starting in v1.1.0 the binary plays two roles: a **supervising Windows Service**
 
 | Mode | How it's invoked | What it does |
 |---|---|---|
-| **`--service-run`** | SCM only — never run by hand | Supervising Windows Service. Finds the active console session via `WTSGetActiveConsoleSessionId`, gets the user token via `WTSQueryUserToken`, duplicates to a primary token, builds an env block, spawns the controller via `CreateProcessAsUserW`. Respawns on controller exit. On `sc stop` it `TerminateProcess`-es the controller. |
+| **`--service-run`** | SCM only — never run by hand | Supervising Windows Service. Finds the active console session via `WTSGetActiveConsoleSessionId`, gets the user token via `WTSQueryUserToken` (falling back to stealing `explorer.exe`'s token + linked-elevated unwrap if WTS returns `ERROR_NO_TOKEN` — v1.1.3), duplicates to a primary token, builds an env block, spawns the controller via `CreateProcessAsUserW`. Respawns on controller exit. On `sc stop` it `TerminateProcess`-es the controller. |
+| **`--ask-password`** | spawned by `askPasswordModal` (any caller) | Child-process password modal. Renders the branded WebView2 dialog, validates the entered password against the HKLM bcrypt hash, exits 0/1/2 = OK/Wrong/Cancel. Required because `go-webview2` panics on the second `NewWithOptions` in any process — keeping the modal in a child guarantees the controller's WebView2 budget stays at 1 (the first-run wizard). v1.1.3+. |
+| **`--show-toast`** | spawned by `showTimedInfo` (any caller) | Child-process toast renderer. Renders the branded toast for the given milliseconds, then exits. Same WebView2-isolation rationale as `--ask-password`. v1.1.2+. |
 | **`--service-install`** | first-run setup (admin) | Registers `KioskExitGuardSvc` with SCM, starts it, deletes any leftover v1.0.x scheduled task. |
 | **`--service-remove`** | `--uninstall` (admin) | Stops and unregisters the Service. |
 | **Controller** | no args — spawned by the Service into the user session, or first manual launch by the admin | Owns the LL keyboard hook, filter-mode state, registry lockdown, and supervises the kiosk window. Long-running. |

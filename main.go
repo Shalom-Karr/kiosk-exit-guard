@@ -58,7 +58,7 @@ import (
 
 // currentVersion must be kept in sync with versioninfo.json. Used by the
 // --update flow to compare against the latest GitHub release tag.
-const currentVersion = "1.1.2"
+const currentVersion = "1.1.3"
 
 // ---------- logging ----------
 
@@ -2032,11 +2032,57 @@ const (
 	pwCancel                         // user dismissed (Cancel / Esc / window close)
 )
 
-// askPasswordModal shows a branded, autofocused WebView2 password dialog.
-// Returns pwOK only if the entered password matches the stored bcrypt
-// hash. Callers should treat pwCancel as a silent dismissal and only
-// surface a "Wrong password" toast on pwWrong.
+// askPasswordModal spawns a `--ask-password` child process to render
+// the branded WebView2 password dialog and waits for its exit code:
+// 0 = pwOK, 1 = pwWrong, 2 = pwCancel. Routing the modal through a
+// child process is required because go-webview2 panics on the second
+// NewWithOptions call in a process (chromium.go:131). The controller
+// has already created one WebView2 during firstRunWithWizard, so
+// opening askPasswordModal in-process from the LL hook callback
+// would crash the controller and drop the keyboard hook. The child
+// process has zero prior WebView2 instances, so the modal is always
+// its first.
+//
+// Pre-v1.1.3 this function was in-process and produced the
+// "controller crashes when user first presses Win" bug observed in
+// the field. The original in-process implementation is preserved as
+// askPasswordModalInProcess and is invoked only by the child's
+// --ask-password flag handler in main().
 func askPasswordModal(title, subtitle string) passwordResult {
+	exe, err := os.Executable()
+	if err != nil {
+		// Can't locate ourselves — fall back to in-process. Last-resort
+		// path that may still panic on second-instance, but better than
+		// no auth at all.
+		return askPasswordModalInProcess(title, subtitle)
+	}
+	cmd := exec.Command(exe, "--ask-password", title, subtitle)
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+	runErr := cmd.Run()
+	if runErr == nil {
+		return pwOK
+	}
+	if exitErr, ok := runErr.(*exec.ExitError); ok {
+		switch exitErr.ExitCode() {
+		case 1:
+			return pwWrong
+		case 2:
+			return pwCancel
+		}
+	}
+	// Child failed to launch / unknown error. Treat as cancel so the
+	// caller's flow exits silently rather than triggering a wrong-
+	// password toast for what is actually a plumbing failure.
+	logf("askPasswordModal child exec failed: %v", runErr)
+	return pwCancel
+}
+
+// askPasswordModalInProcess shows a branded, autofocused WebView2 password
+// dialog. Returns pwOK only if the entered password matches the stored
+// bcrypt hash. Only called by the `--ask-password` child process; all
+// other callers must use the parent-side askPasswordModal which spawns
+// this in a child to avoid the go-webview2 double-instance panic.
+func askPasswordModalInProcess(title, subtitle string) passwordResult {
 	if !promptOpen.CompareAndSwap(false, true) {
 		return pwCancel
 	}
@@ -2902,6 +2948,40 @@ func main() {
 	// Open the log file before anything else can panic. Best-effort.
 	initLogging()
 	defer recoverAndLog("main")
+
+	// --ask-password <title> <subtitle>: child-process password modal.
+	// Used by every askPasswordModal call site so the calling process
+	// never instantiates the modal's WebView2 itself. go-webview2 panics
+	// on the second NewWithOptions in a process; the controller has
+	// already created one during firstRunWithWizard, and any flow that
+	// shows a password modal after another in-process WebView2 (e.g.
+	// the LL hook callback's promptAndReinject in the controller, or
+	// --update's "Checking…" toast before v1.1.1) would crash. This
+	// child has zero prior WebView2 instances so the modal is always
+	// its first; result is conveyed via exit code: 0 pwOK, 1 pwWrong,
+	// 2 pwCancel (and 2 also for any plumbing failure).
+	if len(os.Args) > 1 && os.Args[1] == "--ask-password" {
+		if len(os.Args) < 4 {
+			os.Exit(2)
+		}
+		title := os.Args[2]
+		subtitle := os.Args[3]
+		migrateLegacyHash()
+		hash, herr := loadHash()
+		if herr != nil || len(hash) == 0 {
+			logf("--ask-password: no hash configured")
+			os.Exit(2)
+		}
+		storedHash = hash
+		switch askPasswordModalInProcess(title, subtitle) {
+		case pwOK:
+			os.Exit(0)
+		case pwWrong:
+			os.Exit(1)
+		default:
+			os.Exit(2)
+		}
+	}
 
 	// --service-run: SCM-only entry point for the Windows Service. Runs
 	// the supervisor loop that respawns the user-session controller via

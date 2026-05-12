@@ -4,6 +4,39 @@ All notable changes to kiosk-exit-guard, newest first. Versions follow [Semantic
 
 For the current state of the project, see the [landing page](https://shalom-karr.github.io/kiosk-exit-guard/), the [architecture doc](architecture.md), and the [admin runbook](admin-runbook.md).
 
+## v1.1.3 — 2026-05-12
+
+**Two critical bugs the v1.1.0–v1.1.2 line missed.** Reported from production logs.
+
+### Bug A — controller crashed on first Win/Ctrl/Alt press
+
+User-visible: install fresh, press Win key once, get the password modal, and the kiosk is bypassed because the controller crashed half-way through the modal.
+
+Same root cause as v1.1.1 and v1.1.2: `go-webview2` panics on the second `NewWithOptions` call per process (`chromium.go:131`). I fixed `showTimedInfo` in v1.1.2 but missed the bigger call site — `askPasswordModal`. The controller has already used WebView2 once during `firstRunWithWizard`. When the LL hook fires on the first key combo and calls `promptAndReinject` → `askPasswordModal`, that's the controller's second WebView2 → panic on the `time.AfterFunc` goroutine with no recover → controller dies → LL hook dies with it → user pressed past the kiosk while the modal was still drawing. Confirmed from logs:
+
+```
+[01:55:17.167] LL keyboard hook installed (handle=3277641)
+… modal opens, panics at chromium.go:131 …
+"i got a full screen option to close the filter and then it crashed and let me get passed it"
+```
+
+Fix: `askPasswordModal` now spawns `kiosk-exit-guard.exe --ask-password <title> <subtitle>` as a child process and reads its exit code (0=OK, 1=Wrong, 2=Cancel). The child's WebView2 is always its first instance, so the panic class is structurally eliminated. The in-process implementation is preserved as `askPasswordModalInProcess` and used only by the `--ask-password` flag handler. Every call site (`runPauseInvocation`, `runUpdateInvocation`, `runUninstallInvocation`, `runReset`, `runSetURL`, and most importantly the controller's LL-hook-callback path) goes through the child route automatically — no per-site changes needed.
+
+### Bug B — service couldn't spawn its child controller (filter only ran when manually launched)
+
+User-visible: "right now the filter only runs when I re-click the exe file from the downloads folder." After a reboot the kiosk had zero protection until the admin manually double-clicked the exe.
+
+Root cause: `WTSQueryUserToken(activeConsoleSession)` returned `ERROR_NO_TOKEN` every 2 seconds for the entire session. The supervising Service's `spawnControllerInSession` couldn't get a primary token for the console user, so `CreateProcessAsUserW` never ran. v1.0.x's Task-Scheduler path (which would have worked) was removed in v1.1.0 in favor of the Service-only path, so when `WTSQueryUserToken` fails on a given install, there's no fallback. Documented Windows API but inconsistent on Win11 Home in the field. Confirmed from logs — same machine, every spawn attempt:
+
+```
+service: spawnControllerInSession(1) failed: WTSQueryUserToken(1):
+  An attempt was made to reference a token that does not exist.
+```
+
+Fix: if `WTSQueryUserToken` fails, fall back to stealing `explorer.exe`'s primary token in the same session. `explorer.exe` is guaranteed to exist whenever a user has reached the desktop, and its token represents that user's identity. To handle UAC, `tokenFromExplorerInSession` then calls `GetTokenInformation(TokenElevationType)` to detect a split-token state; if it's Limited (UAC-on admin user with the unelevated half running explorer), it unwraps to the linked elevated token via `GetTokenInformation(TokenLinkedToken)`. The controller needs admin (HKLM writes, IFEO, Explorer restart) so the limited half is not usable.
+
+The `WTSQueryUserToken` path is still tried first because it's the documented one and works on most installs. Only the failure path goes via explorer.exe-token.
+
 ## v1.1.2 — 2026-05-11
 
 **Hook stayed dead after pause auto-expired — root cause of "Win key not blocked" reports.**
