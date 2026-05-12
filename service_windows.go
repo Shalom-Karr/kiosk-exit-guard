@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -128,8 +129,12 @@ const (
 	wtsConnected    = 1
 	wtsDisconnected = 4
 
-	// WTS_INFO_CLASS value for WTSUserName.
-	wtsInfoUserName = 5
+	// WTS_INFO_CLASS values. WTSUserName returns the logged-in user's
+	// account name; WTSDomainName returns the domain (or local machine
+	// name on workgroup boxes). Both used by pickActiveUserSession for
+	// the v1.2.0 candidate-logging behavior.
+	wtsInfoUserName   = 5
+	wtsInfoDomainName = 7
 )
 
 // wtsSessionInfoW mirrors the Win32 WTS_SESSION_INFOW on amd64. Layout:
@@ -153,28 +158,39 @@ type wtsSessionInfoW struct {
 }
 
 // wtsProcessInfoW mirrors the Win32 WTS_PROCESS_INFO_EXW (level 0) on
-// amd64. The struct is 32 bytes per entry with natural 8-byte alignment;
-// the two uint32 padding fields are inserted by MSVC to align the next
-// pointer field on an 8-byte boundary. Verified at runtime with
-// unsafe.Sizeof at the call site.
+// amd64. The struct is 24 bytes per entry with natural 8-byte alignment.
+// MSVC packs the two adjacent DWORDs (SessionId, ProcessId) into a single
+// 8-byte slot, then the two pointer-sized fields follow at offsets 8 and
+// 16. v1.2.0 fix: pre-v1.2.0 had explicit 4-byte padding fields between
+// the DWORDs and the pointers (32 bytes total) which is wrong — on the
+// real layout that miscast SessionId/ProcessId, walked off the array
+// stride by 8 bytes per entry, and made the picker dereference garbage
+// pointers. Verified at compile time via the size assertion below.
 //
 // typedef struct _WTS_PROCESS_INFOW {
-//     DWORD  SessionId;
-//     DWORD  ProcessId;
-//     LPWSTR pProcessName;
-//     PSID   pUserSid;
-// } WTS_PROCESS_INFOW;
+//     DWORD  SessionId;     // offset 0, 4 bytes
+//     DWORD  ProcessId;     // offset 4, 4 bytes
+//     LPWSTR pProcessName;  // offset 8, 8 bytes
+//     PSID   pUserSid;      // offset 16, 8 bytes
+// } WTS_PROCESS_INFOW;       // sizeof == 24
 //
 // (The "Ex" variant at level 0 has the same on-disk layout as
-// WTS_PROCESS_INFOW per MS docs — both are 32 bytes on x64.)
+// WTS_PROCESS_INFOW per MS docs — both are 24 bytes on x64.)
 type wtsProcessInfoW struct {
 	SessionId   uint32
-	_           uint32 // padding to 8-byte align ProcessName pointer
 	ProcessId   uint32
-	_           uint32 // padding
 	ProcessName *uint16
 	UserSid     uintptr // PSID
 }
+
+// Compile-time size assertions. If either struct's Go layout drifts from
+// the Win32 ABI we'll dereference garbage at runtime; better to fail the
+// build. Each array type below is invalid (negative length) unless the
+// struct is exactly 24 bytes, so the build fails on layout drift.
+var _ [1]struct{} = [unsafe.Sizeof(wtsProcessInfoW{}) - 23]struct{}{} // size must be >= 24 (length 1)
+var _ [1]struct{} = [25 - unsafe.Sizeof(wtsProcessInfoW{})]struct{}{} // size must be <= 24 (length 1)
+var _ [1]struct{} = [unsafe.Sizeof(wtsSessionInfoW{}) - 23]struct{}{} // size must be >= 24 (length 1)
+var _ [1]struct{} = [25 - unsafe.Sizeof(wtsSessionInfoW{})]struct{}{} // size must be <= 24 (length 1)
 
 func destroyEnvironmentBlock(env *uint16) {
 	if env == nil {
@@ -449,7 +465,17 @@ func (s *kioskExitGuardService) supervisorLoop() {
 		}
 
 		if sessionID != lastLoggedSession {
-			logf("service: spawning controller in session %d (state=Active, user logged in)", sessionID)
+			// v1.2.0: log chosen user/domain and any passed-over
+			// candidates so an operator can see who the controller is
+			// being spawned as on multi-user RDP boxes.
+			lastPickMu.Lock()
+			user, domain := lastPickUser, lastPickDomain
+			cands := append([]string(nil), lastPickCandidates...)
+			lastPickMu.Unlock()
+			if len(cands) > 1 {
+				logf("service: %d candidate sessions: %s", len(cands), strings.Join(cands, ", "))
+			}
+			logf("service: spawning controller in session %d (state=Active, user=%s\\%s)", sessionID, domain, user)
 			lastLoggedSession = sessionID
 		}
 
@@ -544,7 +570,8 @@ func pickActiveUserSession() (uint32, bool) {
 
 	// Defensive: validate the on-disk struct size matches what we
 	// declared. amd64 layout is 24 bytes; mismatch means we'd
-	// dereference garbage.
+	// dereference garbage. (Now compile-time asserted as well; this
+	// runtime check stays as a belt-and-suspenders guard.)
 	const expectedSessionInfoSize = 24
 	if got := unsafe.Sizeof(wtsSessionInfoW{}); got != expectedSessionInfoSize {
 		_, _, _ = procWTSFreeMemory.Call(uintptr(unsafe.Pointer(pSessionInfo)))
@@ -557,7 +584,16 @@ func pickActiveUserSession() (uint32, bool) {
 	consoleID := windows.WTSGetActiveConsoleSessionId()
 
 	// Two-pass: console first (if it qualifies), then lowest-numbered
-	// other WTSActive with a user.
+	// other WTSActive with a user. v1.2.0: collect every candidate so we
+	// can log what was passed over — on Server 2022 with multiple RDP
+	// users the picker silently picks the lowest-numbered session, which
+	// might not be the admin the kiosk is supposed to lock down.
+	type candidate struct {
+		sessionID uint32
+		user      string
+		domain    string
+	}
+	var candidates []candidate
 	var consolePick uint32
 	var consoleOK bool
 	var bestOther uint32
@@ -568,9 +604,16 @@ func pickActiveUserSession() (uint32, bool) {
 		if si.State != wtsActive {
 			continue
 		}
-		if !sessionHasLoggedInUser(si.SessionID) {
+		user := wtsSessionString(si.SessionID, wtsInfoUserName)
+		if user == "" {
 			continue
 		}
+		domain := wtsSessionString(si.SessionID, wtsInfoDomainName)
+		candidates = append(candidates, candidate{
+			sessionID: si.SessionID,
+			user:      user,
+			domain:    domain,
+		})
 		if consoleID != noActiveSession && si.SessionID == consoleID {
 			consolePick = si.SessionID
 			consoleOK = true
@@ -584,42 +627,84 @@ func pickActiveUserSession() (uint32, bool) {
 
 	_, _, _ = procWTSFreeMemory.Call(uintptr(unsafe.Pointer(pSessionInfo)))
 
-	if consoleOK {
-		return consolePick, true
+	var chosen uint32
+	var chosenOK bool
+	switch {
+	case consoleOK:
+		chosen, chosenOK = consolePick, true
+	case bestOtherOK:
+		chosen, chosenOK = bestOther, true
 	}
-	if bestOtherOK {
-		return bestOther, true
+	if !chosenOK {
+		return 0, false
 	}
-	return 0, false
+
+	// v1.2.0: cache pick info for the supervisor's once-per-change log
+	// line. The supervisor calls pickActiveUserSession every 2s; logging
+	// from inside would spam the log. We stash the chosen user/domain +
+	// the full candidate list in package-level state so the supervisor
+	// can read it on a transition without re-querying WTS.
+	var chosenUser, chosenDomain string
+	for _, c := range candidates {
+		if c.sessionID == chosen {
+			chosenUser, chosenDomain = c.user, c.domain
+			break
+		}
+	}
+	lastPickMu.Lock()
+	lastPickChosen = chosen
+	lastPickUser = chosenUser
+	lastPickDomain = chosenDomain
+	lastPickCandidates = lastPickCandidates[:0]
+	for _, c := range candidates {
+		lastPickCandidates = append(lastPickCandidates, fmt.Sprintf("%d (%s\\%s)", c.sessionID, c.domain, c.user))
+	}
+	lastPickMu.Unlock()
+
+	return chosen, true
 }
 
-// sessionHasLoggedInUser returns true if WTSQuerySessionInformationW
-// reports a non-empty WTSUserName for the given session. An RDP
-// session sitting at the logon dialog (no user yet) returns empty;
-// a real interactive logon returns the username.
-func sessionHasLoggedInUser(sessionID uint32) bool {
+// lastPick* hold the most recent pickActiveUserSession result so the
+// supervisor loop can log session/user/candidate info exactly once per
+// transition (rather than every 2-second poll). Guarded by lastPickMu.
+var (
+	lastPickMu         sync.Mutex
+	lastPickChosen     uint32
+	lastPickUser       string
+	lastPickDomain     string
+	lastPickCandidates []string
+)
+
+// wtsSessionString returns a WTS string property (WTSUserName,
+// WTSDomainName, …) for the given session, or "" on any error or empty
+// result. Wraps the WTSQuerySessionInformationW call + WTSFreeMemory
+// cleanup pattern used by sessionHasLoggedInUser. v1.2.0 visibility fix.
+func wtsSessionString(sessionID uint32, infoClass uint32) string {
 	var buf *uint16
 	var bytesReturned uint32
 	r1, _, _ := procWTSQuerySessionInformationW.Call(
 		uintptr(wtsCurrentServerHandle),
 		uintptr(sessionID),
-		uintptr(wtsInfoUserName),
+		uintptr(infoClass),
 		uintptr(unsafe.Pointer(&buf)),
 		uintptr(unsafe.Pointer(&bytesReturned)),
 	)
 	if r1 == 0 || buf == nil {
-		return false
+		return ""
 	}
 	defer procWTSFreeMemory.Call(uintptr(unsafe.Pointer(buf)))
-
-	// bytesReturned counts bytes including the trailing NUL. UTF-16, so
-	// empty = 2 bytes (just the NUL). Defensive: also check first wchar
-	// in case some SKU returns bytesReturned==0 for empty.
 	if bytesReturned <= 2 {
-		return false
+		return ""
 	}
-	first := *(*uint16)(unsafe.Pointer(buf))
-	return first != 0
+	// Convert the UTF-16 NUL-terminated buffer to a Go string. Walk the
+	// buffer up to bytesReturned/2 wchars to find the terminator.
+	maxWChars := int(bytesReturned / 2)
+	wchars := unsafe.Slice(buf, maxWChars)
+	n := 0
+	for n < maxWChars && wchars[n] != 0 {
+		n++
+	}
+	return windows.UTF16ToString(wchars[:n])
 }
 
 // spawnControllerInSession is the meat of the Service: get the user's
@@ -920,9 +1005,10 @@ func enumerateWTSProcesses(sessionID uint32, cb func([]wtsProcessInfoW)) error {
 	}
 
 	// Defensive: validate the on-disk struct size matches what we
-	// declared. The user's amd64 layout is 32 bytes; if Go's compiler
-	// laid it out differently we'd dereference garbage.
-	const expectedSize = 32
+	// declared. The amd64 layout is 24 bytes (compile-time asserted
+	// above); this runtime check is a belt-and-suspenders guard against
+	// the assertion ever being weakened.
+	const expectedSize = 24
 	if got := unsafe.Sizeof(wtsProcessInfoW{}); got != expectedSize {
 		_, _, _ = procWTSFreeMemoryExW.Call(
 			uintptr(wtsTypeProcessInfoLevel0),

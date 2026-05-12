@@ -62,7 +62,7 @@ import (
 
 // currentVersion must be kept in sync with versioninfo.json. Used by the
 // --update flow to compare against the latest GitHub release tag.
-const currentVersion = "1.1.11"
+const currentVersion = "1.2.0"
 
 // ---------- logging ----------
 
@@ -1914,18 +1914,51 @@ func relocateToProgramFilesIfNeeded() bool {
 	}
 	src.Close()
 	dst.Close()
-	// Replace any existing canonical exe so an upgrade-from-Downloads
-	// install correctly updates the on-disk binary.
-	_ = os.Remove(canonical)
-	if err := os.Rename(tmp, canonical); err != nil {
+	// v1.2.0 LOW#9: atomic swap via MoveFileExW(MOVEFILE_REPLACE_EXISTING)
+	// instead of the pre-v1.2.0 os.Remove(canonical) + os.Rename(tmp, …)
+	// pair. The old sequence left the install dir empty if the rename
+	// failed (lock held by a still-running previous controller): the
+	// old canonical was already deleted and the new path never landed.
+	// MoveFileExW preserves the old canonical on failure — if the swap
+	// can't take effect, the previous binary is still there.
+	pTmp, tmpErr := syscall.UTF16PtrFromString(tmp)
+	pCanonical, canErr := syscall.UTF16PtrFromString(canonical)
+	if tmpErr != nil || canErr != nil {
 		_ = os.Remove(tmp)
-		logf("relocate: rename %s -> %s failed: %v", tmp, canonical, err)
+		logf("relocate: UTF16PtrFromString failed: tmp=%v canonical=%v", tmpErr, canErr)
+		return false
+	}
+	if err := windows.MoveFileEx(pTmp, pCanonical, windows.MOVEFILE_REPLACE_EXISTING); err != nil {
+		_ = os.Remove(tmp)
+		logf("relocate: MoveFileEx %s -> %s failed: %v (old canonical preserved)", tmp, canonical, err)
 		return false
 	}
 
 	logf("relocate: copied exe to canonical path %s — re-executing", canonical)
 	cmd := exec.Command(canonical, os.Args[1:]...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+
+	// v1.2.0 HIGH#4: explicitly null out KIOSK_EXIT_GUARD_VIA_SERVICE in
+	// the child's env. Today nothing sets that variable up the call
+	// chain — only the Service supervisor sets it via
+	// CreateEnvironmentBlock — but if a future change ever does, the
+	// re-exec would inherit it and suppress the first-run wizard.
+	// Scrubbing here makes that regression landmine inert.
+	parentEnv := os.Environ()
+	childEnv := parentEnv[:0:0]
+	for _, kv := range parentEnv {
+		// Match the var name case-insensitively (Windows env var names
+		// are case-insensitive; the runtime can return them in any
+		// case depending on which API set them).
+		if eq := strings.IndexByte(kv, '='); eq > 0 {
+			if strings.EqualFold(kv[:eq], envViaService) {
+				continue
+			}
+		}
+		childEnv = append(childEnv, kv)
+	}
+	cmd.Env = childEnv
+
 	if err := cmd.Start(); err != nil {
 		logf("relocate: exec.Command(canonical).Start failed: %v — continuing from current location", err)
 		return false
@@ -2340,9 +2373,22 @@ func askCustomMinutes() (time.Duration, bool) {
 
 // ---------- hook callback ----------
 
+// kbdLLHookStructFromLParam decodes a LowLevelKeyboardProc lParam (a
+// uintptr documented by Microsoft to be a pointer to KBDLLHOOKSTRUCT)
+// into a typed *kbdLLHookStruct. Isolating the conversion in a
+// nocheckptr helper silences go vet's unsafeptr analyzer (it can't see
+// the Win32 ABI contract that lParam is a valid pointer) while keeping
+// runtime checkptr happy.
+//
+//go:nosplit
+//go:nocheckptr
+func kbdLLHookStructFromLParam(lParam uintptr) *kbdLLHookStruct {
+	return (*kbdLLHookStruct)(unsafe.Pointer(lParam)) //nolint:govet // Win32 LowLevelKeyboardProc ABI
+}
+
 func hookCallback(nCode int32, wParam uintptr, lParam uintptr) uintptr {
 	if nCode >= 0 {
-		kb := (*kbdLLHookStruct)(unsafe.Pointer(lParam))
+		kb := kbdLLHookStructFromLParam(lParam)
 		injected := (kb.Flags & llkhfInject) != 0
 		ourInjection := kb.DwExtraInfo == kioskMarker
 		if !injected && !ourInjection {
@@ -2515,6 +2561,17 @@ const passwordPromptHTML = `<!DOCTYPE html><html lang="en"><head><meta charset="
   setTimeout(function() { input.focus(); input.select(); }, 0);
   window.addEventListener('load',          function() { input.focus(); });
   document.addEventListener('DOMContentLoaded', function() { input.focus(); });
+  // v1.2.0 MEDIUM#5: signal to Go that the page is interactive. The Go
+  // side arms the inactivity timer here instead of before w.Run() so a
+  // slow WebView2 cold-start (5–6s) doesn't eat into the 30s budget.
+  document.addEventListener('DOMContentLoaded', function() {
+    if (window.kgReady) { window.kgReady(); }
+  });
+  // Also fire on load in case DOMContentLoaded already fired before
+  // this script ran (race during slow first paint).
+  window.addEventListener('load', function() {
+    if (window.kgReady) { window.kgReady(); }
+  });
   input.addEventListener('keydown', function(e) {
     if (e.key === 'Enter')  { e.preventDefault(); submit(); }
     if (e.key === 'Escape') { e.preventDefault(); cancel(); }
@@ -2604,27 +2661,78 @@ func releaseGlobalPromptLock(h uintptr) {
 // kiosk WebView2 blink/reopen as the loser's supervisor respawns. Fail-
 // open on kernel32 / mutex-create errors so a degraded kernel32 doesn't
 // turn into "controller refuses to start".
+//
+// v1.2.0 INFO fix: passes an explicit SECURITY_ATTRIBUTES granting
+// MUTEX_ALL_ACCESS only to BUILTIN\Administrators and SYSTEM. The
+// default DACL on CreateMutexW grants the caller's process owner
+// SYNCHRONIZE access — meaning the kiosk user (LocalSystem-spawned
+// controller runs as the kiosk user) could pre-create the same-named
+// mutex from a logon script and DoS the real controller. The admin-only
+// DACL closes that hole.
 func acquireControllerMutex() (handle uintptr, alreadyRunning bool) {
+	return acquireAdminOnlyNamedMutex(globalControllerMutexName)
+}
+
+// acquireAdminOnlyNamedMutex is the v1.2.0 helper backing every
+// process-level "only one of these alive" gate (controller, first-run
+// relocate, update). Creates the named mutex with a DACL granting
+// MUTEX_ALL_ACCESS (0x1F0001) only to BUILTIN\Administrators (BA) and
+// SYSTEM (SY), so a kiosk-user logon script can't squat on it and DoS
+// the real holder. Returns (handle, alreadyHeld) on success or
+// (0, false) on any failure (fail-open so a degraded kernel32 doesn't
+// brick the controller).
+func acquireAdminOnlyNamedMutex(name string) (handle uintptr, alreadyHeld bool) {
 	if procCreateMutexW.Find() != nil {
 		return 0, false
 	}
-	name, err := syscall.UTF16PtrFromString(globalControllerMutexName)
+	wname, err := syscall.UTF16PtrFromString(name)
 	if err != nil {
 		return 0, false
 	}
-	h, _, _ := procCreateMutexW.Call(0, 1 /* bInitialOwner */, uintptr(unsafe.Pointer(name)))
+
+	// SDDL: D: → DACL; (A;;0x1F0001;;;BA) ALLOW BUILTIN\Administrators
+	// MUTEX_ALL_ACCESS; (A;;0x1F0001;;;SY) ALLOW SYSTEM the same.
+	// 0x1F0001 = STANDARD_RIGHTS_REQUIRED (0x1F0000) | MUTANT_QUERY_STATE
+	// (0x0001) = MUTEX_ALL_ACCESS.
+	const sddl = `D:(A;;0x1F0001;;;BA)(A;;0x1F0001;;;SY)`
+	sd, sdErr := windows.SecurityDescriptorFromString(sddl)
+	if sdErr != nil {
+		// Fall back to default DACL so we don't refuse to start on a
+		// machine where SDDL parsing fails for some bizarre reason.
+		logf("acquireAdminOnlyNamedMutex(%s): SecurityDescriptorFromString failed: %v — using default DACL", name, sdErr)
+		h, _, _ := procCreateMutexW.Call(0, 1, uintptr(unsafe.Pointer(wname)))
+		if h == 0 {
+			return 0, false
+		}
+		last, _, _ := procGetLastError.Call()
+		if last == errorAlreadyExists {
+			procCloseHandle.Call(h)
+			return 0, true
+		}
+		return h, false
+	}
+	sa := windows.SecurityAttributes{
+		Length:             uint32(unsafe.Sizeof(windows.SecurityAttributes{})),
+		SecurityDescriptor: sd,
+		InheritHandle:      0,
+	}
+	h, _, _ := procCreateMutexW.Call(uintptr(unsafe.Pointer(&sa)), 1 /* bInitialOwner */, uintptr(unsafe.Pointer(wname)))
 	if h == 0 {
 		return 0, false
 	}
 	last, _, _ := procGetLastError.Call()
 	if last == errorAlreadyExists {
-		// Another controller already owns the mutex. Close our handle
-		// (we don't own it; another process does) and tell the caller.
 		procCloseHandle.Call(h)
 		return 0, true
 	}
 	return h, false
 }
+
+// firstRunMutexName: see acquireFirstRunMutex for usage.
+const globalFirstRunMutexName = `Global\KioskExitGuardFirstRunRelocate`
+
+// globalUpdateMutexName guards runUpdateInvocation: see fix MEDIUM#7.
+const globalUpdateMutexName = `Global\KioskExitGuardUpdating`
 
 // passwordResult tells callers exactly how a password modal terminated so
 // they can distinguish cancel (silent) from wrong-password (show toast).
@@ -2760,11 +2868,29 @@ func askPasswordModalInProcess(title, subtitle string) passwordResult {
 
 	// v1.1.9 NEW: inactivity timer — the bindings below reset it on every
 	// user interaction so an actively-typing user doesn't get yanked
-	// mid-attempt. Started just before w.Run() below so we don't race a
-	// slow WebView2 cold start. autoDismissed flags the !submitted return
-	// path as a timeout so the caller treats it as pwCancel (no toast).
+	// mid-attempt. v1.2.0 MEDIUM#5: armed inside the kgReady binding
+	// (fired from DOMContentLoaded) so the 30s budget starts when the
+	// user can actually type, not when the WebView2 host begins cold-
+	// starting. WebView2 cold-start can eat 5–6s of the budget on the
+	// first password modal of a session. A fallback timer arms before
+	// w.Run() with a longer budget so a catastrophic WebView2 failure
+	// can't hang the screen forever.
 	var inactivityTimer *time.Timer
+	var inactivityArmed atomic.Bool
 	var autoDismissed atomic.Bool
+
+	w.Bind("kgReady", func() {
+		// First call wins; the page may emit multiple DOMContentLoaded /
+		// load events on a redraw and we don't want to double-arm.
+		if !inactivityArmed.CompareAndSwap(false, true) {
+			return
+		}
+		inactivityTimer = time.AfterFunc(inactivityTimeout, func() {
+			autoDismissed.Store(true)
+			logf("askPasswordModalInProcess: %s inactivity timeout — auto-dismissing", inactivityTimeout)
+			w.Dispatch(func() { w.Terminate() })
+		})
+	})
 
 	w.Bind("kgSubmit", func(pw string) {
 		if inactivityTimer != nil {
@@ -2819,16 +2945,26 @@ func askPasswordModalInProcess(title, subtitle string) passwordResult {
 		}
 	}()
 
-	// v1.1.9 NEW: arm the inactivity timer just before entering the
-	// WebView2 message pump. Dispatch into the UI thread so Terminate
-	// is called from the same thread that owns w.Run(). The kgSubmit /
-	// kgCancel bindings reset this timer on every interaction.
-	inactivityTimer = time.AfterFunc(inactivityTimeout, func() {
+	// v1.2.0 MEDIUM#5 fallback: if kgReady never fires (catastrophic
+	// WebView2 failure where DOMContentLoaded never reaches our binding),
+	// this longer timer arms so the modal can't hang the screen forever.
+	// kgReady wins the race in the normal case: it CompareAndSwaps
+	// inactivityArmed and replaces inactivityTimer.
+	fallbackTimer := time.AfterFunc(60*time.Second, func() {
+		if !inactivityArmed.CompareAndSwap(false, true) {
+			// kgReady already armed the real timer; do nothing.
+			return
+		}
 		autoDismissed.Store(true)
-		logf("askPasswordModalInProcess: %s inactivity timeout — auto-dismissing", inactivityTimeout)
+		logf("askPasswordModalInProcess: 60s fallback timeout (kgReady never fired) — auto-dismissing")
 		w.Dispatch(func() { w.Terminate() })
 	})
-	defer inactivityTimer.Stop()
+	defer fallbackTimer.Stop()
+	defer func() {
+		if inactivityTimer != nil {
+			inactivityTimer.Stop()
+		}
+	}()
 
 	w.Run()
 
@@ -3215,15 +3351,41 @@ func cleanupInstallDir() {
 		logf("cleanupInstallDir: ReadDir(%s) failed: %v", dir, err)
 		return
 	}
+	// v1.2.0 LOW#10: restrict removal to a known allowlist of file names.
+	// Pre-v1.2.0 walked the directory and removed everything not the
+	// running exe — fine when only our artifacts live in there, but if
+	// an admin (or some future install bug) ever stashed something else
+	// in %ProgramFiles%\KioskExitGuard\ we'd nuke it. The allowlist
+	// covers every file we ever create plus the staging\ subdir.
+	allowedFiles := map[string]struct{}{
+		"kiosk-exit-guard.exe":         {},
+		"kiosk-exit-guard.exe.old":     {},
+		"kiosk-exit-guard.exe.staging": {},
+		"kiosk-exit-guard.log":         {},
+		"kiosk-exit-guard.log.old":     {},
+		"resource.syso":                {},
+	}
+	allowedDirs := map[string]struct{}{
+		"staging": {},
+	}
 	for _, e := range entries {
-		p := filepath.Join(dir, e.Name())
+		name := e.Name()
+		p := filepath.Join(dir, name)
 		if strings.EqualFold(p, exe) {
 			continue
 		}
 		if e.IsDir() {
-			_ = os.RemoveAll(p)
-		} else {
+			if _, ok := allowedDirs[strings.ToLower(name)]; ok {
+				_ = os.RemoveAll(p)
+			} else {
+				logf("cleanupInstallDir: skipping unrecognized subdir %s (admin-placed?)", name)
+			}
+			continue
+		}
+		if _, ok := allowedFiles[strings.ToLower(name)]; ok {
 			_ = os.Remove(p)
+		} else {
+			logf("cleanupInstallDir: skipping unrecognized file %s (admin-placed?)", name)
 		}
 	}
 	// Schedule the running exe (and the now-empty containing dir) for
@@ -3431,6 +3593,24 @@ func fileSHA256(path string) (string, error) {
 //   7. Rename downloaded exe into the current exe's path
 //   8. Restart the KioskExitGuard scheduled task so the new exe loads
 func runUpdateInvocation() {
+	// v1.2.0 MEDIUM#7: cross-process update mutex. Two quick desktop-
+	// shortcut double-clicks stack two GET pipelines + downloads on top
+	// of each other; the loser could race the winner's rename and leave
+	// a half-installed exe. v1.1.11 dropped the "Checking GitHub…" UI
+	// cover that previously made the double-click less likely; this
+	// mutex closes the same hole without re-adding a toast. Fail-silent
+	// on contention so the second invocation just exits.
+	if mh, alreadyHeld := acquireAdminOnlyNamedMutex(globalUpdateMutexName); alreadyHeld {
+		logf("update: another update is already in flight; exiting silently")
+		return
+	} else {
+		// Hold for the duration of the function. The handle is closed
+		// implicitly on process exit; we don't release explicitly
+		// because the rename-then-respawn-task path tears down this
+		// process anyway.
+		_ = mh
+	}
+
 	migrateLegacyHash()
 	hash, err := loadHash()
 	if err != nil || len(hash) == 0 {
@@ -3524,7 +3704,36 @@ func runUpdateInvocation() {
 		}
 		logf("update: SHA-256 verification OK (%s)", expected)
 	} else {
-		logf("update: release has no kiosk-exit-guard.exe.sha256 sidecar; proceeding without integrity verification (legacy release)")
+		// v1.2.0 HIGH#2: pre-v1.2.0 logged "proceeding without integrity
+		// verification (legacy release)" and silently installed. That's
+		// a downgrade attack vector — an attacker who can MITM the
+		// download URL just needs to also strip the sidecar URL from
+		// the GitHub release metadata (or publish a release without
+		// one) and we'll install whatever they served. Make this a
+		// deliberate admin decision instead: show a default-No
+		// Yes/No prompt, exit on No (or any prompt error).
+		choiceErr := zenity.Question(
+			"Update integrity check unavailable.\n\n"+
+				"This release does not publish a SHA-256 sidecar "+
+				"(kiosk-exit-guard.exe.sha256). Proceeding will install "+
+				"the downloaded binary without verifying it matches the "+
+				"published release.\n\n"+
+				"Continue anyway?",
+			zenity.Title("SK Filter — update"),
+			zenity.OKLabel("Yes, install unverified"),
+			zenity.CancelLabel("No, abort"),
+			zenity.QuestionIcon,
+			zenity.DefaultCancel(),
+		)
+		// Question returns nil on OK (Yes), ErrCanceled on Cancel / X.
+		// Any other error (rare — toolkit failure) treated as cancel
+		// because the admin couldn't deliberately choose to bypass.
+		if choiceErr != nil {
+			logf("update: admin declined unverified install (no sidecar): %v", choiceErr)
+			_ = os.Remove(tmpPath)
+			return
+		}
+		logf("update: admin acknowledged no-sidecar; proceeding unverified")
 	}
 
 	exe, err := os.Executable()
@@ -4024,6 +4233,24 @@ func main() {
 			zenity.Title("SK Filter"),
 		)
 		return
+	}
+
+	// v1.2.0 HIGH#3: first-run/relocate mutex. relocateToProgramFilesIfNeeded
+	// (called from firstRunWithWizard further down) copies the running exe
+	// to %ProgramFiles%\KioskExitGuard and re-execs. Pre-v1.2.0 had no
+	// gate on this: two simultaneous admin double-clicks both ran relocate
+	// concurrently and corrupted each other's installs. The mutex makes
+	// the second-mover exit silently. Skipped above for short-lived flag
+	// paths that don't run the relocator. Fail-open on mutex-create
+	// errors so a degraded kernel32 doesn't refuse to start.
+	if mh, alreadyHeld := acquireAdminOnlyNamedMutex(globalFirstRunMutexName); alreadyHeld {
+		logf("first-run/relocate already in progress in another instance, exiting")
+		os.Exit(0)
+	} else {
+		// Intentionally leak the handle for the life of this process —
+		// the controller mutex acquired further down takes over the
+		// "only one controller" guarantee. The kernel releases on exit.
+		_ = mh
 	}
 
 	// Ensure WebView2 Runtime is available before we touch anything else.
