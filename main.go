@@ -39,6 +39,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -56,7 +57,7 @@ import (
 
 // currentVersion must be kept in sync with versioninfo.json. Used by the
 // --update flow to compare against the latest GitHub release tag.
-const currentVersion = "1.0.6"
+const currentVersion = "1.0.7"
 
 // ---------- logging ----------
 
@@ -2782,6 +2783,19 @@ func syncFilterStateLoop() {
 // ---------- main ----------
 
 func main() {
+	// Pin the main goroutine to its initial OS thread for the life of the
+	// process. The Win32 LL keyboard hook installed below via
+	// SetWindowsHookExW is bound to the thread that called it: events are
+	// only dispatched while THAT thread is running a GetMessage loop. If
+	// the Go runtime migrates this goroutine to a different OS thread
+	// between SetWindowsHookExW and GetMessageW, the hook silently goes
+	// dead — symptom: Ctrl/Win/Alt combos fall through instead of opening
+	// the password modal. Reliably reproducible on first-run install
+	// because firstRunWithWizard() runs a WebView2 message loop which
+	// leaves the goroutine on a different thread than it started on.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	// IFEO redirect handler: if Windows invoked us as the Debugger for a
 	// blocked exe, we get --silent-exit as argv[1] and the blocked exe's
 	// path appended. Exit silently so the user's launch attempt just
