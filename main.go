@@ -58,7 +58,7 @@ import (
 
 // currentVersion must be kept in sync with versioninfo.json. Used by the
 // --update flow to compare against the latest GitHub release tag.
-const currentVersion = "1.1.5"
+const currentVersion = "1.1.6"
 
 // ---------- logging ----------
 
@@ -146,12 +146,57 @@ func makeModalFullscreenTopmost(hwnd uintptr) {
 		wsExToolWindow = 0x00000080
 		swpShow        = 0x0040
 		swpFrameChang  = 0x0020
+		swShow         = 5
 	)
 	cx, _, _ := procGetSystemMetrics.Call(smCXScreen)
 	cy, _, _ := procGetSystemMetrics.Call(smCYScreen)
 	procSetWindowLongPtrW.Call(hwnd, uintptr(gwlStyleU), uintptr(wsPopup|wsVisible))
 	procSetWindowLongPtrW.Call(hwnd, uintptr(gwlExStyleU), uintptr(wsExTopmost|wsExToolWindow))
 	procSetWindowPos.Call(hwnd, hwndTopmost, 0, 0, cx, cy, uintptr(swpShow|swpFrameChang))
+	procShowWindow.Call(hwnd, uintptr(swShow))
+	// v1.1.6: actually grab keyboard focus. Without this the modal is
+	// visually on top but the kiosk WebView2 still owns input — user
+	// types the password and it goes to the kiosk page. Triggered by
+	// the user pressing Ctrl+Shift+Alt+K on the fullscreen kiosk and
+	// seeing the modal not come to front. Uses the AttachThreadInput
+	// idiom so we don't depend on SetForegroundWindow's eligibility
+	// rules (which require the calling process to already own focus).
+	forceForeground(hwnd)
+}
+
+// forceForeground steals foreground for hwnd from whichever window
+// currently owns input. The AttachThreadInput trick temporarily
+// merges our thread's input queue with the foreground thread's so
+// the SetForegroundWindow call passes the eligibility check Windows
+// applies (only the foreground process can normally grant foreground
+// to another). Detaches in defer so a panic during the inner calls
+// can't leak the input attach.
+func forceForeground(hwnd uintptr) {
+	if hwnd == 0 {
+		return
+	}
+	fgHwnd, _, _ := procGetForegroundWindow.Call()
+	if fgHwnd == hwnd {
+		// Already foreground — nothing to steal.
+		return
+	}
+	ourTid, _, _ := procGetCurrentThreadId.Call()
+	if fgHwnd == 0 {
+		// No foreground window — just call directly.
+		procBringWindowToTop.Call(hwnd)
+		procSetForegroundWindow.Call(hwnd)
+		return
+	}
+	var fgPid uint32
+	fgTid, _, _ := procGetWindowThreadProcessId.Call(fgHwnd, uintptr(unsafe.Pointer(&fgPid)))
+	if fgTid == 0 || fgTid == ourTid {
+		procSetForegroundWindow.Call(hwnd)
+		return
+	}
+	procAttachThreadInput.Call(ourTid, fgTid, 1)
+	defer procAttachThreadInput.Call(ourTid, fgTid, 0)
+	procBringWindowToTop.Call(hwnd)
+	procSetForegroundWindow.Call(hwnd)
 }
 
 // ---------- constants ----------
@@ -266,14 +311,18 @@ var (
 	procSetWindowPos        = user32.NewProc("SetWindowPos")
 	procGetSystemMetrics    = user32.NewProc("GetSystemMetrics")
 	procSendInput           = user32.NewProc("SendInput")
-	procSetForegroundWindow = user32.NewProc("SetForegroundWindow")
-	procBringWindowToTop    = user32.NewProc("BringWindowToTop")
-	procGetDpiForSystem     = user32.NewProc("GetDpiForSystem")
+	procSetForegroundWindow      = user32.NewProc("SetForegroundWindow")
+	procBringWindowToTop         = user32.NewProc("BringWindowToTop")
+	procGetDpiForSystem          = user32.NewProc("GetDpiForSystem")
+	procGetWindowThreadProcessId = user32.NewProc("GetWindowThreadProcessId")
+	procAttachThreadInput        = user32.NewProc("AttachThreadInput")
+	procShowWindow               = user32.NewProc("ShowWindow")
 
-	procCreateMutexW = kernel32.NewProc("CreateMutexW")
-	procReleaseMutex = kernel32.NewProc("ReleaseMutex")
-	procCloseHandle  = kernel32.NewProc("CloseHandle")
-	procGetLastError = kernel32.NewProc("GetLastError")
+	procCreateMutexW      = kernel32.NewProc("CreateMutexW")
+	procReleaseMutex      = kernel32.NewProc("ReleaseMutex")
+	procCloseHandle       = kernel32.NewProc("CloseHandle")
+	procGetLastError      = kernel32.NewProc("GetLastError")
+	procGetCurrentThreadId = kernel32.NewProc("GetCurrentThreadId")
 
 	storedHash []byte
 	promptOpen atomic.Bool

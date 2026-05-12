@@ -155,7 +155,7 @@
 <div class="wrap">
 
 <header>
-  <h1>kiosk-exit-guard <span class="version-pill">v1.1.5</span></h1>
+  <h1>kiosk-exit-guard <span class="version-pill">v1.1.6</span></h1>
   <p class="tagline">Single-binary kiosk lockdown for Windows 11 Home. Embedded WebView2 kiosk, password-gated keyboard, Chrome uninstalled, Edge launches blocked at the OS level, self-installing, self-updating, all from one ~7&nbsp;MB exe.</p>
 </header>
 
@@ -186,7 +186,13 @@
   <a href="#build">Build</a>
 </nav>
 
-<h2 id="whats-new">v1.1.5 — what's in the box</h2>
+<h2 id="whats-new">v1.1.6 — what's in the box</h2>
+
+<div class="callout callout-good">
+  <strong>Password modal now actually comes to front + gets keyboard focus on the fullscreen kiosk.</strong> User report: "pressing Ctrl+Shift+Alt+K while on the kiosk full screen needs to move the modal to the front to pause the filter." Root cause: both the kiosk window and the modal child were <code>HWND_TOPMOST</code>; the modal's z-order beat the kiosk visually, but keyboard focus stayed with the kiosk because the modal never called <code>SetForegroundWindow</code> (and Windows would have rejected the call anyway — only the foreground process can grant foreground to another). Fix: <code>forceForeground</code> uses the <code>AttachThreadInput</code> idiom — temporarily merge the modal thread's input queue with the foreground thread's queue, call <code>SetForegroundWindow</code> (Windows now treats them as one process for foreground-grant), detach. Bypasses the eligibility rules without the v0.5.4 modal-hang risk that originally caused the v1.0.3 strip.
+</div>
+
+<h2 id="v115">v1.1.5 — zoom shortcuts allowed</h2>
 
 <div class="callout callout-good">
   <strong>Browser zoom shortcuts allowed through.</strong> <code>Ctrl+0</code> (zoom reset), <code>Ctrl+-</code> (zoom out), and <code>Ctrl++</code> / <code>Ctrl+=</code> (zoom in) now pass through the LL hook to the kiosk WebView2 page instead of triggering the password modal. Numpad equivalents (<code>Ctrl+Numpad0</code>, <code>Ctrl+Subtract</code>, <code>Ctrl+Add</code>) too. All variants still require Ctrl-only — <code>Win+0</code>, <code>Alt+-</code>, etc. still hit the lockdown path. Joins the existing always-allowed list of <code>F5</code> and <code>Ctrl+R</code>.

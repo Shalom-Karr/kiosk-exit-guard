@@ -4,6 +4,14 @@ All notable changes to kiosk-exit-guard, newest first. Versions follow [Semantic
 
 For the current state of the project, see the [landing page](https://shalom-karr.github.io/kiosk-exit-guard/), the [architecture doc](architecture.md), and the [admin runbook](admin-runbook.md).
 
+## v1.1.6 — 2026-05-12
+
+**Password modal now actually comes to front + gets keyboard focus on the fullscreen kiosk.** User report: "pressing Ctrl+Shift+Alt+K while on the [kiosk] full screen needs to move the modal to the front to pause the filter."
+
+Root cause: both the kiosk WebView2 window and the password modal child process are `HWND_TOPMOST`. The modal's z-order beat the kiosk visually because of `SetWindowPos(HWND_TOPMOST)` ordering, but **keyboard focus** stayed with the kiosk because the modal child process never called `SetForegroundWindow` — and even if it had, Windows would have rejected the call (only the current foreground process can grant foreground to another). So the user saw the modal but typing the password went to the kiosk page.
+
+The v1.0.3 fix had deliberately stripped `SetForegroundWindow` + `BringWindowToTop` because the combination caused modal hangs on Server SKUs. v1.1.6 brings them back via the **AttachThreadInput idiom** which bypasses the eligibility check without the hang risk: temporarily merge the modal thread's input queue with the foreground thread's queue, call `SetForegroundWindow` (Windows now treats them as the same process for foreground-grant purposes), then detach. `forceForeground()` in `main.go` does this; `makeModalFullscreenTopmost` calls it at the end so every fullscreen modal (password modal + first-run wizard) grabs focus on top of whatever was there before. The detach happens in `defer` so a panic during the steal can't leak the input attach.
+
 ## v1.1.5 — 2026-05-12
 
 **Browser zoom shortcuts allowed through.** `Ctrl+0` (zoom reset), `Ctrl+-` (zoom out), and `Ctrl++` / `Ctrl+=` (zoom in) now pass through the LL hook to the kiosk WebView2 page instead of triggering the password modal. Numpad equivalents (`Ctrl+Numpad0`, `Ctrl+Subtract`, `Ctrl+Add`) are also allowed. All variants still require Ctrl-only — `Win+0`, `Alt+-`, etc. still hit the lockdown path.
