@@ -53,7 +53,7 @@ import (
 
 // currentVersion must be kept in sync with versioninfo.json. Used by the
 // --update flow to compare against the latest GitHub release tag.
-const currentVersion = "1.0.0"
+const currentVersion = "1.0.1"
 
 // ---------- constants ----------
 
@@ -709,14 +709,84 @@ func capturedModifiers() []uint32 {
 
 // ---------- toast helpers ----------
 
+// toastHTML is the in-page template for our WebView2-based toast. The
+// page itself sets a timer that calls kgClose() after the requested
+// duration, so the Go side just spins up the window and waits for Run()
+// to return when the close binding fires.
+const toastHTML = `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<style>
+  *,*::before,*::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; height: 100vh;
+    background: transparent;
+    font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased; color: #f1f5f9; }
+  .wrap { height: 100vh; display: flex; align-items: center; justify-content: center; padding: 0.6rem; }
+  .toast { display: flex; align-items: center; gap: 0.85rem;
+    background: linear-gradient(180deg, rgba(35, 47, 72, 0.97), rgba(26, 36, 56, 0.97));
+    border: 1px solid rgba(148, 163, 184, 0.28); border-radius: 12px;
+    padding: 0.85rem 1.15rem; font-size: 0.92rem; line-height: 1.5;
+    box-shadow: 0 18px 50px rgba(0,0,0,0.55); width: 100%; }
+  .badge { color: #38bdf8; font-size: 0.68rem; font-weight: 700;
+    letter-spacing: 0.12em; text-transform: uppercase; flex-shrink: 0; }
+  .msg { white-space: pre-line; }
+</style></head><body>
+<div class="wrap"><div class="toast">
+  <span class="badge">SK Filter</span>
+  <span class="msg" id="m"></span>
+</div></div>
+<script>
+  document.getElementById('m').textContent = window.__msg || '';
+  setTimeout(function() { if (window.kgClose) window.kgClose(); }, window.__ms || 2000);
+</script>
+</body></html>`
+
+// showFrontmostToast renders a brief WebView2 toast and ensures it sits
+// above the fullscreen topmost kiosk window. Falls back to zenity if
+// WebView2 fails (Runtime missing).
+func showFrontmostToast(text string, duration time.Duration) {
+	w := webview2.NewWithOptions(webview2.WebViewOptions{
+		Debug:     false,
+		AutoFocus: false,
+		WindowOptions: webview2.WindowOptions{
+			Title:  "SK Filter",
+			Width:  480,
+			Height: 110,
+			Center: true,
+		},
+	})
+	if w == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), duration)
+		defer cancel()
+		_ = zenity.Info(text, zenity.Title("SK Filter"), zenity.Context(ctx))
+		return
+	}
+	defer w.Destroy()
+
+	w.Bind("kgClose", func() {
+		w.Terminate()
+	})
+
+	// Tight poll: apply frameless+topmost the moment HWND is valid.
+	// No fixed delay — the toast must show on top instantly.
+	go func() {
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			h := uintptr(w.Window())
+			if h != 0 {
+				makeModalFrameless(h)
+				return
+			}
+			time.Sleep(15 * time.Millisecond)
+		}
+	}()
+
+	w.Init(fmt.Sprintf(`window.__msg = %q; window.__ms = %d;`, text, duration.Milliseconds()))
+	w.SetHtml(toastHTML)
+	w.Run()
+}
+
 func showTimedInfo(text string) {
-	ctx, cancel := context.WithTimeout(context.Background(), toastTimeoutMs*time.Millisecond)
-	defer cancel()
-	_ = zenity.Info(
-		text,
-		zenity.Title("kiosk-exit-guard"),
-		zenity.Context(ctx),
-	)
+	showFrontmostToast(text, toastTimeoutMs*time.Millisecond)
 }
 
 func showFailedToast() { showTimedInfo("Wrong password.") }
@@ -1541,15 +1611,19 @@ func askPasswordModal(title, subtitle string) bool {
 
 	w.Init(fmt.Sprintf(`window.__title = %q; window.__subtitle = %q;`, title, subtitle))
 	w.SetHtml(passwordPromptHTML)
-	// One-shot, off the WebView2 message pump's thread: strip the title
-	// bar (no X to bypass the password gate) and force topmost+focus.
-	// The old retry loop hammered Win32 from a competing goroutine and
-	// hung the modal — we do it exactly once now, after a brief settle.
+	// Tight HWND poll — apply frameless + topmost the instant the
+	// WebView2 has a valid HWND. Single application (no retry storm
+	// that hangs the message pump), but fast detection so the modal is
+	// never visible behind the kiosk window.
 	go func() {
-		time.Sleep(220 * time.Millisecond)
-		h := uintptr(w.Window())
-		if h != 0 {
-			makeModalFrameless(h)
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			h := uintptr(w.Window())
+			if h != 0 {
+				makeModalFrameless(h)
+				return
+			}
+			time.Sleep(15 * time.Millisecond)
 		}
 	}()
 	w.Run()
