@@ -3,7 +3,7 @@
   <assemblyIdentity
       type="win32"
       name="KioskExitGuard"
-      version="1.1.10.0"
+      version="1.1.11.0"
       processorArchitecture="amd64"/>
 
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">

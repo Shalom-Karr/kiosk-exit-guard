@@ -4,6 +4,105 @@ All notable changes to kiosk-exit-guard, newest first. Versions follow [Semantic
 
 For the current state of the project, see the [landing page](https://shalom-karr.github.io/kiosk-exit-guard/), the [architecture doc](architecture.md), and the [admin runbook](admin-runbook.md).
 
+## v1.1.11 — 2026-05-12
+
+**Server 2022 RDP is a real supported target, and the supervisor now picks the right session for it.** The v1.1.10 ship helped a user whose machine turned out — on follow-up diagnostic — to actually be a headless Windows Server 2022 accessed over RDP, not a Win11 Home laptop. v1.1.10's `WTSEnumerateProcessesExW` cross-session process enumeration handles session 1 fine, but the supervisor hardcoded `sessionID = WTSGetActiveConsoleSessionId()` — on a headless RDP'd server that returns the empty physical-console session ID 1 while the real interactive user is in session 2. The controller never spawned. This release picks the right session, plus four smaller fixes that fell out of the Server 2022 pivot.
+
+### CRITICAL — Service supervisor now walks all WTS sessions, picks the right one for RDP
+
+**Root cause:** `supervisorLoop` in `service_windows.go` started every iteration with:
+
+```go
+sessionID := windows.WTSGetActiveConsoleSessionId()
+if sessionID == noActiveSession { ... }
+hProc, err := s.spawnControllerInSession(sessionID)
+```
+
+`WTSGetActiveConsoleSessionId()` returns the session ID of the *physical* console attached to the keyboard/monitor — not the user's session in general. On a Win11 laptop where someone is sitting at the device, that's session 1 and it's also the user's interactive session, so the v1.1.0 design happened to work. On a headless RDP'd Windows Server 2022, the physical console session exists (ID 1) but is empty (state=Disconnected, no user); the user's actual session is the RDP one (ID 2, state=Active, user=administrator). The supervisor spawned no controller, logged nothing (the call returned a valid ID 1, not `noActiveSession`), and `spawnControllerInSession(1)` failed at the `WTSQueryUserToken(1)` step or the user-session-process fallback because no candidate process exists in an empty session. After every reboot the kiosk was completely unprotected on the server. User's diagnostic on the server:
+
+```
+quser → administrator  rdp-tcp#0  ID 2  Active
+Win32_Process Name SessionId
+  sihost.exe       2
+  taskhostw.exe    2
+  explorer.exe     2
+```
+
+**Fix:** new helper `pickActiveUserSession() (uint32, bool)` in `service_windows.go`:
+
+1. Call `WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, Reserved=0, Version=1, &pSessionInfo, &count)` to get every session on the box.
+2. For each session where `State == WTSActive`, call `WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, sessionID, WTSUserName=5, &buffer, &bytesReturned)`. A logged-in interactive session has a non-empty username; an RDP session sitting at the logon dialog returns an empty string.
+3. Priority: console session (compared against `WTSGetActiveConsoleSessionId()` return value) if it's active AND has a user — preserves Win11 / laptop behavior where session 1 is both the console AND the user. Else lowest-numbered other `WTSActive` session with a user — picks session 2 (RDP) on Server 2022.
+4. Free the session list via `WTSFreeMemory` and each `WTSUserName` buffer via `WTSFreeMemory`.
+5. Returns `(0, false)` if no usable session is found; supervisor sleeps `svcNoSessionDelay` and retries.
+
+Win32 plumbing added to the `var` block: `procWTSEnumerateSessionsW`, `procWTSQuerySessionInformationW`, `procWTSFreeMemory`. New constants `wtsActive=0`, `wtsConnected=1`, `wtsDisconnected=4`, `wtsInfoUserName=5`. New struct `wtsSessionInfoW` mirroring the Win32 `WTS_SESSION_INFOW` layout (24 bytes on amd64 — `SessionID DWORD` + 4 bytes padding + `WinStationName LPWSTR` + `State DWORD` + 4 bytes trailing padding for 8-byte struct alignment, verified at runtime with `unsafe.Sizeof`).
+
+`supervisorLoop` now calls `pickActiveUserSession()` instead of `WTSGetActiveConsoleSessionId()`. New `lastLoggedSession` variable on the loop tracks the last successful pick so we only log on state change — verbose-on-first-success but quiet on the steady-state respawn cycle. New log lines: `service: spawning controller in session N (state=Active, user logged in)` on a new successful session, `service: no active user session, waiting…` on the first failure tick after a successful streak. `spawnControllerInSession` failure paths reset `lastLoggedSession` so admins reading the log see paired "spawn failed" / "spawn succeeded" lines without having to grep for both.
+
+On a Win11 laptop where `WTSGetActiveConsoleSessionId()` returns 1 and session 1 is `WTSActive` with a user, `pickActiveUserSession()` picks session 1 — both because it qualifies as the console session AND because no other session matches (server-class WTS sessions like Services/Listen are not `WTSActive`). The laptop / Win11 path is unchanged.
+
+### MEDIUM — `restartExplorer` defensive shell check
+
+**Root cause:** `restartExplorer()` in `main.go` did:
+
+```go
+cmd := exec.Command("cmd.exe", "/c", "taskkill /F /IM explorer.exe & start explorer.exe")
+```
+
+On Server 2022 (and any custom-shell setup) the registered shell may not be `explorer.exe`. On Server 2022 Core / fresh Server 2022 installs without Desktop Experience, `explorer.exe` may not exist at all as the user's shell — the `taskkill` succeeds (kills any explorer instance), but the `start explorer.exe` may not restore the user's actual shell properly; the user could lose their shell permanently mid-session.
+
+**Fix:** before the taskkill, open `HKLM\Software\Microsoft\Windows NT\CurrentVersion\Winlogon` and read the `Shell` `REG_SZ` value. If the value (after `strings.TrimSpace`) is exactly `"explorer.exe"` (case-insensitive via `strings.EqualFold`), proceed with the restart. Otherwise log `restartExplorer: registered shell is %q, not explorer.exe — skipping restart` and return. The `NoTaskbar` HKCU policy still gets written by the caller; it just won't take effect until next logon, which is acceptable since a non-Explorer shell is the user's deliberate choice. If the registry open or read itself fails, log and skip — fail-closed is safe (the worst case is the taskbar reappearing for one session until logoff).
+
+### MEDIUM — IFEO removal silently absorbs `ERROR_FILE_NOT_FOUND` / `registry.ErrNotExist`
+
+**Root cause:** `removeIFEOBlock(targetExe string)` in `main.go` returned silently on any `OpenKey` failure. That hid actual errors (access denied, registry corruption) as well as the expected "key doesn't exist" case. On Server 2022 fresh installs without Chrome, the IFEO `chrome.exe` key may never have been written if `setIFEOBlock` never ran (e.g. on a `--reset` / `--resume` / `--uninstall` flow on a half-installed box). Silently swallowing all errors made post-mortem log review harder.
+
+**Fix:** distinguish "not exist" (silent, expected) from other errors (logged for audit). `removeIFEOBlock` now does `errors.Is(err, registry.ErrNotExist) || errors.Is(err, syscall.ERROR_FILE_NOT_FOUND)` on the `OpenKey` error; both return silently. Other errors get `logf("removeIFEOBlock(%s): OpenKey failed: %v", targetExe, err)`. Behavior unchanged on installs where the IFEO key was written by a prior `applyBrowserBlocks()` — `OpenKey` succeeds, `DeleteValue("Debugger")` succeeds.
+
+### MEDIUM — `uninstallChrome` logs "Chrome not installed" instead of silently returning success
+
+**Root cause:** `uninstallChrome()` in `main.go` looped through three registry candidates (`HKLM\...\Uninstall\Google Chrome`, the WOW6432Node twin, and `HKCU\...\Uninstall\Google Chrome`); any `OpenKey` failure was `continue`'d. If none of the three keys existed (Chrome not installed — normal on a fresh Server 2022), the function returned `nil` silently. That's the correct end state, but logging nothing made it look like the function ran successfully and silently uninstalled Chrome, which was confusing in post-mortem log review.
+
+**Fix:** track a `found` bool that flips true when any candidate yields a non-empty `UninstallString`. At the end, if `!found`, log `uninstallChrome: Chrome not installed, skipping uninstall` at info level. Return `nil` either way — the IFEO block is the actual enforcement, missing Chrome is a clean end state.
+
+### MEDIUM — `--update` UI simplified: drop the "checking" toast and the separate confirm
+
+**User request, verbatim:** "scratch the checking for updates ui just show the box do you want to update and password to approve it".
+
+**Old flow** (`runUpdateInvocation` in `main.go`):
+
+1. `showTimedInfo("Checking GitHub for updates…")` — toast (200–500ms WebView2 cold-start)
+2. HTTP fetch of `/releases/latest`
+3. If same version → `zenity.Info` "You're on the latest version (v%s). No update needed."
+4. Else → `zenity.Question` "A new version is available. Current: v%s, Latest: v%s. Download and install?"
+5. `askPasswordModal("Install the update?", "Replacing the running kiosk-exit-guard.exe with v%s. Enter your admin password to confirm.")`
+6. Download / SHA-256 verify / atomic rename / Service restart
+
+**New flow:**
+
+1. Silent HTTP fetch (no toast — the user doesn't need a status update for a sub-second network round-trip)
+2. If same version → `zenity.Info` "You're on v%s. No update available." (kept so the click isn't silent — admin needs feedback when nothing happens)
+3. Else → `askPasswordModal("Install v%s?", "A new version is available (you're on v%s). Enter your admin password to download and install.")` — combines confirm + auth in one screen
+4. Download / verify / rename (existing)
+
+Deleted the `showTimedInfo("Checking GitHub for updates…")` line and the `zenity.Question` block. The password modal subtitle now mentions both the new version (target) and the current version (context) so the admin can verify the version bump before typing their password.
+
+### Doc pivot — Windows Server 2022 (RDP / physical console) is a supported target
+
+The project shipped through v1.1.10 documenting "Windows 11 Home (no Assigned Access)" as the target. The Server 2022 discovery in v1.1.11 makes that wording wrong — and the v1.1.11 supervisor logic is generic across both. Updated:
+
+- **`README.md`** line 1 tagline and new "What's in v1.1.11" section.
+- **`docs/index.html`** title, h1 tagline, download-card metadata, version pill v1.1.10→v1.1.11, new `<h2 id="whats-new">v1.1.11 — Server 2022 RDP session-id fix</h2>` callout, retitled v1.1.10 section to `<h2 id="v1110">v1.1.10 — WTS process enumeration</h2>`, four new feature cards at the top of the feature-grid (Server 2022 RDP support, Update UI simplified, restartExplorer respects the registered shell, IFEO/Chrome cleanup absorbs "not installed").
+- **`versioninfo.json`** `FileDescription` "Kiosk lockdown utility for Windows 11 Home" → "Kiosk lockdown for Windows 11 Home and Server 2022", and both Patch:10 / "1.1.10" entries → Patch:11 / "1.1.11".
+- **`app.manifest`** version attribute "1.1.10.0" → "1.1.11.0".
+- **`docs/architecture.md`** v1.1.0 paragraph rewritten ("active console session" → "active user session") with a v1.1.11 sub-paragraph explaining the RDP discovery and `pickActiveUserSession()`. The `--service-run` row in the modes table updated to mention `pickActiveUserSession()` and the v1.1.10 user-session-process fallback.
+- **`docs/admin-runbook.md`** new "Server 2022 / RDP: which session is the supervisor targeting? (v1.1.11+)" section with the expected log line, a `quser` cross-check, and the Server Core / custom-shell `restartExplorer` gotcha.
+
+### Build
+
+`goversioninfo -64 versioninfo.json` regenerated `resource.syso`. `go build -ldflags="-H windowsgui -s -w" -o kiosk-exit-guard.exe ./...` produces a ~7.9 MB binary (7,897,088 bytes — `+~2 KB` vs. v1.1.10 for the new session-enumeration code).
+
 ## v1.1.10 — 2026-05-12
 
 **Service spawn reliability fix plus two log-noise cleanups from production traces.** The headline fix is a switch from `gopsutil` to `WTSEnumerateProcessesExW` for the service-side cross-session process enumeration, which makes the kiosk reboot-survivable on machines where the gopsutil snapshot path was returning empty results across sessions. The other two are cosmetic — they suppress alarming-looking but benign log lines that were firing on every controller startup.

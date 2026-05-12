@@ -104,9 +104,12 @@ var (
 	userenvDLL                  = windows.NewLazySystemDLL("userenv.dll")
 	procDestroyEnvironmentBlock = userenvDLL.NewProc("DestroyEnvironmentBlock")
 
-	wtsapi32DLL                  = windows.NewLazySystemDLL("wtsapi32.dll")
-	procWTSEnumerateProcessesExW = wtsapi32DLL.NewProc("WTSEnumerateProcessesExW")
-	procWTSFreeMemoryExW         = wtsapi32DLL.NewProc("WTSFreeMemoryExW")
+	wtsapi32DLL                     = windows.NewLazySystemDLL("wtsapi32.dll")
+	procWTSEnumerateProcessesExW    = wtsapi32DLL.NewProc("WTSEnumerateProcessesExW")
+	procWTSFreeMemoryExW            = wtsapi32DLL.NewProc("WTSFreeMemoryExW")
+	procWTSEnumerateSessionsW       = wtsapi32DLL.NewProc("WTSEnumerateSessionsW")
+	procWTSQuerySessionInformationW = wtsapi32DLL.NewProc("WTSQuerySessionInformationW")
+	procWTSFreeMemory               = wtsapi32DLL.NewProc("WTSFreeMemory")
 )
 
 // WTS constants for the level-0 process info enumeration. wtsAnySession is
@@ -116,7 +119,38 @@ const (
 	wtsCurrentServerHandle   = 0
 	wtsTypeProcessInfoLevel0 = 0
 	wtsAnySession            = ^uint32(0) // (DWORD)-1
+
+	// WTS_CONNECTSTATE_CLASS values. We only act on wtsActive — Connected
+	// (locked screen on the console) and Disconnected (RDP'd-then-closed
+	// without logoff) sessions are skipped, since the user isn't actually
+	// looking at the desktop.
+	wtsActive       = 0
+	wtsConnected    = 1
+	wtsDisconnected = 4
+
+	// WTS_INFO_CLASS value for WTSUserName.
+	wtsInfoUserName = 5
 )
+
+// wtsSessionInfoW mirrors the Win32 WTS_SESSION_INFOW on amd64. Layout:
+//
+//	typedef struct _WTS_SESSION_INFOW {
+//	    DWORD                  SessionId;        // 4 bytes
+//	    LPWSTR                 pWinStationName;  // 8 bytes (pointer)
+//	    WTS_CONNECTSTATE_CLASS State;            // 4 bytes
+//	} WTS_SESSION_INFOW;
+//
+// MSVC inserts 4 bytes of padding after SessionId to 8-byte-align
+// pWinStationName, and 4 bytes of trailing padding so the struct size is
+// 24 bytes (8-byte aligned). Verified at runtime with unsafe.Sizeof at
+// the call site.
+type wtsSessionInfoW struct {
+	SessionID      uint32
+	_              uint32 // padding to 8-byte align WinStationName
+	WinStationName *uint16
+	State          uint32
+	_              uint32 // trailing padding for 8-byte struct alignment
+}
 
 // wtsProcessInfoW mirrors the Win32 WTS_PROCESS_INFO_EXW (level 0) on
 // amd64. The struct is 32 bytes per entry with natural 8-byte alignment;
@@ -372,13 +406,24 @@ loop:
 	return false, 0
 }
 
-// supervisorLoop runs forever (until stopCh is closed) finding the active
-// console session, spawning a controller into it, and waiting for the
+// supervisorLoop runs forever (until stopCh is closed) finding an active
+// user session, spawning a controller into it, and waiting for the
 // controller to exit. On clean exit, sleep briefly and respawn. On no
 // user logged in, sleep and re-check.
+//
+// v1.1.11: instead of trusting WTSGetActiveConsoleSessionId() — which
+// returns the empty *physical* console session ID on a headless RDP'd
+// Server 2022 (typically 1, with no user) while the real interactive
+// user is in session 2 (RDP) — we walk WTSEnumerateSessionsW and pick
+// the lowest-numbered WTSActive session that has a logged-in user,
+// preferring the console session if it qualifies. On a Win11 laptop
+// where the console session IS the user session, this picks the same
+// session 1 as before; on Server 2022 / RDP it picks session 2 (or
+// whatever the RDP session ID happens to be).
 func (s *kioskExitGuardService) supervisorLoop() {
 	defer recoverAndLog("supervisorLoop")
 
+	var lastLoggedSession uint32 = noActiveSession
 	for {
 		select {
 		case <-s.stopCh:
@@ -386,10 +431,15 @@ func (s *kioskExitGuardService) supervisorLoop() {
 		default:
 		}
 
-		sessionID := windows.WTSGetActiveConsoleSessionId()
-		if sessionID == noActiveSession {
-			// Lock screen with nobody, or no console session. Wait and
-			// poll again.
+		sessionID, ok := pickActiveUserSession()
+		if !ok {
+			// No interactive user session anywhere (boot before any
+			// user logged on, Welcome screen with nobody, all RDP
+			// sessions disconnected). Wait and poll again.
+			if lastLoggedSession != noActiveSession {
+				logf("service: no active user session, waiting…")
+				lastLoggedSession = noActiveSession
+			}
 			select {
 			case <-s.stopCh:
 				return
@@ -398,9 +448,18 @@ func (s *kioskExitGuardService) supervisorLoop() {
 			continue
 		}
 
+		if sessionID != lastLoggedSession {
+			logf("service: spawning controller in session %d (state=Active, user logged in)", sessionID)
+			lastLoggedSession = sessionID
+		}
+
 		hProc, err := s.spawnControllerInSession(sessionID)
 		if err != nil {
 			logf("service: spawnControllerInSession(%d) failed: %v", sessionID, err)
+			// Force the next successful pick to re-log even if it
+			// resolves to the same session — admins reading the log
+			// want to see "spawn failed" / "spawn succeeded" pairs.
+			lastLoggedSession = noActiveSession
 			select {
 			case <-s.stopCh:
 				return
@@ -439,6 +498,128 @@ func (s *kioskExitGuardService) supervisorLoop() {
 		case <-time.After(svcRespawnDelay):
 		}
 	}
+}
+
+// pickActiveUserSession walks every session reported by
+// WTSEnumerateSessionsW and returns the best session to spawn a
+// controller into:
+//
+//  1. Prefer the physical-console session (the one
+//     WTSGetActiveConsoleSessionId reports) when it's WTSActive AND has
+//     a logged-in user — that's the v1.1.10 behavior on a Win11 laptop.
+//  2. Otherwise, the lowest-numbered other WTSActive session whose
+//     WTSUserName query returns a non-empty string — that's the RDP
+//     session on a headless Server 2022 where the console session is
+//     empty.
+//
+// Returns (0, false) if no candidate session exists. The supervisor
+// loop sleeps and retries on false.
+//
+// v1.1.11: introduced for Server 2022 RDP. On a headless server with
+// nobody at the physical console, WTSGetActiveConsoleSessionId returns
+// session 1 with State=Disconnected and no user. The user's actual
+// session is the RDP one (typically 2). Walking the session list lets
+// us pick session 2 and spawn the controller there.
+func pickActiveUserSession() (uint32, bool) {
+	var pSessionInfo *wtsSessionInfoW
+	var count uint32
+
+	r1, _, callErr := procWTSEnumerateSessionsW.Call(
+		uintptr(wtsCurrentServerHandle),
+		0, // Reserved — must be 0
+		1, // Version — must be 1
+		uintptr(unsafe.Pointer(&pSessionInfo)),
+		uintptr(unsafe.Pointer(&count)),
+	)
+	if r1 == 0 {
+		logf("pickActiveUserSession: WTSEnumerateSessionsW failed: %v", callErr)
+		return 0, false
+	}
+	if pSessionInfo == nil || count == 0 {
+		if pSessionInfo != nil {
+			_, _, _ = procWTSFreeMemory.Call(uintptr(unsafe.Pointer(pSessionInfo)))
+		}
+		return 0, false
+	}
+
+	// Defensive: validate the on-disk struct size matches what we
+	// declared. amd64 layout is 24 bytes; mismatch means we'd
+	// dereference garbage.
+	const expectedSessionInfoSize = 24
+	if got := unsafe.Sizeof(wtsSessionInfoW{}); got != expectedSessionInfoSize {
+		_, _, _ = procWTSFreeMemory.Call(uintptr(unsafe.Pointer(pSessionInfo)))
+		logf("pickActiveUserSession: wtsSessionInfoW size mismatch: got %d, expected %d", got, expectedSessionInfoSize)
+		return 0, false
+	}
+
+	sessions := unsafe.Slice(pSessionInfo, int(count))
+
+	consoleID := windows.WTSGetActiveConsoleSessionId()
+
+	// Two-pass: console first (if it qualifies), then lowest-numbered
+	// other WTSActive with a user.
+	var consolePick uint32
+	var consoleOK bool
+	var bestOther uint32
+	var bestOtherOK bool
+
+	for i := range sessions {
+		si := &sessions[i]
+		if si.State != wtsActive {
+			continue
+		}
+		if !sessionHasLoggedInUser(si.SessionID) {
+			continue
+		}
+		if consoleID != noActiveSession && si.SessionID == consoleID {
+			consolePick = si.SessionID
+			consoleOK = true
+			continue
+		}
+		if !bestOtherOK || si.SessionID < bestOther {
+			bestOther = si.SessionID
+			bestOtherOK = true
+		}
+	}
+
+	_, _, _ = procWTSFreeMemory.Call(uintptr(unsafe.Pointer(pSessionInfo)))
+
+	if consoleOK {
+		return consolePick, true
+	}
+	if bestOtherOK {
+		return bestOther, true
+	}
+	return 0, false
+}
+
+// sessionHasLoggedInUser returns true if WTSQuerySessionInformationW
+// reports a non-empty WTSUserName for the given session. An RDP
+// session sitting at the logon dialog (no user yet) returns empty;
+// a real interactive logon returns the username.
+func sessionHasLoggedInUser(sessionID uint32) bool {
+	var buf *uint16
+	var bytesReturned uint32
+	r1, _, _ := procWTSQuerySessionInformationW.Call(
+		uintptr(wtsCurrentServerHandle),
+		uintptr(sessionID),
+		uintptr(wtsInfoUserName),
+		uintptr(unsafe.Pointer(&buf)),
+		uintptr(unsafe.Pointer(&bytesReturned)),
+	)
+	if r1 == 0 || buf == nil {
+		return false
+	}
+	defer procWTSFreeMemory.Call(uintptr(unsafe.Pointer(buf)))
+
+	// bytesReturned counts bytes including the trailing NUL. UTF-16, so
+	// empty = 2 bytes (just the NUL). Defensive: also check first wchar
+	// in case some SKU returns bytesReturned==0 for empty.
+	if bytesReturned <= 2 {
+		return false
+	}
+	first := *(*uint16)(unsafe.Pointer(buf))
+	return first != 0
 }
 
 // spawnControllerInSession is the meat of the Service: get the user's

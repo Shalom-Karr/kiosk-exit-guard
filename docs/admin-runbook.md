@@ -98,6 +98,37 @@ Expect:
 
 All three rows should reference `Path = C:\Program Files\KioskExitGuard\kiosk-exit-guard.exe` on a v1.1.8+ install.
 
+### Server 2022 / RDP: which session is the supervisor targeting? (v1.1.11+)
+
+On a Windows Server 2022 install accessed over RDP, the physical-console session is empty and the user is in an RDP session (typically session 2). v1.1.11's `pickActiveUserSession()` walks every session and picks the one with a logged-in user. Verify which session won by looking at `kiosk-exit-guard.log`:
+
+```powershell
+Get-Content "C:\Program Files\KioskExitGuard\kiosk-exit-guard.log" -Tail 50 |
+    Select-String "spawning controller in session"
+```
+
+Expect (on Server 2022 over RDP):
+
+```
+service: spawning controller in session 2 (state=Active, user logged in)
+```
+
+Expect (on a Win11 laptop or any install where the user is at the physical console):
+
+```
+service: spawning controller in session 1 (state=Active, user logged in)
+```
+
+Cross-check against `quser` — the session ID it reports for the `Active` row should match:
+
+```cmd
+quser
+```
+
+If the log says `service: no active user session, waiting…` every couple of seconds, no session is currently `WTSActive` with a logged-in user — the supervisor is waiting for someone to actually log in. This is the correct behavior between boot and first logon.
+
+**Known Server 2022 gotcha — Server Core / custom shell.** v1.1.11's `restartExplorer` reads `HKLM\Software\Microsoft\Windows NT\CurrentVersion\Winlogon\Shell` and skips the `taskkill /F /IM explorer.exe & start explorer.exe` step when the registered shell isn't exactly `explorer.exe`. On Server Core or any install with a custom shell, the `NoTaskbar` HKCU policy will still be written but won't take effect until the user logs off and back on — that's fine and intentional, but worth knowing if you're staring at the kiosk wondering why the taskbar is still visible on a Server Core install that's running with `cmd.exe` as its shell.
+
 ### Is the HKLM config set?
 
 ```powershell

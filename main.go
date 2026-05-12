@@ -62,7 +62,7 @@ import (
 
 // currentVersion must be kept in sync with versioninfo.json. Used by the
 // --update flow to compare against the latest GitHub release tag.
-const currentVersion = "1.1.10"
+const currentVersion = "1.1.11"
 
 // ---------- logging ----------
 
@@ -870,7 +870,33 @@ func removeLockdown() {
 // restartExplorer kills explorer.exe and lets Windows auto-relaunch it
 // (the Shell registry entry triggers respawn). Needed to flush taskbar
 // policy changes (NoTaskbar) which Explorer caches at startup.
+//
+// v1.1.11: on Server 2022 (and any custom-shell setup) the registered
+// shell may not be explorer.exe — Server Core / fresh Server 2022
+// installs without Desktop Experience don't even have explorer.exe as
+// the user's shell. Killing explorer there is at best a no-op and at
+// worst loses the user's actual shell permanently mid-session. Check
+// HKLM\...\Winlogon\Shell first; only proceed if it's exactly
+// "explorer.exe" (case-insensitive). The NoTaskbar policy still gets
+// written; it just won't take effect until next logon — acceptable
+// since a non-Explorer shell is the user's deliberate choice.
 func restartExplorer() {
+	const winlogonKey = `Software\Microsoft\Windows NT\CurrentVersion\Winlogon`
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, winlogonKey, registry.QUERY_VALUE)
+	if err != nil {
+		logf("restartExplorer: could not open Winlogon key: %v — skipping restart", err)
+		return
+	}
+	shell, _, sErr := k.GetStringValue("Shell")
+	k.Close()
+	if sErr != nil {
+		logf("restartExplorer: could not read Winlogon Shell value: %v — skipping restart", sErr)
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(shell), "explorer.exe") {
+		logf("restartExplorer: registered shell is %q, not explorer.exe — skipping restart", shell)
+		return
+	}
 	cmd := exec.Command("cmd.exe", "/c", "taskkill /F /IM explorer.exe & start explorer.exe")
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
 	_ = cmd.Run()
@@ -899,6 +925,17 @@ func removeIFEOBlock(targetExe string) {
 	keyPath := ifeoBase + `\` + targetExe
 	k, err := registry.OpenKey(registry.LOCAL_MACHINE, keyPath, registry.SET_VALUE)
 	if err != nil {
+		// v1.1.11: silently absorb "no such key" — on Server 2022 fresh
+		// installs the IFEO entry may never have been written (e.g. the
+		// browser wasn't installed, so setIFEOBlock skipped — actually
+		// setIFEOBlock writes unconditionally, but the v1.1.x removal
+		// paths fire on uninstall / resume / reset, and a partial install
+		// can legitimately leave the key absent). Other errors still log
+		// for audit.
+		if errors.Is(err, registry.ErrNotExist) || errors.Is(err, syscall.ERROR_FILE_NOT_FOUND) {
+			return
+		}
+		logf("removeIFEOBlock(%s): OpenKey failed: %v", targetExe, err)
 		return
 	}
 	defer k.Close()
@@ -944,6 +981,7 @@ func uninstallChrome() error {
 		{registry.LOCAL_MACHINE, `Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Google Chrome`},
 		{registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Uninstall\Google Chrome`},
 	}
+	found := false
 	for _, c := range candidates {
 		k, err := registry.OpenKey(c.Root, c.Path, registry.QUERY_VALUE)
 		if err != nil {
@@ -954,6 +992,7 @@ func uninstallChrome() error {
 		if err != nil || uninstallStr == "" {
 			continue
 		}
+		found = true
 		// Chrome's uninstaller can hang behind a "close all Chrome windows"
 		// prompt on some builds — bound the wait so first-run setup doesn't
 		// appear frozen. If the uninstaller is still running after 60s we
@@ -970,7 +1009,14 @@ func uninstallChrome() error {
 		}
 		logf("chrome uninstaller did not exit cleanly: %v (continuing — IFEO block still applies)", err)
 	}
-	return nil // not found is fine
+	// v1.1.11: distinguish "not installed" (info, expected on Server 2022
+	// fresh installs) from "uninstall failed" (error path above already
+	// logged). Either way return nil — the IFEO block is the actual
+	// enforcement; missing Chrome is a clean end state.
+	if !found {
+		logf("uninstallChrome: Chrome not installed, skipping uninstall")
+	}
+	return nil
 }
 
 // ---------- self-install via schtasks ----------
@@ -3393,12 +3439,11 @@ func runUpdateInvocation() {
 	}
 	storedHash = hash
 
-	// As of v1.1.2 showTimedInfo always spawns a --show-toast child
-	// process, so calling it before askPasswordModal is safe (the modal's
-	// WebView2 is still this process's first). Earlier versions had to
-	// manually exec the child here to dodge the go-webview2 double-
-	// instance panic.
-	showTimedInfo("Checking GitHub for updates…")
+	// v1.1.11: silent fetch — the "Checking GitHub for updates…" toast
+	// (showTimedInfo spawns a WebView2 child, 200–500ms cold-start) added
+	// visible latency before the meaningful UI without telling the admin
+	// anything useful. User request: "scratch the checking for updates UI
+	// just show the box do you want to update and password to approve it".
 
 	latest, downloadURL, shaURL, err := fetchLatestRelease()
 	if err != nil {
@@ -3411,27 +3456,19 @@ func runUpdateInvocation() {
 
 	if latest == currentVersion {
 		_ = zenity.Info(
-			fmt.Sprintf("You're on the latest version (v%s).\n\nNo update needed.", currentVersion),
+			fmt.Sprintf("You're on v%s.\n\nNo update available.", currentVersion),
 			zenity.Title("SK Filter — update"),
 		)
 		return
 	}
 
-	if qerr := zenity.Question(
-		fmt.Sprintf(
-			"A new version is available.\n\nCurrent: v%s\nLatest:  v%s\n\nDownload and install?",
-			currentVersion, latest,
-		),
-		zenity.Title("SK Filter — update available"),
-		zenity.OKLabel("Update now"),
-		zenity.CancelLabel("Maybe later"),
-	); qerr != nil {
-		return
-	}
-
+	// v1.1.11: combine confirm + auth into a single password modal.
+	// Previously a zenity.Question "A new version is available, download
+	// and install?" preceded the password prompt; the modal's subtitle
+	// already conveys the same intent, so two screens is one too many.
 	switch askPasswordModal(
-		"Install the update?",
-		fmt.Sprintf("Replacing the running kiosk-exit-guard.exe with v%s. Enter your admin password to confirm.", latest),
+		fmt.Sprintf("Install v%s?", latest),
+		fmt.Sprintf("A new version is available (you're on v%s). Enter your admin password to download and install.", currentVersion),
 	) {
 	case pwWrong:
 		// v1.1.9 UX MEDIUM#9: sync variant — return below tears the

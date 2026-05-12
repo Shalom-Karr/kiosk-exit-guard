@@ -1,6 +1,19 @@
 # kiosk-exit-guard
 
-Single-binary kiosk lockdown utility for **Windows 11 Home** (no Assigned Access). One ~7 MB exe contains an embedded WebView2 kiosk window, a low-level keyboard hook with re-injection, an HKLM-backed password store, Chrome / Edge launch blocks at the OS level, a Chrome uninstaller, a self-installer, a self-updater, and four desktop shortcuts for the admin.
+Single-binary kiosk lockdown for **Windows 11 Home** and **Windows Server 2022 (RDP / physical console)**. One ~7.9 MB exe contains an embedded WebView2 kiosk window, a low-level keyboard hook with re-injection, an HKLM-backed password store, Chrome / Edge launch blocks at the OS level, a Chrome uninstaller, a self-installer, a self-updater, and four desktop shortcuts for the admin.
+
+The v1.1.11 supervisor walks every `WTSActive` session via `WTSEnumerateSessionsW` and picks the lowest-numbered one with a logged-in user (preferring the physical console when it qualifies), so a headless RDP'd Server 2022 with no user at the physical console works the same as a laptop sitting on someone's desk: the controller spawns into whichever session is actually interactive, not the empty session 1 that `WTSGetActiveConsoleSessionId()` reports on the server.
+
+## What's in v1.1.11
+
+Server 2022 RDP support + a defensive-shell-check on the Explorer restart + IFEO/Chrome cleanup absorbs "not installed" + `--update` UI simplification:
+
+- **Service supervisor now walks all WTS sessions.** Field discovery: the affected install is Windows Server 2022 accessed over RDP, not (only) Win11 Home. `WTSGetActiveConsoleSessionId()` returns the empty physical-console session ID 1 on a headless RDP'd server; the user's actual interactive session is 2 (RDP). v1.1.10's `WTSEnumerateProcessesExW` cross-session enumeration helped but never got past hardcoded session 1. New `pickActiveUserSession()` in `service_windows.go` walks `WTSEnumerateSessionsW`, calls `WTSQuerySessionInformationW(WTSUserName)` to find sessions with a logged-in user, and picks the console session if it qualifies (preserves Win11 / laptop behavior) or the lowest-numbered other `WTSActive` session with a user (Server 2022 / RDP). `supervisorLoop` logs `service: spawning controller in session N (state=Active, user logged in)` on every session change.
+- **`restartExplorer` checks the registered shell first.** On Server 2022 Core (no Desktop Experience) or any custom-shell setup, `taskkill /F /IM explorer.exe & start explorer.exe` could lose the user's actual shell mid-session. v1.1.11 reads `HKLM\...\Winlogon\Shell` and only proceeds if it's `explorer.exe`. The `NoTaskbar` policy still gets written; it just won't take effect until next logon, which is acceptable when the user has chosen a non-Explorer shell.
+- **IFEO removal + Chrome uninstall silently absorb "not installed".** Fresh Server 2022 installs without Chrome no longer log `ERROR_FILE_NOT_FOUND` (2) when `removeIFEOBlock("chrome.exe")` fires during uninstall / resume / reset, and `uninstallChrome` now logs `Chrome not installed, skipping uninstall` at info level instead of returning success silently.
+- **`--update` UI simplified.** User request: "scratch the checking for updates UI just show the box do you want to update and password to approve it". Removed the "Checking GitHub for updates…" toast and the separate "A new version is available, download and install?" `zenity.Question`. The password modal's subtitle now mentions the new version number and combines confirm + auth into one screen. The "you're on v%s. No update available." branch is kept so the click isn't silent.
+
+Per-fix root cause + diff in [docs/CHANGELOG.md](docs/CHANGELOG.md).
 
 ## What's in v1.1.10
 
