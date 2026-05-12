@@ -4,6 +4,86 @@ All notable changes to kiosk-exit-guard, newest first. Versions follow [Semantic
 
 For the current state of the project, see the [landing page](https://shalom-karr.github.io/kiosk-exit-guard/), the [architecture doc](architecture.md), and the [admin runbook](admin-runbook.md).
 
+## v1.1.9 — 2026-05-12
+
+**UX audit pass plus a 30-second password-modal timeout.** Eleven concrete fixes addressing the kiosk-blink at logon, silent panics, stacked first-run dialogs, the orphan-toast race at exit, stale admin-runbook docs, and the new "user walks away from the password modal and holds the kiosk hostage" report.
+
+### NEW — password modal auto-dismisses after 30 seconds of inactivity
+
+**Root cause:** `askPasswordModalInProcess` (`main.go`) entered `w.Run()` and waited indefinitely for either a `kgSubmit` / `kgCancel` host-object call or a window destroy. A user who pressed `Ctrl+Shift+Alt+K`, saw the modal, then walked away would leave the fullscreen modal painted forever — the kiosk WebView2 child stayed killed (because the controller's hook had spawned the modal first), and the next person hitting the device saw a frozen "SK Filter — password required" screen with no way to dismiss without the password.
+
+**Fix:** new `const inactivityTimeout = 30 * time.Second` near the top of `askPasswordModalInProcess`. After `w.Run()` is set up but before entering the message pump, arm a `time.AfterFunc(inactivityTimeout, ...)` that calls `w.Dispatch(func() { w.Terminate() })` — Dispatch ensures Terminate runs on the WebView2 UI thread that owns `w.Run()`. The child then exits with `pwCancel` (the `!submitted` branch of the existing return logic) so no failed-password toast fires, and the controller's caller path treats it as a benign cancel. Both `w.Bind("kgSubmit", ...)` and `w.Bind("kgCancel", ...)` reset the timer (`inactivityTimer.Reset(inactivityTimeout)`) at the top of their callbacks so an actively-typing user isn't yanked mid-attempt. Logged ("inactivity timeout — auto-dismissing") so admin runbook traces can confirm the cause when reviewing a "modal disappeared on me" report.
+
+### UX HIGH#1 — service / task race at logon no longer blinks the kiosk
+
+**Root cause:** as of v1.1.4 both the Windows Service supervisor AND the AtLogon scheduled task auto-start the controller. At logon both fire within ~1s of each other. Whichever loses the race gets killed by the winner's `killRunningController()` call inside `main()`. The loser's supervisor (Service or task RestartOnFailure) respawns the lost controller within seconds. The respawn re-enters `main()`, kills the *winner*, and oscillation continues until both supervisors decide one process is "good enough". User-visible symptom: the kiosk WebView2 child blinks / reopens 1 – 2s after logon.
+
+**Fix:** new named Win32 mutex `Global\KioskExitGuardControllerRunning` acquired via `procCreateMutexW` (the same pattern as `acquireGlobalPromptLock`) right before `killRunningController()` in `main()`. The acquisition runs only for the default controller mode (no early-return flag handler fired) so short-lived `--reset` / `--update` / `--pause` / `--resume` / `--launch-kiosk` / `--set-url` / `--service-install` / `--service-remove` / `--silent-exit` / `--show-toast` / `--ask-password` / `--webview` invocations don't fight over it. `--service-run` itself doesn't take the path either — it's the Service wrapper that spawns the controller, not the controller. New `acquireControllerMutex()` in `main.go` returns `(handle, alreadyRunning bool)`. On `alreadyRunning == true` the second mover logs "controller mutex … already held by another process; exiting", releases its early-installed LL keyboard hook (to avoid leaking a hook handle), and `os.Exit(0)`s cleanly. The first controller keeps running; its supervisor never sees a death; no respawn loop; no kiosk blink. The handle is intentionally leaked for the controller's lifetime (the GetMessageW pump keeps the process alive; the kernel auto-releases the mutex on process exit).
+
+### UX HIGH#2 — controller panic now surfaces a recovery toast
+
+**Root cause:** `recoverAndLog` (`main.go`) logged the panic + stack trace to `kiosk-exit-guard.log` and returned, letting the deferred panic propagate. The Service / scheduled task respawned the controller within ~1s, but in that window the kiosk WebView2 child died (no parent to watchdog-respawn it) and the user saw the desktop briefly without explanation.
+
+**Fix:** `recoverAndLog` now spawns `kiosk-exit-guard.exe --show-toast 5000 "SK Filter restarted after an internal error. Auto-recovery in progress."` as a fire-and-forget child via the existing `--show-toast` path before returning. The child's WebView2 is its own first instance so it survives the crashing parent. The user sees a 5-second toast explaining the brief glitch; the supervising Service respawns the controller; the kiosk paints again. Best-effort — spawn failure is itself logged but doesn't block panic propagation.
+
+### UX HIGH#3 — `docs/admin-runbook.md` updated for v1.1.4+ co-installed auto-start and v1.1.8 paths
+
+**Root cause:** the runbook still claimed the v1.0.x scheduled task gets *deleted* on upgrade to v1.1.0+, and described `--update` as "restarts the scheduled task". v1.1.4 made the Service and task co-installed (`installService` no longer touches the task), and v1.1.0+'s `--update` flow restarts the Service via `sc start KioskExitGuardSvc`.
+
+**Fix:** rewrote the verification section so the scheduled-task query expects **one row** `State = Ready` (it's the AtLogon fallback now, not a legacy artifact). Added an "Auto-start verification" section that exercises `Get-Service` + `Get-ScheduledTask` + `Get-Process kiosk-exit-guard` together. Added an "Install paths (v1.1.8+)" section describing `%ProgramFiles%\KioskExitGuard\` (canonical install dir, NTFS-default admin-only) and `%ProgramData%\KioskExitGuard\` (icacls-tightened data root with `staging\`, `WebView2\`, and the new v1.1.9 `pause-just-applied.flag`). Replaced "restarts the scheduled task" with "restarts the Service" in the `Install an update` task. Updated the "I lost the password" recovery script comment so the `schtasks /Delete` line no longer claims to be a no-op on v1.1.0+. Updated the v1.0.x upgrade table row to describe both `installService()` and `installStartupTask()` running, not the v1.0.x task-deletion behavior that's gone.
+
+### UX MEDIUM#4 + UX MEDIUM#5 — first-run setup now shows ONE combined status dialog
+
+**Root cause:** the first-run success path's `zenity.Info` hardcoded "Auto-start task installed" — a lie when only the Service installed or only the task installed. Worse, dual-failure stacked two modals: `installService` failure surfaced a `zenity.Warning` BEFORE the task install attempt, and a follow-up `zenity.Error` if the task also failed, so admins on broken installs saw the Warning, dismissed it, then got an Error on top.
+
+**Fix:** install both first without surfacing per-step warnings, then build a single status dialog from `(svcErr, taskErr)`. The line "Auto-start: Windows Service ✓, Scheduled task ✓" (or any combination of ✓ / ✗) replaces the hardcoded string. Dual-success surfaces `zenity.Info`; service-only-failure / task-only-failure each surface a single `zenity.Warning` explaining what survived; dual-failure escalates to `zenity.Error` with both error texts in one body. One modal per first-run outcome, no stacking.
+
+### UX MEDIUM#6 — pause-shortcut kiosk-relaunch race closed
+
+**Root cause:** `runPauseInvocation` kills the kiosk WebView2 child immediately after password accept so `zenity.List` (the duration picker, native Win32 dialog without `HWND_TOPMOST`) can grab foreground. The controller's `runWatchdog` ticks every 30s and `syncFilterStateLoop` polls the pause file every 2s. If a watchdog tick fired between the kill and the sync-loop seeing the new pause file, the watchdog respawned the kiosk and the user saw the "Pause cancelled / paused" zenity flow interrupted by a flash of the kiosk re-appearing.
+
+**Fix:** new marker file `%ProgramData%\KioskExitGuard\pause-just-applied.flag` written via new `writePauseJustAppliedMarker(5*time.Second)` BEFORE the `findOurWebViewChild().Kill()` in `runPauseInvocation`. The marker is a decimal `time.Now().Add(5*time.Second).UnixNano()` string. `watchdogTick` (`main.go`) now calls `pauseJustAppliedActive()` before launching a `--webview` child; if the marker exists AND its timestamp is still in the future, the watchdog skips the relaunch this tick. The 5-second buffer covers the worst-case skew between the two processes' wall clocks, far exceeding the 2-second `syncFilterStateLoop` interval that actually flips `filterMode` — so the marker is irrelevant after the sync loop catches up. Stale markers (old timestamps from a previous boot) read as inactive; any parse error degrades back to pre-v1.1.9 behavior. The directory is admin-only via the existing `ensureAdminOnlyDir(programDataDir())`.
+
+### UX MEDIUM#7 — `--update` waits for the Service to actually reach Stopped
+
+**Root cause:** `runUpdateInvocation` (`main.go`) ran `exec.Command("sc", "stop", svcName).Run()` and continued immediately. `sc stop` returns as soon as SCM accepts the stop request, not when the service is actually Stopped. In the 1 – 2s the supervisor takes to wind down, the running supervisor goroutine could respawn a fresh controller via `CreateProcessAsUserW`, which then file-locked `kiosk-exit-guard.exe` and broke the subsequent `os.Rename(exe, oldPath)`.
+
+**Fix:** extracted the SCM poll loop from `installService` into a reusable `waitForServiceStopped(d time.Duration) error` helper in `service_windows.go`. Same pattern (`mgr.Connect` → `OpenService` → `s.Query` → check `status.State == svc.Stopped` → `time.Sleep(200ms)`), wrapped in a deadline check. `runUpdateInvocation` calls `waitForServiceStopped(10 * time.Second)` after `sc stop` and logs (but proceeds anyway) on timeout — 10s is enough headroom for any normal SCM cycle without bricking the update if SCM is hung. Mirrors the inline loop already in `installService` (`service_windows.go:127-133`).
+
+### UX MEDIUM#8 — modal-spawn failure surfaces a toast instead of silent swallow
+
+**Root cause:** `askPasswordModal` (`main.go`, the parent-side wrapper around the `--ask-password` child) returned `pwCancel` on any `cmd.Run` error that wasn't an `*exec.ExitError`. The LL-hook callback path swallows `pwCancel` silently (intentional for "user pressed Esc"). So if the child failed to *start* — antivirus quarantine, missing exe, locked path — the user tapped Win, saw nothing, and assumed the filter was broken or had bypassed itself.
+
+**Fix:** distinguish spawn-failure from exit-code in the wrapper. If `runErr` is non-nil AND NOT `*exec.ExitError`, the child never started — log it (already done) and additionally call `showTimedInfo("Password prompt failed.\nCheck kiosk-exit-guard.log or restart the filter.")`. The wrapper still returns `pwCancel` so callers don't trigger the wrong-password toast for what is actually plumbing failure — a "Wrong password" message would be actively misleading.
+
+### UX MEDIUM#9 — exit-after-failure toasts wait for the child to render
+
+**Root cause:** `runPauseInvocation`, `runUpdateInvocation`, and the `--set-url` flow all called `showFailedToast()` (fire-and-forget via `--show-toast` child) on wrong-password, then immediately `os.Exit(1)`. The parent process died before the child WebView2 finished cold-starting, sometimes before the toast painted at all. User-visible symptom: enter the wrong password on `--pause`, the parent disappears, no feedback.
+
+**Fix:** new `showTimedInfoSync(text)` and `showFailedToastSync()` in `main.go` that use `cmd.Run()` instead of `cmd.Start()` — the parent blocks until the child renders + the existing dismiss timer fires. Replaced `showFailedToast()` with `showFailedToastSync()` at the three exit-after-failure call sites. The hook-callback `promptAndPause` path keeps the async `showFailedToast()` (the controller doesn't exit after, so fire-and-forget is correct).
+
+### UX LOW#10 — uninstall dialog mentions the Windows Service; post-uninstall block verifies its removal
+
+**Root cause:** the `zenity.Question` confirm dialog in `runUninstallInvocation` listed "Scheduled task" but not the Service. On v1.1.0+ installs the Service is the primary auto-start mechanism — the dialog understated what was about to happen. Also, the post-uninstall verification block only ran `schtasks /Query` to confirm the task was gone; a stuck SCM entry (`removeService` rare-failure mode) would survive uninstall without complaint.
+
+**Fix:** added "Windows Service (KioskExitGuardSvc)" to the bulleted "this removes:" list. Added a verification check after the existing scheduled-task query via new helper `serviceStillExists()` in `service_windows.go` (uses `mgr.Connect` + `OpenService` — clean way to avoid leaking the `golang.org/x/sys/windows/svc/mgr` import into `main.go`). On true return, the failures list gains `"The Windows Service KioskExitGuardSvc could not be removed. Open an Admin PowerShell and run: sc delete KioskExitGuardSvc"`.
+
+### UX LOW#11 — `--set-url` writes to HKLM before killing the kiosk child
+
+**Root cause / fix:** `promptForKioskURL` already calls `saveKioskURLToRegistry` as its last step before returning the new URL, then the caller in `main()` kills the kiosk child to force a respawn at the new URL. The audit flagged this as a potential reorder risk in future refactors of `promptForKioskURL`. Added a defensive `saveKioskURLToRegistry(newURL)` call in the `--set-url` block AFTER `promptForKioskURL` returns and BEFORE the `findOurWebViewChild().Kill()`, with a log line on the (idempotent) second-save failure. Belt and suspenders — the current code path was correct, the second call costs one `RegSetValueEx` and locks the invariant against drift.
+
+### Shared helpers added
+
+- `acquireControllerMutex()` (`main.go`) — UX HIGH#1.
+- `writePauseJustAppliedMarker(dur)` / `pauseJustAppliedActive()` / `pauseJustAppliedMarkerPath()` (`main.go`) — UX MEDIUM#6.
+- `showTimedInfoSync(text)` / `showFailedToastSync()` (`main.go`) — UX MEDIUM#9.
+- `waitForServiceStopped(d)` (`service_windows.go`) — UX MEDIUM#7, extracted from `installService`'s inline loop.
+- `serviceStillExists()` (`service_windows.go`) — UX LOW#10.
+
+### Build
+
+`goversioninfo -64 versioninfo.json` regenerated the resource. `go build -ldflags="-H windowsgui -s -w" -o kiosk-exit-guard.exe ./...` produces a 7.89 MB binary (was 7.88 MB on v1.1.8).
+
 ## v1.1.8 — 2026-05-12
 
 **Security audit pass: every finding addressed.** Nine concrete fixes spanning install-path hardening, update-flow integrity, identity authentication of the explorer-token fallback, WebView2 profile isolation, registry DACL tightening, hook-install ordering, PowerShell injection prep, and parent-PID authentication.

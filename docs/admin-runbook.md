@@ -31,7 +31,7 @@ Double-click **Resume SK Filter**. No password (resuming the lockdown is safe). 
 
 ### Install an update
 
-Double-click **Update SK Filter**. Hits the GitHub `/releases/latest` API, shows current vs latest. Click Install → password modal → it downloads, atomic-renames the running exe to `.old`, swaps in the new one, restarts the scheduled task.
+Double-click **Update SK Filter**. Hits the GitHub `/releases/latest` API, shows current vs latest. Click Install → password modal → it downloads, atomic-renames the running exe to `.old`, swaps in the new one, restarts the Service.
 
 If the device can't reach `api.github.com`, the dialog will report a network error; download the new exe manually from [Releases](https://github.com/Shalom-Karr/kiosk-exit-guard/releases) and overwrite `kiosk-exit-guard.exe` (you'll need to kill the running controller first — see below).
 
@@ -68,14 +68,35 @@ sc qc KioskExitGuardSvc
 
 `sc qc` should show `BINARY_PATH_NAME : "C:\Program Files\KioskExitGuard\kiosk-exit-guard.exe" --service-run` and `SERVICE_START_NAME : LocalSystem`.
 
-### Is the legacy v1.0.x scheduled task gone? (after upgrading to v1.1.0)
+### Is the scheduled task installed? (v1.1.4+)
 
 ```powershell
 Get-ScheduledTask -TaskName KioskExitGuard -ErrorAction SilentlyContinue |
     Select-Object TaskName, State
 ```
 
-Expect: no rows. `installService()` deletes the v1.0.x task during install / upgrade. If a row exists, the device is in a degraded state — manual cleanup: `schtasks /Delete /F /TN KioskExitGuard`.
+Expect: **one row** with `State = Ready`. As of v1.1.4 the Service AND the scheduled task are co-installed as belt-and-suspenders auto-start — either alone has been observed to fail in the field, so we keep both. The Service is the in-session respawn supervisor; the task is the AtLogon fallback for installs where the Service spawn path fails. `killRunningController()` plus the v1.1.9 cross-process controller mutex (`Global\KioskExitGuardControllerRunning`) keep exactly one controller alive regardless of which mechanism fires first.
+
+If no row exists, the AtLogon fallback isn't installed — re-run the exe (which re-installs both auto-starts on every non-service-spawn launch) or manually trigger via `"C:\Program Files\KioskExitGuard\kiosk-exit-guard.exe"`.
+
+### Auto-start verification
+
+Combined check that both auto-start paths are present and the running controller is sane:
+
+```powershell
+Get-Service KioskExitGuardSvc | Select-Object Name, Status, StartType
+Get-ScheduledTask -TaskName KioskExitGuard | Select-Object TaskName, State
+Get-Process kiosk-exit-guard -ErrorAction SilentlyContinue |
+    Select-Object Id, ProcessName, StartTime, Path
+```
+
+Expect:
+
+- `KioskExitGuardSvc` row: `Status = Running`, `StartType = Automatic`.
+- `KioskExitGuard` scheduled task row: `State = Ready`.
+- 2 – 3 `kiosk-exit-guard` processes: one `--service-run` (SYSTEM), one user-session controller (no args or `--service-run`-spawned), optionally one `--webview` while the kiosk is up.
+
+All three rows should reference `Path = C:\Program Files\KioskExitGuard\kiosk-exit-guard.exe` on a v1.1.8+ install.
 
 ### Is the HKLM config set?
 
@@ -131,7 +152,7 @@ The bcrypt hash is one-way; we cannot recover the password from it. The only rec
 sc stop KioskExitGuardSvc
 sc delete KioskExitGuardSvc
 Get-Process kiosk-exit-guard | Stop-Process -Force
-schtasks /Delete /F /TN KioskExitGuard   # legacy v1.0.x task, no-op on v1.1.0+
+schtasks /Delete /F /TN KioskExitGuard   # v1.1.4+ AtLogon fallback task (also v1.0.x legacy)
 Remove-Item -Recurse -Force "HKLM:\Software\KioskExitGuard"
 $ifeoRoot = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
 foreach ($exe in @("chrome.exe","msedge.exe","sethc.exe","osk.exe","narrator.exe","utilman.exe","magnify.exe")) {
@@ -197,6 +218,18 @@ Start-Process "$env:TEMP\MicrosoftEdgeWebview2Setup.exe" -ArgumentList "/silent"
 
 Then re-run kiosk-exit-guard.exe — it'll detect the now-installed runtime and continue normally.
 
+## Install paths (v1.1.8+)
+
+As of v1.1.8 the controller relocates itself at first run, and stores all admin-only data under `%ProgramData%`. Two directories matter:
+
+- **`%ProgramFiles%\KioskExitGuard\`** — the canonical install path. `kiosk-exit-guard.exe` lives here; `kiosk-exit-guard.exe.old` appears here after an `--update` and stays as a rollback target. State files (`filter_mode.state`, `pause_until.state`) also land here. Admin-only DACL (NTFS default on `%ProgramFiles%`).
+- **`%ProgramData%\KioskExitGuard\`** — admin-only data root, DACL tightened on every controller startup via `icacls /inheritance:r /grant:r "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F"`. Contains:
+  - `staging\` — `--update` downloads the new exe here before atomic-rename. Kept admin-only so a kiosk user can't swap the file between download and install.
+  - `WebView2\` — shared user-data folder for all four in-process WebView2 instances (password modal, toast, first-run wizard, kiosk page). Pre-v1.1.8 this was under `%LOCALAPPDATA%` and kiosk-user-writable, which allowed a poisoned service-worker attack on the password modal's `kgSubmit` binding.
+  - `pause-just-applied.flag` (v1.1.9) — short-lived marker the `--pause` shortcut writes to suppress the controller's watchdog briefly while `syncFilterStateLoop` flips filterMode. Auto-stale after 5s; safe to delete.
+
+Both directories survive uninstall as a courtesy (delete manually for full removal). The v1.1.8 uninstall flow deletes the contents of `%ProgramFiles%\KioskExitGuard\` and schedules the running exe + dir for delete-on-reboot via `MoveFileExW(MOVEFILE_DELAY_UNTIL_REBOOT)`.
+
 ## Logs and diagnostics
 
 There's no log file by design (kiosk machines don't have anywhere good to put one). For diagnostics during development:
@@ -214,6 +247,6 @@ There's no log file by design (kiosk machines don't have anywhere good to put on
 |---|---|
 | v0.4.x | Uninstall via PowerShell (legacy uninstall flag may not exist), then install v1.1.x fresh. |
 | v0.5.0 – v0.5.5 | Double-click **Update SK Filter** desktop shortcut, or run the new exe — first-run's `purgeLeftoverState()` handles the migration. |
-| v1.0.x | Same — Update shortcut handles it. On the next non-first-run launch, the controller calls `installService()` which registers `KioskExitGuardSvc` and deletes the v1.0.x `KioskExitGuard` scheduled task in the same step. |
+| v1.0.x | Same — Update shortcut handles it. On the next non-first-run launch, the controller calls `installService()` to register `KioskExitGuardSvc` AND `installStartupTask()` to (re)register the AtLogon scheduled task — both auto-start mechanisms are co-installed as of v1.1.4, no longer mutually exclusive. |
 
-The atomic-rename approach in `--update` keeps the previous exe as `.old` next to the new one, so a botched update can be rolled back by renaming back. On v1.1.0+ the update flow does `sc stop KioskExitGuardSvc` before the rename and `sc start` after.
+The atomic-rename approach in `--update` keeps the previous exe as `.old` next to the new one, so a botched update can be rolled back by renaming back. On v1.1.0+ the update flow does `sc stop KioskExitGuardSvc` before the rename and `sc start` after — as of v1.1.9 it also polls SCM until the service reaches the Stopped state before renaming, so the supervisor can't respawn a fresh controller mid-rename.

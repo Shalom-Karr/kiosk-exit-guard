@@ -62,7 +62,7 @@ import (
 
 // currentVersion must be kept in sync with versioninfo.json. Used by the
 // --update flow to compare against the latest GitHub release tag.
-const currentVersion = "1.1.8"
+const currentVersion = "1.1.9"
 
 // ---------- logging ----------
 
@@ -120,6 +120,24 @@ func logf(format string, args ...interface{}) {
 func recoverAndLog(where string) {
 	if r := recover(); r != nil {
 		logf("PANIC in %s: %v\n%s", where, r, string(debug.Stack()))
+		// v1.1.9 UX HIGH#2: surface a user-visible toast before the
+		// process tears down. Without this the controller would die
+		// silently — the Service / scheduled task respawns it within
+		// ~1s, but during the gap the kiosk WebView2 child disappears
+		// and the user sees a black/desktop flash without explanation.
+		// Spawned as a fire-and-forget child via the existing
+		// --show-toast path so it survives this process's death.
+		// Best-effort: any spawn failure is itself logged but we keep
+		// going with the panic propagation (recover already consumed
+		// the panic; we just return from this defer).
+		if exe, err := os.Executable(); err == nil {
+			cmd := exec.Command(exe, "--show-toast", "5000",
+				"SK Filter restarted after an internal error. Auto-recovery in progress.")
+			cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+			if startErr := cmd.Start(); startErr != nil {
+				logf("recoverAndLog: failed to spawn recovery toast: %v", startErr)
+			}
+		}
 	}
 }
 
@@ -1351,6 +1369,30 @@ func showTimedInfo(text string) {
 
 func showFailedToast() { showTimedInfo("Wrong password.") }
 
+// showTimedInfoSync is the synchronous variant of showTimedInfo: it
+// spawns the same --show-toast child process but cmd.Run() blocks until
+// the child renders + dismisses. v1.1.9 UX MEDIUM#9: used by the
+// pause / update / set-url flows that exit immediately after a
+// "wrong password" or "operation cancelled" toast — the parent dying
+// before the child paints meant the toast could fail to render. Use
+// this only at exit-then-die call sites; fire-and-forget toasts during
+// steady-state operation should keep using showTimedInfo.
+func showTimedInfoSync(text string) {
+	exe, err := os.Executable()
+	if err != nil {
+		showFrontmostToast(text, toastTimeoutMs*time.Millisecond)
+		return
+	}
+	cmd := exec.Command(exe, "--show-toast", strconv.Itoa(toastTimeoutMs), text)
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+	_ = cmd.Run()
+}
+
+// showFailedToastSync is the synchronous "Wrong password." toast used at
+// exit-after-failure call sites where the parent calls os.Exit(1)
+// immediately after. v1.1.9 UX MEDIUM#9.
+func showFailedToastSync() { showTimedInfoSync("Wrong password.") }
+
 // ---------- WebView2 runtime auto-install ----------
 
 const (
@@ -1895,28 +1937,69 @@ func firstRunWithWizard() bool {
 	// non-service-spawn launch. killRunningController() at controller
 	// startup guarantees only one controller runs at a time regardless
 	// of which auto-start mechanism fired first.
+	// v1.1.9 UX MEDIUM#4 + #5: install BOTH auto-start mechanisms
+	// without surfacing per-step warnings, then build a single status
+	// dialog that reports which combination of success/failure occurred.
+	// Previously installService surfaced a Warning before the task
+	// attempt, and the task-failure path stacked an Error on top —
+	// double-modal on dual-failure. Also the success message lied with
+	// "Auto-start task installed" when only one mechanism succeeded.
 	svcErr := installService()
+	taskErr := installStartupTask()
 	if svcErr != nil {
-		_ = zenity.Warning(
-			fmt.Sprintf("Service install failed: %v\n\nThe scheduled task is still installed so the filter will auto-start on logon, but the Windows Service (which the kiosk user can't disable) was not registered.", svcErr),
+		logf("first-run: installService failed: %v", svcErr)
+	}
+	if taskErr != nil {
+		logf("first-run: installStartupTask failed: %v", taskErr)
+	}
+
+	const (
+		check = "✓"
+		cross = "✗"
+	)
+	svcMark, taskMark := check, check
+	if svcErr != nil {
+		svcMark = cross
+	}
+	if taskErr != nil {
+		taskMark = cross
+	}
+	autoStartLine := fmt.Sprintf("Auto-start: Windows Service %s, Scheduled task %s", svcMark, taskMark)
+	baseMsg := fmt.Sprintf(
+		"Setup complete.\n\n%s%s%s\n\nThe SK Filter is ON by default and will start enforcing immediately.\nUse Ctrl+Shift+Alt+K to pause it for 1–100 minutes when needed.",
+		"• Password and kiosk URL saved\n• Chrome uninstalled\n• Chrome and Edge launches blocked\n• Desktop shortcut created\n• ",
+		autoStartLine,
+		"",
+	)
+
+	switch {
+	case svcErr != nil && taskErr != nil:
+		_ = zenity.Error(
+			fmt.Sprintf(
+				"Setup completed BUT auto-start install FAILED.\n\n%s\n\nService error: %v\nTask error:    %v\n\nThe kiosk will run while this exe stays open, but it will NOT auto-start after reboot. Try running the installer from a fully elevated admin shell.",
+				autoStartLine, svcErr, taskErr,
+			),
 			zenity.Title("kiosk-exit-guard"),
 		)
+	case svcErr != nil:
+		_ = zenity.Warning(
+			fmt.Sprintf(
+				"%s\n\nThe scheduled task is installed so the filter will auto-start on logon, but the Windows Service (which the kiosk user can't disable) was not registered.\n\nService error: %v",
+				baseMsg, svcErr,
+			),
+			zenity.Title("kiosk-exit-guard"),
+		)
+	case taskErr != nil:
+		_ = zenity.Warning(
+			fmt.Sprintf(
+				"%s\n\nThe Windows Service is installed and will respawn the controller after kills, but the AtLogon scheduled task fallback was not registered.\n\nTask error: %v",
+				baseMsg, taskErr,
+			),
+			zenity.Title("kiosk-exit-guard"),
+		)
+	default:
+		_ = zenity.Info(baseMsg, zenity.Title("kiosk-exit-guard"))
 	}
-	if taskErr := installStartupTask(); taskErr != nil {
-		logf("first-run: installStartupTask failed: %v", taskErr)
-		if svcErr != nil {
-			// Both failed — surface this loudly so the admin knows the
-			// kiosk has no auto-start at all.
-			_ = zenity.Error(
-				fmt.Sprintf("Auto-start install FAILED.\n\nService: %v\nTask: %v\n\nThe kiosk will run while this exe stays open, but it will NOT auto-start after reboot. Try running the installer from a fully elevated admin shell.", svcErr, taskErr),
-				zenity.Title("kiosk-exit-guard"),
-			)
-		}
-	}
-	_ = zenity.Info(
-		"Setup complete.\n\n• Password and kiosk URL saved\n• Chrome uninstalled\n• Chrome and Edge launches blocked\n• Desktop shortcut created\n• Auto-start task installed\n\nThe SK Filter is ON by default and will start enforcing immediately.\nUse Ctrl+Shift+Alt+K to pause it for 1–100 minutes when needed.",
-		zenity.Title("kiosk-exit-guard"),
-	)
 	return true
 }
 
@@ -2026,8 +2109,57 @@ func killWebViewChild() {
 	}
 }
 
+// pauseJustAppliedMarkerName is the file under %ProgramData%\KioskExitGuard\
+// that runPauseInvocation writes a future timestamp into RIGHT before
+// killing the kiosk child. watchdogTick reads it and skips relaunching
+// while the timestamp is still in the future, eliminating the brief
+// kiosk-reappear flash between the pause shortcut killing the kiosk and
+// syncFilterStateLoop (2s) flipping filterMode. v1.1.9 UX MEDIUM#6.
+const pauseJustAppliedMarkerName = "pause-just-applied.flag"
+
+func pauseJustAppliedMarkerPath() string {
+	return filepath.Join(programDataDir(), pauseJustAppliedMarkerName)
+}
+
+// writePauseJustAppliedMarker creates the marker file holding a
+// timestamp `dur` in the future as decimal UnixNano. Best-effort — on
+// any error the kiosk-blink protection is just degraded back to the
+// pre-v1.1.9 behavior (brief reappearance possible).
+func writePauseJustAppliedMarker(dur time.Duration) {
+	_ = ensureAdminOnlyDir(programDataDir())
+	p := pauseJustAppliedMarkerPath()
+	until := time.Now().Add(dur)
+	if err := os.WriteFile(p, []byte(strconv.FormatInt(until.UnixNano(), 10)), 0o600); err != nil {
+		logf("writePauseJustAppliedMarker: %v", err)
+	}
+}
+
+// pauseJustAppliedActive returns true if the marker file exists AND its
+// timestamp is still in the future. Stale markers (e.g. an old one from
+// a previous boot) are treated as inactive. Returns false on any read
+// error so the controller falls back to its pre-marker behavior rather
+// than getting stuck never relaunching the kiosk.
+func pauseJustAppliedActive() bool {
+	b, err := os.ReadFile(pauseJustAppliedMarkerPath())
+	if err != nil {
+		return false
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+	if err != nil {
+		return false
+	}
+	return time.Now().UnixNano() < n
+}
+
 func watchdogTick() {
 	if filterMode.Load() && !isPaused() {
+		// v1.1.9 UX MEDIUM#6: a separate --pause invocation just killed
+		// the kiosk child but the controller's filterMode hasn't yet
+		// flipped (syncFilterStateLoop polls every 2s). Skip the
+		// relaunch so the user doesn't see the kiosk briefly reappear.
+		if pauseJustAppliedActive() {
+			return
+		}
 		if findOurWebViewChild() == nil {
 			launchWebViewChild()
 		}
@@ -2355,6 +2487,16 @@ const passwordPromptHTML = `<!DOCTYPE html><html lang="en"><head><meta charset="
 // pendingComboV.
 const globalPromptMutexName = `Global\KioskExitGuardPromptMutex`
 
+// v1.1.9 UX HIGH#1: cross-process "only one controller alive" guard.
+// Both the Windows Service supervisor and the AtLogon scheduled task
+// auto-start the controller at logon. Whichever fires second runs
+// killRunningController() to clear the first, the loser's supervisor
+// respawns, and the kiosk WebView2 child blinks/reopens. Acquiring this
+// mutex BEFORE killRunningController converts the race into a clean
+// "second mover exits silently" — the first controller keeps running,
+// the kiosk stays painted.
+const globalControllerMutexName = `Global\KioskExitGuardControllerRunning`
+
 const (
 	errorAlreadyExists = 183
 )
@@ -2392,6 +2534,37 @@ func releaseGlobalPromptLock(h uintptr) {
 	}
 	procReleaseMutex.Call(h)
 	procCloseHandle.Call(h)
+}
+
+// acquireControllerMutex tries to take the system-wide "controller is
+// running" named mutex. Returns the handle (intentionally leaked for the
+// controller's lifetime) if we own it, or 0 if another controller
+// already does. v1.1.9 UX HIGH#1: called once at controller startup
+// before killRunningController so the second-to-start logon-time auto-
+// start exits silently instead of killing the first and triggering a
+// kiosk WebView2 blink/reopen as the loser's supervisor respawns. Fail-
+// open on kernel32 / mutex-create errors so a degraded kernel32 doesn't
+// turn into "controller refuses to start".
+func acquireControllerMutex() (handle uintptr, alreadyRunning bool) {
+	if procCreateMutexW.Find() != nil {
+		return 0, false
+	}
+	name, err := syscall.UTF16PtrFromString(globalControllerMutexName)
+	if err != nil {
+		return 0, false
+	}
+	h, _, _ := procCreateMutexW.Call(0, 1 /* bInitialOwner */, uintptr(unsafe.Pointer(name)))
+	if h == 0 {
+		return 0, false
+	}
+	last, _, _ := procGetLastError.Call()
+	if last == errorAlreadyExists {
+		// Another controller already owns the mutex. Close our handle
+		// (we don't own it; another process does) and tell the caller.
+		procCloseHandle.Call(h)
+		return 0, true
+	}
+	return h, false
 }
 
 // passwordResult tells callers exactly how a password modal terminated so
@@ -2442,10 +2615,16 @@ func askPasswordModal(title, subtitle string) passwordResult {
 			return pwCancel
 		}
 	}
-	// Child failed to launch / unknown error. Treat as cancel so the
-	// caller's flow exits silently rather than triggering a wrong-
-	// password toast for what is actually a plumbing failure.
-	logf("askPasswordModal child exec failed: %v", runErr)
+	// v1.1.9 UX MEDIUM#8: spawn-failure path. The child never started
+	// (exec.Run returned a non-ExitError), so the user saw nothing.
+	// Pre-v1.1.9 this returned pwCancel silently and the LL hook's
+	// promptAndReinject swallowed the press — user taps Win, sees no
+	// modal, assumes the filter is broken. Surface a one-line toast so
+	// the user knows the issue is the prompt itself rather than the
+	// keyboard hook. The Cancel return-path is unchanged so callers
+	// don't show a "wrong password" toast for a plumbing failure.
+	logf("askPasswordModal child exec failed (spawn-time): %v", runErr)
+	showTimedInfo("Password prompt failed.\nCheck kiosk-exit-guard.log or restart the filter.")
 	return pwCancel
 }
 
@@ -2455,6 +2634,12 @@ func askPasswordModal(title, subtitle string) passwordResult {
 // other callers must use the parent-side askPasswordModal which spawns
 // this in a child to avoid the go-webview2 double-instance panic.
 func askPasswordModalInProcess(title, subtitle string) passwordResult {
+	// v1.1.9 NEW: auto-dismiss the modal after this many seconds of
+	// inactivity so a walked-away user can't hold the kiosk hostage
+	// indefinitely. The kgSubmit / kgCancel bindings reset the timer
+	// so an actively-typing user doesn't get yanked mid-attempt.
+	const inactivityTimeout = 30 * time.Second
+
 	if !promptOpen.CompareAndSwap(false, true) {
 		return pwCancel
 	}
@@ -2514,7 +2699,18 @@ func askPasswordModalInProcess(title, subtitle string) passwordResult {
 	const maxAttempts = 3
 	var attempts int
 
+	// v1.1.9 NEW: inactivity timer — the bindings below reset it on every
+	// user interaction so an actively-typing user doesn't get yanked
+	// mid-attempt. Started just before w.Run() below so we don't race a
+	// slow WebView2 cold start. autoDismissed flags the !submitted return
+	// path as a timeout so the caller treats it as pwCancel (no toast).
+	var inactivityTimer *time.Timer
+	var autoDismissed atomic.Bool
+
 	w.Bind("kgSubmit", func(pw string) {
+		if inactivityTimer != nil {
+			inactivityTimer.Reset(inactivityTimeout)
+		}
 		attempts++
 		if bcrypt.CompareHashAndPassword(storedHash, []byte(pw)) == nil {
 			submitted = true
@@ -2540,6 +2736,9 @@ func askPasswordModalInProcess(title, subtitle string) passwordResult {
 		})
 	})
 	w.Bind("kgCancel", func() {
+		if inactivityTimer != nil {
+			inactivityTimer.Reset(inactivityTimeout)
+		}
 		w.Terminate()
 	})
 
@@ -2560,6 +2759,18 @@ func askPasswordModalInProcess(title, subtitle string) passwordResult {
 			time.Sleep(15 * time.Millisecond)
 		}
 	}()
+
+	// v1.1.9 NEW: arm the inactivity timer just before entering the
+	// WebView2 message pump. Dispatch into the UI thread so Terminate
+	// is called from the same thread that owns w.Run(). The kgSubmit /
+	// kgCancel bindings reset this timer on every interaction.
+	inactivityTimer = time.AfterFunc(inactivityTimeout, func() {
+		autoDismissed.Store(true)
+		logf("askPasswordModalInProcess: %s inactivity timeout — auto-dismissing", inactivityTimeout)
+		w.Dispatch(func() { w.Terminate() })
+	})
+	defer inactivityTimer.Stop()
+
 	w.Run()
 
 	if !submitted {
@@ -2797,7 +3008,11 @@ func runUninstallInvocation() {
 		os.Exit(0)
 	}
 	if err := zenity.Question(
-		"Are you sure?\n\nThis removes:\n  • Chrome / Edge IFEO blocks\n  • Task Manager / Run dialog policies\n  • Stored password and kiosk URL\n  • Scheduled task\n  • Desktop shortcuts\n\nThe SK Filter will no longer enforce anything after this.",
+		// v1.1.9 UX LOW#10: Windows Service added to the bulleted list
+		// — pre-v1.1.9 the dialog only mentioned the scheduled task,
+		// which understated what was about to happen on v1.1.0+ installs
+		// where the Service is the primary auto-start mechanism.
+		"Are you sure?\n\nThis removes:\n  • Chrome / Edge IFEO blocks\n  • Task Manager / Run dialog policies\n  • Stored password and kiosk URL\n  • Windows Service (KioskExitGuardSvc)\n  • Scheduled task\n  • Desktop shortcuts\n\nThe SK Filter will no longer enforce anything after this.",
 		zenity.Title("SK Filter — Uninstall"),
 		zenity.OKLabel("Uninstall"),
 		zenity.CancelLabel("Keep installed"),
@@ -2887,6 +3102,15 @@ func runUninstallInvocation() {
 		failures = append(failures,
 			"The auto-start scheduled task could not be removed. "+
 				"Open Task Scheduler (taskschd.msc) and delete the task named \""+taskName+"\" manually.")
+	}
+
+	// v1.1.9 UX LOW#10: also verify the Windows Service is gone. Pre-
+	// v1.1.9 the verification block only checked the scheduled task,
+	// so a stuck SCM entry would survive uninstall without complaint.
+	if serviceStillExists() {
+		failures = append(failures,
+			"The Windows Service "+svcName+" could not be removed. "+
+				"Open an Admin PowerShell and run: sc delete "+svcName)
 	}
 	// Log the raw schtasks output for diagnosis but don't dump it on the user.
 	for _, f := range failures {
@@ -3197,7 +3421,10 @@ func runUpdateInvocation() {
 		fmt.Sprintf("Replacing the running kiosk-exit-guard.exe with v%s. Enter your admin password to confirm.", latest),
 	) {
 	case pwWrong:
-		showFailedToast()
+		// v1.1.9 UX MEDIUM#9: sync variant — return below tears the
+		// parent down immediately and the fire-and-forget child could
+		// die before painting.
+		showFailedToastSync()
 		return
 	case pwCancel:
 		return
@@ -3267,6 +3494,14 @@ func runUpdateInvocation() {
 	stopCmd := exec.Command("sc", "stop", svcName)
 	stopCmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
 	_ = stopCmd.Run()
+	// v1.1.9 UX MEDIUM#7: poll SCM until the service is actually
+	// Stopped. `sc stop` returns immediately; without this wait the
+	// supervisor goroutine inside the running service can respawn a
+	// fresh controller in the rename window. 10s is generous —
+	// installService's inline poll uses 4s.
+	if waitErr := waitForServiceStopped(10 * time.Second); waitErr != nil {
+		logf("update: waitForServiceStopped: %v (continuing — service may have been ungraceful)", waitErr)
+	}
 	endCmd := exec.Command("schtasks", "/End", "/TN", taskName)
 	endCmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
 	_ = endCmd.Run()
@@ -3391,11 +3626,22 @@ func runPauseInvocation() {
 		"Edge will be allowed and the kiosk will close for the duration you choose. The filter resumes automatically when the timer ends.",
 	) {
 	case pwWrong:
-		showFailedToast()
+		// v1.1.9 UX MEDIUM#9: sync variant — os.Exit below kills the
+		// parent before a fire-and-forget child toast can render.
+		showFailedToastSync()
 		os.Exit(1)
 	case pwCancel:
 		os.Exit(0)
 	}
+	// v1.1.9 UX MEDIUM#6: write the pause-just-applied marker BEFORE
+	// killing the kiosk child. The controller's runWatchdog ticks every
+	// 30s; if a tick fires between this Kill and the syncFilterStateLoop
+	// (2s) flipping filterMode, the watchdog respawns the kiosk and the
+	// user sees the "paused" toast followed by the kiosk briefly
+	// reappearing. The marker carries a 5s future timestamp; watchdogTick
+	// skips relaunching while the marker is in the future.
+	writePauseJustAppliedMarker(5 * time.Second)
+
 	// v1.1.7: kill the kiosk WebView2 child BEFORE showing the duration
 	// picker. zenity.List is not HWND_TOPMOST so it would render behind
 	// the kiosk's fullscreen topmost WebView2 and be invisible. Killing
@@ -3692,7 +3938,9 @@ func main() {
 			"Enter the admin password to confirm.",
 		) {
 		case pwWrong:
-			showFailedToast()
+			// v1.1.9 UX MEDIUM#9: sync variant — os.Exit below would
+			// kill a fire-and-forget child mid-paint.
+			showFailedToastSync()
 			os.Exit(1)
 		case pwCancel:
 			os.Exit(0)
@@ -3706,6 +3954,15 @@ func main() {
 			}
 			_ = zenity.Error(err.Error(), zenity.Title("SK Filter"))
 			os.Exit(1)
+		}
+		// v1.1.9 UX LOW#11: defensively re-save the URL to HKLM BEFORE
+		// killing the kiosk child. promptForKioskURL already persists
+		// it as its last step, but an explicit save here guards the
+		// invariant against future refactors of promptForKioskURL:
+		// the kiosk respawn loaded the OLD URL if Kill ever fired
+		// before the registry write completed. Idempotent.
+		if err := saveKioskURLToRegistry(newURL); err != nil {
+			logf("--set-url: re-save before kiosk restart failed: %v (URL was already saved by promptForKioskURL)", err)
 		}
 		// Restart the kiosk child so it loads the new URL immediately
 		// rather than waiting for the controller's next watchdog tick.
@@ -3754,11 +4011,42 @@ func main() {
 	logf("LL keyboard hook installed early (handle=%d) before killRunningController", hookHandle)
 	defer procUnhookWindowsHookEx.Call(hookHandle)
 
+	// v1.1.9 UX HIGH#1: take the cross-process "controller is running"
+	// mutex BEFORE killRunningController. Without this, at logon both
+	// the Windows Service supervisor AND the AtLogon scheduled task
+	// race to spawn a controller; whichever loses gets killed by the
+	// winner's killRunningController call, the loser's supervisor
+	// respawns it ~1s later, and the kiosk WebView2 child blinks /
+	// reopens. With the mutex, the second mover exits silently and
+	// the first controller keeps running (its supervisor never sees
+	// a death, so no respawn, no kiosk blink). Skipped for all the
+	// short-lived flag-driven invocations above (--reset, --update,
+	// --pause, etc. — those already returned earlier in main).
+	//
+	// Intentionally leak the handle: holding it open for the
+	// controller's lifetime is exactly what we want (the GetMessageW
+	// loop at the bottom of main keeps the process alive, the kernel
+	// frees the handle on process exit, the mutex is auto-released).
+	if mh, alreadyRunning := acquireControllerMutex(); alreadyRunning {
+		logf("controller mutex %s already held by another process; exiting", globalControllerMutexName)
+		// Release the early-installed LL hook before exit so we
+		// don't leak a hook handle into the kernel.
+		procUnhookWindowsHookEx.Call(hookHandle)
+		os.Exit(0)
+	} else {
+		_ = mh // own it for the life of the process; closed on exit
+	}
+
 	// If there's a leftover controller from a previous install still
 	// running (orphaned by a partial uninstall, an aborted update, etc.),
 	// kill it after our hook is in place. Otherwise two controllers fight
 	// over the hook and the new install's password doesn't match the old
-	// one's in-memory cached hash.
+	// one's in-memory cached hash. With the mutex above held, this is now
+	// a no-op in the steady-state co-installed-auto-start case — any
+	// surviving controller would have held the mutex and we'd have
+	// exited already. The kill remains useful for cleaning up orphans
+	// from partial uninstalls / aborted updates where the dead process
+	// can't have held the mutex.
 	killRunningController()
 
 	hash, err := loadHash()

@@ -178,6 +178,62 @@ func installService() error {
 	return nil
 }
 
+// serviceStillExists returns true if KioskExitGuardSvc is currently
+// registered with SCM. Used by runUninstallInvocation's post-uninstall
+// verification block to confirm removeService actually deleted the
+// service. v1.1.9 UX LOW#10.
+func serviceStillExists() bool {
+	m, err := mgr.Connect()
+	if err != nil {
+		return false
+	}
+	defer m.Disconnect()
+	s, err := m.OpenService(svcName)
+	if err != nil {
+		return false
+	}
+	s.Close()
+	return true
+}
+
+// waitForServiceStopped polls SCM until the KioskExitGuardSvc reaches
+// svc.Stopped or the deadline elapses, whichever comes first. Returns
+// nil once the service is observed Stopped (or doesn't exist — same
+// effective state for callers' purposes), or an error on timeout /
+// open / query failure. v1.1.9 UX MEDIUM#7: extracted from the inline
+// loop in installService so runUpdateInvocation can wait for `sc stop`
+// to actually complete before renaming the exe. Without this the
+// supervisor could respawn a fresh controller mid-rename and break
+// the update.
+func waitForServiceStopped(d time.Duration) error {
+	m, err := mgr.Connect()
+	if err != nil {
+		return fmt.Errorf("connect to SCM: %w", err)
+	}
+	defer m.Disconnect()
+
+	s, err := m.OpenService(svcName)
+	if err != nil {
+		// Service doesn't exist — equivalent to Stopped for callers
+		// that want to safely rename the on-disk exe.
+		return nil
+	}
+	defer s.Close()
+
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		status, qErr := s.Query()
+		if qErr != nil {
+			return fmt.Errorf("query service: %w", qErr)
+		}
+		if status.State == svc.Stopped {
+			return nil
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return fmt.Errorf("service %s did not reach Stopped within %s", svcName, d)
+}
+
 // removeService stops the Service and deletes it. Used by --uninstall and
 // the standalone --service-remove flag. Idempotent — no error if the
 // service doesn't exist.
