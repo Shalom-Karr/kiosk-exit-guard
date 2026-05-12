@@ -155,7 +155,7 @@
 <div class="wrap">
 
 <header>
-  <h1>kiosk-exit-guard <span class="version-pill">v0.5.3</span></h1>
+  <h1>kiosk-exit-guard <span class="version-pill">v0.5.4</span></h1>
   <p class="tagline">Single-binary kiosk lockdown for Windows 11 Home. Embedded WebView2 kiosk window, password-gated keyboard, Chrome uninstalled, Edge launches blocked at the OS level — all from one exe.</p>
 </header>
 
@@ -183,14 +183,19 @@
   <a href="#build">Build</a>
 </nav>
 
-<h2 id="whats-new">What's new in v0.5.3</h2>
+<h2 id="whats-new">What's new in v0.5.4</h2>
 
 <div class="callout callout-good">
-  <strong>The big shift in v0.5.1:</strong> the SK Filter is now <strong>always ON by default</strong>. There is no "turn off" path. Instead, the admin can <strong>pause</strong> the filter for a chosen duration (1, 5, 10, 20, 30, 45 minutes, or any custom value up to 100). During a pause, <strong>Edge is re-enabled</strong>, the kiosk window closes, and the registry lockdown is lifted. When the timer fires, everything goes back on automatically — no user intervention needed.
+  <strong>v0.5.4 highlights:</strong> the password modal is now <strong>frameless</strong> — no title bar X button, so killing the modal can no longer bypass the password gate. The modal-hang bug from v0.5.3 is fixed (single topmost call instead of a racing retry loop). A <strong>"Resume SK Filter"</strong> shortcut now appears on the desktop (no password — resuming is the safe direction) plus an <strong>"Uninstall SK Filter"</strong> shortcut (password-gated, with a confirm dialog).
 </div>
 
 <div class="feature-grid">
-  <div class="feature"><h4><span class="dot new"></span>"Pause SK Filter" desktop button<span class="badge">v0.5.3</span></h4><p>First-run now drops a second shortcut on the desktop. Double-click → UAC consent → password modal → duration picker. Same flow as the Ctrl+Shift+Alt+K hotkey, just one click away.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>Frameless password modal<span class="badge">v0.5.4</span></h4><p>No title bar, no X button, no taskbar entry, no Alt+Tab. The only way to dismiss is the in-page Cancel button or the correct password. Closes the "kill the modal to bypass the SK Filter" hole.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>"Resume SK Filter" shortcut<span class="badge">v0.5.4</span></h4><p>Ends the current pause immediately and brings the kiosk back. <strong>No password required</strong> — resuming makes the system more locked-down, not less, so any user can trigger it.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>"Uninstall SK Filter" shortcut<span class="badge">v0.5.4</span></h4><p>Password + confirm dialog gate it. Removes IFEO blocks, HKCU lockdown, HKLM config, scheduled task, all shortcuts. The exe binary itself remains — delete manually.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>Cancel in first-run wizard<span class="badge">v0.5.4</span></h4><p>First-run modal also gets a Cancel button matching the password modal's style. Esc key dismisses too.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>Modal-hang fix<span class="badge">v0.5.4</span></h4><p>The 12-iteration topmost retry loop hammered Win32 calls from a competing goroutine and froze the modal. Replaced with one shot after a 220 ms settle.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>"Pause SK Filter" desktop button<span class="badge">v0.5.3</span></h4><p>Drops a shortcut on the desktop. Double-click → UAC consent → password modal → duration picker. Same flow as the Ctrl+Shift+Alt+K hotkey, just one click away.</p></div>
   <div class="feature"><h4><span class="dot new"></span><code>--pause</code> flag + sync loop<span class="badge">v0.5.3</span></h4><p>The shortcut runs <code>kiosk-exit-guard.exe --pause</code> as a fresh elevated process. A new 2-second polling goroutine in the controller reconciles in-memory state with the pause file written by the <code>--pause</code> process — kiosk closes, hook stops blocking, all within a couple seconds.</p></div>
   <div class="feature"><h4><span class="dot new"></span>Hotkey modal topmost fix<span class="badge">v0.5.2</span></h4><p>Password modal was being created behind the fullscreen kiosk window. Now forces HWND_TOPMOST + SetForegroundWindow with a brief retry loop so the modal always wins z-order.</p></div>
   <div class="feature"><h4><span class="dot new"></span>Ctrl+R / F5 allowlist<span class="badge">v0.5.2</span></h4><p>Reload shortcuts now pass through to the kiosk WebView2 without prompting for the password. Admin can refresh the display freely; everything else still gates.</p></div>
@@ -411,12 +416,14 @@
 <h2 id="flags">CLI flags</h2>
 
 <pre>kiosk-exit-guard.exe                  # normal — controller + hook + watchdog
-kiosk-exit-guard.exe --pause          # show password + duration picker, pause the filter (wired to desktop button)
+kiosk-exit-guard.exe --pause          # password + duration picker, pause the filter (desktop button)
+kiosk-exit-guard.exe --resume         # end the pause early (no password — desktop button)
+kiosk-exit-guard.exe --uninstall      # password + confirm dialog, full teardown (desktop button)
 kiosk-exit-guard.exe --webview        # internal: renders the kiosk window
 kiosk-exit-guard.exe --silent-exit    # internal: IFEO Debugger redirect handler
 kiosk-exit-guard.exe --set-password   # change the password (UAC-elevated)
 kiosk-exit-guard.exe --set-url        # change the kiosk URL (UAC-elevated)
-kiosk-exit-guard.exe --reset          # password-gated — clears registry policies, IFEO blocks, filter mode</pre>
+kiosk-exit-guard.exe --reset          # password-gated — clears registry policies, IFEO, filter mode</pre>
 
 <p><code>--reset</code> requires the configured password. If lost entirely, an admin can wipe <code>HKLM\Software\KioskExitGuard</code> via <code>regedit</code> to fully reset.</p>
 

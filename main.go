@@ -550,8 +550,7 @@ func isAlwaysAllowedCombo(vk uint32) bool {
 
 // makeWindowTopmostFront forces a window to the top of the z-order and
 // gives it focus. Used for the password modal so it appears over the
-// fullscreen topmost WebView2 kiosk window (which would otherwise hide
-// it — both are HWND_TOPMOST and the kiosk was activated first).
+// fullscreen topmost WebView2 kiosk window.
 func makeWindowTopmostFront(hwnd uintptr) {
 	if hwnd == 0 {
 		return
@@ -563,6 +562,34 @@ func makeWindowTopmostFront(hwnd uintptr) {
 	)
 	procSetWindowPos.Call(hwnd, hwndTopmost, 0, 0, 0, 0,
 		uintptr(swpNoMove|swpNoSize|swpShow))
+	procBringWindowToTop.Call(hwnd)
+	procSetForegroundWindow.Call(hwnd)
+}
+
+// makeModalFrameless strips the title bar and system menu from the
+// modal's window so the user can't close it via the X button. The
+// password modal is then dismissable only through the in-page Cancel
+// button (or correct password). Critical to prevent killing the modal
+// from bypassing the password gate.
+func makeModalFrameless(hwnd uintptr) {
+	if hwnd == 0 {
+		return
+	}
+	const (
+		wsExToolWindow = 0x00000080
+		swpNoMove      = 0x0002
+		swpNoSize      = 0x0001
+		swpShow        = 0x0040
+		swpFrameChang  = 0x0020
+	)
+	// Replace the standard window style with WS_POPUP|WS_VISIBLE — no
+	// title bar, no min/max/close buttons, no resize grips.
+	procSetWindowLongPtrW.Call(hwnd, uintptr(gwlStyleU), uintptr(wsPopup|wsVisible))
+	// Topmost + tool-window (also hides from taskbar and Alt+Tab).
+	procSetWindowLongPtrW.Call(hwnd, uintptr(gwlExStyleU), uintptr(wsExTopmost|wsExToolWindow))
+	// Force a frame change so the style strip is repainted.
+	procSetWindowPos.Call(hwnd, hwndTopmost, 0, 0, 0, 0,
+		uintptr(swpNoMove|swpNoSize|swpShow|swpFrameChang))
 	procBringWindowToTop.Call(hwnd)
 	procSetForegroundWindow.Call(hwnd)
 }
@@ -801,21 +828,30 @@ func createDesktopShortcut() error {
 $ws = New-Object -ComObject WScript.Shell
 $desktop = [Environment]::GetFolderPath('Desktop')
 
-$lnk1 = $ws.CreateShortcut(("$desktop\Kiosk Exit Guard.lnk"))
+$lnk1 = $ws.CreateShortcut(("$desktop\Pause SK Filter.lnk"))
 $lnk1.TargetPath = '%s'
+$lnk1.Arguments = '--pause'
 $lnk1.WorkingDirectory = '%s'
 $lnk1.IconLocation = ('%s' + ',0')
-$lnk1.Description = 'Kiosk Exit Guard - kiosk lockdown controller'
+$lnk1.Description = 'Pause the SK Filter for a set time (password required)'
 $lnk1.Save()
 
-$lnk2 = $ws.CreateShortcut(("$desktop\Pause SK Filter.lnk"))
+$lnk2 = $ws.CreateShortcut(("$desktop\Resume SK Filter.lnk"))
 $lnk2.TargetPath = '%s'
-$lnk2.Arguments = '--pause'
+$lnk2.Arguments = '--resume'
 $lnk2.WorkingDirectory = '%s'
 $lnk2.IconLocation = ('%s' + ',0')
-$lnk2.Description = 'Pause the SK Filter for a set time'
+$lnk2.Description = 'End the current pause and re-activate the SK Filter (no password needed)'
 $lnk2.Save()
-`, exeQ, workDir, exeQ, exeQ, workDir, exeQ)
+
+$lnk3 = $ws.CreateShortcut(("$desktop\Uninstall SK Filter.lnk"))
+$lnk3.TargetPath = '%s'
+$lnk3.Arguments = '--uninstall'
+$lnk3.WorkingDirectory = '%s'
+$lnk3.IconLocation = ('%s' + ',0')
+$lnk3.Description = 'Remove the SK Filter (password required)'
+$lnk3.Save()
+`, exeQ, workDir, exeQ, exeQ, workDir, exeQ, exeQ, workDir, exeQ)
 	cmd := exec.Command("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps)
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -861,6 +897,9 @@ const firstRunHTML = `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"
   .btn-primary { background: #38bdf8; color: #0b1220; }
   .btn-primary:hover:not(:disabled) { background: #7dd3fc; }
   .btn-primary:active:not(:disabled) { transform: translateY(1px); }
+  .btn-secondary { background: transparent; color: #94a3b8;
+    border: 1px solid rgba(148, 163, 184, 0.3); }
+  .btn-secondary:hover { color: #f1f5f9; border-color: rgba(148, 163, 184, 0.55); }
   .steps { display: flex; gap: 1rem; margin-bottom: 1.5rem; padding: 0.85rem 1rem;
     background: rgba(15, 23, 42, 0.5); border-radius: 8px; border: 1px solid rgba(148, 163, 184, 0.12);
     font-size: 0.78rem; color: #94a3b8; }
@@ -898,6 +937,7 @@ const firstRunHTML = `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"
     <div class="error" id="error"></div>
 
     <div class="actions">
+      <button class="btn-secondary" onclick="cancel()">Cancel</button>
       <button class="btn-primary" id="submit" onclick="submit()">Continue</button>
     </div>
   </div>
@@ -926,8 +966,10 @@ const firstRunHTML = `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"
     btn.textContent = 'Saving…';
     window.kgSubmit(pw1, url);
   }
+  function cancel() { window.kgCancel(); }
   document.addEventListener('keydown', function(e) {
-    if (e.key === 'Enter') { e.preventDefault(); submit(); }
+    if (e.key === 'Enter')  { e.preventDefault(); submit(); }
+    if (e.key === 'Escape') { e.preventDefault(); cancel(); }
   });
 </script>
 </body></html>`
@@ -965,18 +1007,21 @@ func runFirstRunWizard() *firstRunInput {
 		result.ok = true
 		w.Terminate()
 	})
+	w.Bind("kgCancel", func() {
+		w.Terminate()
+	})
 
 	// Inject the default URL via a window-level global before the page
 	// runs so the input's value is correct on first paint.
 	w.Init(fmt.Sprintf(`window.__defaultURL = %q;`, loadKioskURL()))
 	w.SetHtml(firstRunHTML)
 	go func() {
-		for i := 0; i < 12; i++ {
-			time.Sleep(80 * time.Millisecond)
-			h := uintptr(w.Window())
-			if h != 0 {
-				makeWindowTopmostFront(h)
-			}
+		time.Sleep(220 * time.Millisecond)
+		h := uintptr(w.Window())
+		if h != 0 {
+			// First-run wizard runs before any kiosk window exists, so a
+			// plain topmost is fine — no need to strip the frame.
+			makeWindowTopmostFront(h)
 		}
 	}()
 	w.Run()
@@ -1379,6 +1424,12 @@ const passwordPromptHTML = `<!DOCTYPE html><html lang="en"><head><meta charset="
     if (e.key === 'Enter')  { e.preventDefault(); submit(); }
     if (e.key === 'Escape') { e.preventDefault(); cancel(); }
   });
+  // Catch Alt+F4 at the document level so the WebView2 host can't be
+  // closed by keyboard either. Cancel button + Escape remain the only
+  // dismissal paths.
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'F4' && e.altKey) { e.preventDefault(); cancel(); }
+  }, true);
   function submit() { window.kgSubmit(input.value); }
   function cancel() { window.kgCancel(); }
 </script>
@@ -1431,19 +1482,15 @@ func askPasswordModal(title, subtitle string) bool {
 
 	w.Init(fmt.Sprintf(`window.__title = %q; window.__subtitle = %q;`, title, subtitle))
 	w.SetHtml(passwordPromptHTML)
-	// The kiosk WebView2 window is fullscreen and HWND_TOPMOST. Without
-	// this, the password modal is created behind it and the user sees
-	// nothing happen. Forcing topmost + foreground brings our modal to
-	// the front. Done in a goroutine because Window() may not return a
-	// valid HWND until the WebView2 has finished setting itself up — we
-	// retry briefly while Run() spins up.
+	// One-shot, off the WebView2 message pump's thread: strip the title
+	// bar (no X to bypass the password gate) and force topmost+focus.
+	// The old retry loop hammered Win32 from a competing goroutine and
+	// hung the modal — we do it exactly once now, after a brief settle.
 	go func() {
-		for i := 0; i < 12; i++ {
-			time.Sleep(80 * time.Millisecond)
-			h := uintptr(w.Window())
-			if h != 0 {
-				makeWindowTopmostFront(h)
-			}
+		time.Sleep(220 * time.Millisecond)
+		h := uintptr(w.Window())
+		if h != 0 {
+			makeModalFrameless(h)
 		}
 	}()
 	w.Run()
@@ -1545,7 +1592,108 @@ func promptAndPause() {
 	))
 }
 
-// ---------- desktop button (--pause) handler ----------
+// ---------- desktop button handlers ----------
+
+// runResumeInvocation is the entry point for `kiosk-exit-guard.exe --resume`,
+// wired to the "Resume SK Filter" desktop shortcut. Ending a pause early
+// makes the system more locked-down, not less, so this is intentionally
+// NOT password-gated — anyone can resume. Pausing still needs the
+// password.
+func runResumeInvocation() {
+	// Clear the pause file. The controller's syncFilterStateLoop picks
+	// this up within 2s and runs autoReenableFilterMode for us; we also
+	// re-apply blocks directly so the security state snaps back fast.
+	setPauseUntil(time.Time{})
+	applyBrowserBlocks()
+	applyLockdown()
+	cancelPauseExpiry()
+
+	showTimedInfo("SK Filter resumed.\nKiosk will return within a few seconds.")
+}
+
+// runUninstallInvocation is the entry point for `--uninstall`, wired to
+// the "Uninstall SK Filter" desktop shortcut. Password-gated. Removes:
+//   - HKCU lockdown registry values
+//   - HKLM Chrome / Edge IFEO blocks
+//   - HKLM password + URL config (the entire KioskExitGuard key)
+//   - The KioskExitGuard scheduled task
+//   - All desktop shortcuts (incl. itself)
+//   - filter_mode.state, pause_until.state, legacy password.hash files
+//
+// Does NOT delete the exe itself — admin handles that manually.
+func runUninstallInvocation() {
+	migrateLegacyHash()
+	hash, err := loadHash()
+	if err != nil || len(hash) == 0 {
+		_ = zenity.Error(
+			"SK Filter is not configured. Nothing to uninstall.",
+			zenity.Title("SK Filter"),
+		)
+		os.Exit(1)
+	}
+	storedHash = hash
+
+	if !askPasswordModal(
+		"Uninstall the SK Filter?",
+		"You will be asked to confirm. After this completes, the kiosk-exit-guard.exe binary remains on disk — delete it manually if you want full removal.",
+	) {
+		showFailedToast()
+		os.Exit(1)
+	}
+	if err := zenity.Question(
+		"Are you sure?\n\nThis removes:\n  • Chrome / Edge IFEO blocks\n  • Task Manager / Run dialog policies\n  • Stored password and kiosk URL\n  • Scheduled task\n  • Desktop shortcuts\n\nThe SK Filter will no longer enforce anything after this.",
+		zenity.Title("SK Filter — Uninstall"),
+		zenity.OKLabel("Uninstall"),
+		zenity.CancelLabel("Keep installed"),
+	); err != nil {
+		// User clicked Cancel / closed.
+		return
+	}
+
+	// Tear down everything we put in place.
+	removeLockdown()
+	removeIFEOBlock("chrome.exe")
+	removeIFEOBlock("msedge.exe")
+	if p := findOurWebViewChild(); p != nil {
+		_ = p.Kill()
+	}
+	// Wipe HKLM key (values + key itself).
+	if k, oErr := registry.OpenKey(registry.LOCAL_MACHINE, regAppKey, registry.ALL_ACCESS); oErr == nil {
+		_ = k.DeleteValue(regHashValue)
+		_ = k.DeleteValue(regURLValue)
+		k.Close()
+	}
+	_ = registry.DeleteKey(registry.LOCAL_MACHINE, regAppKey)
+	// Scheduled task.
+	cmd := exec.Command("schtasks", "/Delete", "/F", "/TN", taskName)
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+	_ = cmd.Run()
+	// State files next to exe.
+	for _, fn := range []string{stateFileName, pauseFileName, hashFileName, kioskURLFileName} {
+		if p, err := nextToExe(fn); err == nil {
+			_ = os.Remove(p)
+		}
+	}
+	// Desktop shortcuts.
+	removeDesktopShortcuts()
+
+	_ = zenity.Info(
+		"SK Filter uninstalled.\n\nDelete kiosk-exit-guard.exe manually to complete removal.\nYou may want to reinstall Chrome from google.com/chrome if you use it.",
+		zenity.Title("SK Filter"),
+	)
+}
+
+func removeDesktopShortcuts() {
+	ps := `
+$desktop = [Environment]::GetFolderPath('Desktop')
+foreach ($n in @('Kiosk Exit Guard.lnk','Pause SK Filter.lnk','Resume SK Filter.lnk','Uninstall SK Filter.lnk')) {
+    Remove-Item -Path (Join-Path $desktop $n) -Force -ErrorAction SilentlyContinue
+}
+`
+	cmd := exec.Command("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps)
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+	_ = cmd.Run()
+}
 
 // runPauseInvocation is the entry point for `kiosk-exit-guard.exe --pause`,
 // which is wired to the "Pause SK Filter" desktop shortcut. It performs
@@ -1652,11 +1800,23 @@ func main() {
 	}
 
 	// --pause: triggered by the "Pause SK Filter" desktop shortcut.
-	// Shows the password modal + duration picker in a fresh elevated
-	// process, writes the pause state, and exits. The running controller
-	// picks the change up via syncFilterStateLoop.
 	if len(os.Args) > 1 && os.Args[1] == "--pause" {
 		runPauseInvocation()
+		return
+	}
+
+	// --resume: triggered by the "Resume SK Filter" desktop shortcut.
+	// No password — resuming makes the system more locked-down.
+	if len(os.Args) > 1 && os.Args[1] == "--resume" {
+		runResumeInvocation()
+		return
+	}
+
+	// --uninstall: triggered by the "Uninstall SK Filter" desktop
+	// shortcut. Password-gated, then a confirm dialog before tearing
+	// everything down.
+	if len(os.Args) > 1 && os.Args[1] == "--uninstall" {
+		runUninstallInvocation()
 		return
 	}
 
