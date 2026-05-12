@@ -53,7 +53,7 @@ import (
 
 // currentVersion must be kept in sync with versioninfo.json. Used by the
 // --update flow to compare against the latest GitHub release tag.
-const currentVersion = "1.0.1"
+const currentVersion = "1.0.2"
 
 // ---------- constants ----------
 
@@ -1783,42 +1783,79 @@ func runUninstallInvocation() {
 		return
 	}
 
-	// Tear down everything we put in place.
+	// Order matters here. Earlier versions ran teardown then killed the
+	// controller — but the running controller's watchdog kept relaunching
+	// the kiosk during the teardown, and on some Windows builds
+	// schtasks /Delete silently refuses while the task's process is alive.
+	// Now: kill processes FIRST, then end+delete the task, then wipe state.
+
+	var failures []string
+
+	// 1. Kill the controller + any --webview child it spawned. Belt and
+	// suspenders: use both gopsutil and taskkill. selfPID is skipped.
+	killRunningController()
+	tkCmd := exec.Command("taskkill", "/F", "/IM", "kiosk-exit-guard.exe",
+		"/FI", fmt.Sprintf("PID ne %d", os.Getpid()))
+	tkCmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+	_ = tkCmd.Run()
+	time.Sleep(300 * time.Millisecond) // let TerminateProcess settle
+
+	// 2. End any running instance of the scheduled task, then delete it.
+	endCmd := exec.Command("schtasks", "/End", "/TN", taskName)
+	endCmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+	_ = endCmd.Run()
+	delCmd := exec.Command("schtasks", "/Delete", "/F", "/TN", taskName)
+	delCmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+	if delOut, delErr := delCmd.CombinedOutput(); delErr != nil {
+		out := strings.TrimSpace(string(delOut))
+		// 'task not found' is fine — it means the task is already gone.
+		if !strings.Contains(out, "cannot find") && !strings.Contains(strings.ToLower(out), "does not exist") {
+			failures = append(failures, fmt.Sprintf("schtasks /Delete failed: %v\n  %s", delErr, out))
+		}
+	}
+
+	// 3. Tear down lockdown registry state.
 	removeLockdown()
 	removeIFEOBlock("chrome.exe")
 	removeIFEOBlock("msedge.exe")
-	if p := findOurWebViewChild(); p != nil {
-		_ = p.Kill()
-	}
-	// Wipe HKLM key (values + key itself).
+
+	// 4. Wipe the HKLM config key.
 	if k, oErr := registry.OpenKey(registry.LOCAL_MACHINE, regAppKey, registry.ALL_ACCESS); oErr == nil {
 		_ = k.DeleteValue(regHashValue)
 		_ = k.DeleteValue(regURLValue)
 		k.Close()
 	}
 	_ = registry.DeleteKey(registry.LOCAL_MACHINE, regAppKey)
-	// Scheduled task.
-	cmd := exec.Command("schtasks", "/Delete", "/F", "/TN", taskName)
-	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
-	_ = cmd.Run()
-	// State files next to exe.
+
+	// 5. Delete state files next to the exe.
 	for _, fn := range []string{stateFileName, pauseFileName, hashFileName, kioskURLFileName} {
 		if p, err := nextToExe(fn); err == nil {
 			_ = os.Remove(p)
 		}
 	}
-	// Desktop shortcuts.
+
+	// 6. Remove desktop shortcuts.
 	removeDesktopShortcuts()
 
-	// Find and kill the running controller process. Without this, the
-	// in-memory storedHash + filterMode survive the uninstall and the
-	// controller keeps enforcing the filter from cached state.
-	killRunningController()
+	// 7. Verify the task is actually gone.
+	verifyCmd := exec.Command("schtasks", "/Query", "/TN", taskName)
+	verifyCmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+	if verifyOut, verifyErr := verifyCmd.CombinedOutput(); verifyErr == nil {
+		// Query succeeded → task still exists!
+		failures = append(failures,
+			fmt.Sprintf("Scheduled task %q still exists after delete attempt:\n  %s",
+				taskName, strings.TrimSpace(string(verifyOut))))
+	}
 
-	_ = zenity.Info(
-		"SK Filter uninstalled.\n\nDelete kiosk-exit-guard.exe manually to complete removal.\nYou may want to reinstall Chrome from google.com/chrome if you use it.",
-		zenity.Title("SK Filter"),
-	)
+	msg := "SK Filter uninstalled."
+	if len(failures) > 0 {
+		msg += "\n\nSome teardown steps reported errors:\n  • " +
+			strings.Join(failures, "\n  • ") +
+			"\n\nYou may need to manually clean those up via PowerShell/regedit."
+	}
+	msg += "\n\nDelete kiosk-exit-guard.exe manually to complete removal.\nReinstall Chrome from google.com/chrome if you use it."
+
+	_ = zenity.Info(msg, zenity.Title("SK Filter"))
 }
 
 // purgeLeftoverState wipes anything a prior install (or partial uninstall)
