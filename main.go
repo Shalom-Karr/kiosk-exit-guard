@@ -29,6 +29,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -54,7 +56,7 @@ import (
 
 // currentVersion must be kept in sync with versioninfo.json. Used by the
 // --update flow to compare against the latest GitHub release tag.
-const currentVersion = "1.0.5"
+const currentVersion = "1.0.6"
 
 // ---------- logging ----------
 
@@ -182,6 +184,7 @@ const (
 	regNoRun              = "NoRun"
 	regNoTrayContextMenu  = "NoTrayContextMenu"
 	regNoViewContextMenu  = "NoViewContextMenu"
+	regNoTaskbar          = "NoTaskbar" // hides the taskbar entirely when filter active
 
 	regAppKey         = `Software\KioskExitGuard`
 	regHashValue      = "PasswordHash"
@@ -239,7 +242,8 @@ type msgT struct {
 }
 
 var (
-	user32 = syscall.NewLazyDLL("user32.dll")
+	user32   = syscall.NewLazyDLL("user32.dll")
+	kernel32 = syscall.NewLazyDLL("kernel32.dll")
 
 	procSetWindowHookExW    = user32.NewProc("SetWindowsHookExW")
 	procUnhookWindowsHookEx = user32.NewProc("UnhookWindowsHookEx")
@@ -256,9 +260,24 @@ var (
 	procBringWindowToTop    = user32.NewProc("BringWindowToTop")
 	procGetDpiForSystem     = user32.NewProc("GetDpiForSystem")
 
+	procCreateMutexW = kernel32.NewProc("CreateMutexW")
+	procReleaseMutex = kernel32.NewProc("ReleaseMutex")
+	procCloseHandle  = kernel32.NewProc("CloseHandle")
+	procGetLastError = kernel32.NewProc("GetLastError")
+
 	storedHash []byte
 	promptOpen atomic.Bool
 	filterMode atomic.Bool
+
+	// hookPromptInFlight is set by hookCallback via CompareAndSwap to
+	// guarantee at most one re-inject goroutine spawn per blocked combo.
+	// promptOpen alone is insufficient because it isn't set until the
+	// spawned goroutine actually enters askPasswordModal — a second
+	// blocked combo arriving during that gap would race and overwrite
+	// pendingComboV. Cleared by the goroutine on exit. Non-hook prompt
+	// paths (promptAndPause, --reset, --uninstall, etc.) continue to
+	// CAS on promptOpen themselves; they don't touch this flag.
+	hookPromptInFlight atomic.Bool
 
 	// winKeyChord stays true while a Win key is held with no other key
 	// pressed since. On Win up, if it's still true → "Win alone" → prompt.
@@ -410,24 +429,53 @@ func loadKioskURL() string {
 	return defaultKioskURL
 }
 
+// isValidKioskURL accepts http://, https://, or file:// URLs with a non-
+// empty host/path. Trims and lowercases the scheme for comparison. We don't
+// require a fully-RFC-compliant URL — WebView2 is lenient — but reject the
+// common typo cases ("htttp://", missing scheme, plain "www.example.com")
+// that would silently land on a Chromium error page.
+func isValidKioskURL(u string) bool {
+	u = strings.TrimSpace(u)
+	if u == "" {
+		return false
+	}
+	low := strings.ToLower(u)
+	for _, prefix := range []string{"https://", "http://", "file:///"} {
+		if strings.HasPrefix(low, prefix) && len(u) > len(prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func promptForKioskURL() (string, error) {
 	current := loadKioskURL()
-	url, err := zenity.Entry(
-		"Enter the kiosk URL.\nThis is the page WebView2 will open in fullscreen.",
-		zenity.Title("kiosk-exit-guard — kiosk URL"),
-		zenity.EntryText(current),
-	)
-	if err != nil {
-		return "", err
+	for {
+		url, err := zenity.Entry(
+			"Enter the kiosk URL.\nThis is the page WebView2 will open in fullscreen.\n\nMust start with https://, http://, or file:///.",
+			zenity.Title("kiosk-exit-guard — kiosk URL"),
+			zenity.EntryText(current),
+		)
+		if err != nil {
+			return "", err
+		}
+		url = strings.TrimSpace(url)
+		if url == "" {
+			url = current
+		}
+		if !isValidKioskURL(url) {
+			_ = zenity.Warning(
+				"That doesn't look like a valid URL.\n\nPlease enter something starting with https://, http://, or file:///.",
+				zenity.Title("kiosk-exit-guard — kiosk URL"),
+			)
+			current = url // keep what they typed so they can edit it
+			continue
+		}
+		if err := saveKioskURLToRegistry(url); err != nil {
+			return "", err
+		}
+		return url, nil
 	}
-	url = strings.TrimSpace(url)
-	if url == "" {
-		url = current
-	}
-	if err := saveKioskURLToRegistry(url); err != nil {
-		return "", err
-	}
-	return url, nil
 }
 
 // ---------- filter mode + pause persistence ----------
@@ -563,10 +611,16 @@ func applyLockdown() {
 	_ = setPolicyDWORD(regPolicyExplorer, regNoRun, 1)
 	// Disable right-click context menus on the taskbar and the desktop.
 	// Otherwise the user could right-click the kiosk's taskbar thumbnail
-	// and pick "Close Window", bypassing our Alt+F4 password gate. Same
-	// menu also exposes Task Manager from some shells.
+	// and pick "Close Window", bypassing our Alt+F4 password gate.
 	_ = setPolicyDWORD(regPolicyExplorer, regNoTrayContextMenu, 1)
 	_ = setPolicyDWORD(regPolicyExplorer, regNoViewContextMenu, 1)
+	// Hide the taskbar entirely. Without this, a single LEFT click on the
+	// Start button opens Start menu — from which Settings/File Explorer
+	// are reachable. The Win-key keyboard hook can't catch a mouse click.
+	_ = setPolicyDWORD(regPolicyExplorer, regNoTaskbar, 1)
+	// NoTaskbar requires Explorer to reload its policy cache. Restart
+	// Explorer so the change takes effect immediately.
+	restartExplorer()
 }
 
 func removeLockdown() {
@@ -574,6 +628,19 @@ func removeLockdown() {
 	_ = deletePolicyValue(regPolicyExplorer, regNoRun)
 	_ = deletePolicyValue(regPolicyExplorer, regNoTrayContextMenu)
 	_ = deletePolicyValue(regPolicyExplorer, regNoViewContextMenu)
+	_ = deletePolicyValue(regPolicyExplorer, regNoTaskbar)
+	// Bring the taskbar back immediately rather than waiting for next
+	// Explorer restart.
+	restartExplorer()
+}
+
+// restartExplorer kills explorer.exe and lets Windows auto-relaunch it
+// (the Shell registry entry triggers respawn). Needed to flush taskbar
+// policy changes (NoTaskbar) which Explorer caches at startup.
+func restartExplorer() {
+	cmd := exec.Command("cmd.exe", "/c", "taskkill /F /IM explorer.exe & start explorer.exe")
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+	_ = cmd.Run()
 }
 
 // ---------- IFEO browser launch block ----------
@@ -605,9 +672,29 @@ func removeIFEOBlock(targetExe string) {
 	_ = k.DeleteValue("Debugger")
 }
 
+// blockedExes lists every executable redirected to --silent-exit via IFEO
+// Debugger. Both browsers (chrome/msedge) and the Windows accessibility
+// helpers, which expose dialog-driven hyperlinks into Windows Settings
+// when invoked (e.g. five-times-Shift opens Sticky Keys' setup dialog).
+var blockedExes = []string{
+	"chrome.exe", "msedge.exe",
+	"sethc.exe",   // Sticky Keys (5x Shift)
+	"osk.exe",     // On-Screen Keyboard
+	"narrator.exe", // Narrator
+	"utilman.exe", // Ease of Access launcher (Win+U)
+	"magnify.exe", // Magnifier
+}
+
 func applyBrowserBlocks() {
-	_ = setIFEOBlock("chrome.exe")
-	_ = setIFEOBlock("msedge.exe")
+	for _, exe := range blockedExes {
+		_ = setIFEOBlock(exe)
+	}
+}
+
+func removeBrowserBlocks() {
+	for _, exe := range blockedExes {
+		removeIFEOBlock(exe)
+	}
 }
 
 // ---------- Chrome silent uninstall ----------
@@ -634,11 +721,21 @@ func uninstallChrome() error {
 		if err != nil || uninstallStr == "" {
 			continue
 		}
-		cmd := exec.Command("cmd", "/C", uninstallStr+" --force-uninstall --do-not-launch-chrome")
+		// Chrome's uninstaller can hang behind a "close all Chrome windows"
+		// prompt on some builds — bound the wait so first-run setup doesn't
+		// appear frozen. If the uninstaller is still running after 60s we
+		// kill it and continue; the IFEO block in the next step is what
+		// actually prevents Chrome from being usable as a kiosk-escape, so
+		// a leftover Chrome install is non-fatal.
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		cmd := exec.CommandContext(ctx, "cmd", "/C", uninstallStr+" --force-uninstall --do-not-launch-chrome")
 		cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
-		if err := cmd.Run(); err == nil {
+		err = cmd.Run()
+		cancel()
+		if err == nil {
 			return nil
 		}
+		logf("chrome uninstaller did not exit cleanly: %v (continuing — IFEO block still applies)", err)
 	}
 	return nil // not found is fine
 }
@@ -780,10 +877,35 @@ type keybdInput struct {
 }
 
 const (
-	inputKeyboard   = 1
-	keyeventfKeyUp  = 0x0002
-	kioskMarkerCode = 0xC0DE
+	inputKeyboard  = 1
+	keyeventfKeyUp = 0x0002
 )
+
+// kioskMarker is a per-process, cryptographically-random sentinel value
+// stuffed into SendInput's ExtraInfo on every key event we re-inject.
+// hookCallback recognizes events carrying this value as our own and lets
+// them pass through. Using a random per-process value (instead of a
+// fixed compile-time constant) prevents a hostile external process from
+// guessing the marker and bypassing the hook by calling SendInput with
+// the magic value in ExtraInfo. Populated in init() before the LL hook
+// is installed; never logged.
+var kioskMarker uintptr
+
+func init() {
+	var buf [8]byte
+	for {
+		if _, err := rand.Read(buf[:]); err != nil {
+			// crypto/rand failure on Windows is extraordinarily unlikely;
+			// panic so the controller doesn't run with a zero marker.
+			panic("kiosk-exit-guard: crypto/rand failed: " + err.Error())
+		}
+		v := binary.LittleEndian.Uint64(buf[:])
+		if v != 0 {
+			kioskMarker = uintptr(v)
+			return
+		}
+	}
+}
 
 // buildKey constructs an INPUT for a single key event. The kiosk marker
 // is stuffed into ExtraInfo so our own hook recognizes these as our own
@@ -796,7 +918,7 @@ func buildKey(vk uint32, up bool) winInput {
 	if up {
 		k.Flags = keyeventfKeyUp
 	}
-	k.ExtraInfo = uintptr(kioskMarkerCode)
+	k.ExtraInfo = kioskMarker
 	return in
 }
 
@@ -1293,13 +1415,74 @@ func runFirstRunWizard() *firstRunInput {
 	return result
 }
 
+// firstRunZenityFallback collects password + URL via plain zenity dialogs
+// when WebView2 isn't available. Same output shape as runFirstRunWizard.
+func firstRunZenityFallback() *firstRunInput {
+	_ = zenity.Info(
+		"WebView2 is not available, so we'll use simple dialogs for setup.\n\nYou'll be asked for an admin password (twice) and the kiosk URL.",
+		zenity.Title("kiosk-exit-guard — first run"),
+	)
+	pw1, err := zenity.Entry(
+		"Choose an admin password.\nKeep it secret — anyone with it can pause the kiosk, change its URL, or uninstall the filter.",
+		zenity.Title("kiosk-exit-guard — set password"),
+		zenity.HideText(),
+	)
+	if err != nil || pw1 == "" {
+		return nil
+	}
+	pw2, err := zenity.Entry(
+		"Re-enter the password to confirm.",
+		zenity.Title("kiosk-exit-guard — confirm"),
+		zenity.HideText(),
+	)
+	if err != nil {
+		return nil
+	}
+	if pw1 != pw2 {
+		_ = zenity.Error("Passwords did not match. Run kiosk-exit-guard.exe again to retry.", zenity.Title("kiosk-exit-guard"))
+		return nil
+	}
+	url, err := zenity.Entry(
+		"Enter the kiosk URL.\nMust start with https://, http://, or file:///.",
+		zenity.Title("kiosk-exit-guard — kiosk URL"),
+		zenity.EntryText(defaultKioskURL),
+	)
+	if err != nil {
+		return nil
+	}
+	url = strings.TrimSpace(url)
+	if url == "" {
+		url = defaultKioskURL
+	}
+	if !isValidKioskURL(url) {
+		_ = zenity.Error("That URL is not valid. Run kiosk-exit-guard.exe again to retry.", zenity.Title("kiosk-exit-guard"))
+		return nil
+	}
+	return &firstRunInput{password: pw1, url: url, ok: true}
+}
+
 // firstRunWithWizard runs the full first-run sequence using the WebView2
 // wizard for password + URL, then performs the system-setup steps
 // (Chrome uninstall, IFEO blocks, Task Scheduler, desktop shortcut).
 // Returns whether setup completed cleanly.
 func firstRunWithWizard() bool {
 	input := runFirstRunWizard()
-	if input == nil || !input.ok {
+	if input == nil {
+		// WebView2 failed entirely — fall back to plain zenity so the
+		// admin isn't stranded on a stripped-down image.
+		input = firstRunZenityFallback()
+		if input == nil || !input.ok {
+			_ = zenity.Info(
+				"Setup was cancelled. Re-launch kiosk-exit-guard.exe to try again.",
+				zenity.Title("kiosk-exit-guard"),
+			)
+			return false
+		}
+	} else if !input.ok {
+		_ = zenity.Info(
+			"Setup was cancelled. Re-launch kiosk-exit-guard.exe to try again.",
+			zenity.Title("kiosk-exit-guard"),
+		)
 		return false
 	}
 
@@ -1564,7 +1747,7 @@ func hookCallback(nCode int32, wParam uintptr, lParam uintptr) uintptr {
 	if nCode >= 0 {
 		kb := (*kbdLLHookStruct)(unsafe.Pointer(lParam))
 		injected := (kb.Flags & llkhfInject) != 0
-		ourInjection := kb.DwExtraInfo == uintptr(kioskMarkerCode)
+		ourInjection := kb.DwExtraInfo == kioskMarker
 		if !injected && !ourInjection {
 			isKeyDown := wParam == wmKeyDown || wParam == wmSysKeyDown
 			isKeyUp := wParam == wmKeyUp || wParam == wmSysKeyUp
@@ -1580,7 +1763,14 @@ func hookCallback(nCode int32, wParam uintptr, lParam uintptr) uintptr {
 				} else if isKeyUp {
 					wasAlone := winKeyChord.Load()
 					winKeyChord.Store(false)
-					if wasAlone && !promptOpen.Load() {
+					// CAS gate the goroutine spawn from the hook thread
+					// itself so a second blocked combo can't race in
+					// between our Load() and the goroutine setting
+					// promptOpen — that race would overwrite
+					// pendingComboV and the wrong combo would be
+					// re-injected. The goroutine clears
+					// hookPromptInFlight on exit.
+					if wasAlone && hookPromptInFlight.CompareAndSwap(false, true) {
 						pendingComboMu.Lock()
 						pendingComboV = &pendingCombo{vk: kb.VkCode, modifiers: nil}
 						pendingComboMu.Unlock()
@@ -1611,15 +1801,28 @@ func hookCallback(nCode int32, wParam uintptr, lParam uintptr) uintptr {
 					if isAlwaysAllowedCombo(kb.VkCode) {
 						// fall through to procCallNextHookEx
 					} else if !isModifierVK(kb.VkCode) && (ctrlDown() || winDown() || altDown()) {
-						if !promptOpen.Load() {
+						// Snapshot the live modifier state *here* on the
+						// hook thread, synchronously. Capturing it
+						// inside the goroutine instead would race: if
+						// the user releases Ctrl/Win/Alt while the
+						// WebView2 modal is still spawning,
+						// capturedModifiers() would observe an empty
+						// modifier set and the re-injection would send
+						// the bare key (e.g. Win+R degenerates to "R"
+						// typed into whatever has focus).
+						mods := capturedModifiers()
+						if hookPromptInFlight.CompareAndSwap(false, true) {
 							pendingComboMu.Lock()
 							pendingComboV = &pendingCombo{
 								vk:        kb.VkCode,
-								modifiers: capturedModifiers(),
+								modifiers: mods,
 							}
 							pendingComboMu.Unlock()
 							go promptAndReinject()
 						}
+						// Always swallow even if a prompt is already open —
+						// otherwise a second blocked combo while the modal
+						// is up would leak through to Explorer.
 						return 1
 					}
 				}
@@ -1727,21 +1930,98 @@ const passwordPromptHTML = `<!DOCTYPE html><html lang="en"><head><meta charset="
   }, true);
   function submit() { window.kgSubmit(input.value); }
   function cancel() { window.kgCancel(); }
+  // kgShowError is called from Go after a wrong-password attempt to keep
+  // the modal open and show the error inline rather than spawning a toast.
+  window.kgShowError = function(msg) {
+    var el = document.getElementById('err');
+    el.textContent = msg;
+    el.classList.add('show');
+    input.value = '';
+    input.focus();
+  };
 </script>
 </body></html>`
 
+// globalPromptMutexName is the well-known name of a system-wide mutex
+// used to serialize password modals across processes. Without it, two
+// desktop-shortcut clicks (or a click + hotkey) can stack two fullscreen
+// modals on top of each other, confusing the user and racing on
+// pendingComboV.
+const globalPromptMutexName = `Global\KioskExitGuardPromptMutex`
+
+const (
+	errorAlreadyExists = 183
+)
+
+// acquireGlobalPromptLock tries to take the cross-process modal mutex.
+// Returns (handle, true) if we own it, (0, false) if another process
+// already does. The handle must be passed to releaseGlobalPromptLock.
+//
+// Uses a session-global named mutex so two --pause processes can't open
+// stacked password modals.
+func acquireGlobalPromptLock() (uintptr, bool) {
+	if procCreateMutexW.Find() != nil {
+		return 0, true // fail-open if kernel32 isn't loadable for some reason
+	}
+	name, err := syscall.UTF16PtrFromString(globalPromptMutexName)
+	if err != nil {
+		return 0, true
+	}
+	h, _, _ := procCreateMutexW.Call(0, 1 /* bInitialOwner */, uintptr(unsafe.Pointer(name)))
+	if h == 0 {
+		return 0, true // can't create — degrade gracefully
+	}
+	last, _, _ := procGetLastError.Call()
+	if last == errorAlreadyExists {
+		// Someone else owns it. We hold a handle but not ownership.
+		procCloseHandle.Call(h)
+		return 0, false
+	}
+	return h, true
+}
+
+func releaseGlobalPromptLock(h uintptr) {
+	if h == 0 {
+		return
+	}
+	procReleaseMutex.Call(h)
+	procCloseHandle.Call(h)
+}
+
+// passwordResult tells callers exactly how a password modal terminated so
+// they can distinguish cancel (silent) from wrong-password (show toast).
+type passwordResult int
+
+const (
+	pwOK       passwordResult = iota // submitted, hash matches
+	pwWrong                          // submitted, hash mismatch
+	pwCancel                         // user dismissed (Cancel / Esc / window close)
+)
+
 // askPasswordModal shows a branded, autofocused WebView2 password dialog.
-// Returns (ok=true) only if the user entered a password that matches the
-// stored bcrypt hash.
-func askPasswordModal(title, subtitle string) bool {
+// Returns pwOK only if the entered password matches the stored bcrypt
+// hash. Callers should treat pwCancel as a silent dismissal and only
+// surface a "Wrong password" toast on pwWrong.
+func askPasswordModal(title, subtitle string) passwordResult {
 	if !promptOpen.CompareAndSwap(false, true) {
-		return false
+		return pwCancel
 	}
 	defer promptOpen.Store(false)
 
+	// Cross-process serialization: if another kiosk-exit-guard process
+	// already has a password modal open, don't stack a second one on top
+	// of it. Two stacked fullscreen modals look identical and the user
+	// can't tell which Cancel button belongs to which.
+	gh, gotLock := acquireGlobalPromptLock()
+	if !gotLock {
+		showTimedInfo("Another SK Filter prompt is already open.\nFinish that one first.")
+		return pwCancel
+	}
+	defer releaseGlobalPromptLock(gh)
+
 	var (
-		entered string
-		ok      bool
+		entered   string
+		submitted bool
 	)
 
 	w := webview2.NewWithOptions(webview2.WebViewOptions{
@@ -1760,16 +2040,47 @@ func askPasswordModal(title, subtitle string) bool {
 		pw, err := zenity.Entry(title+"\n"+subtitle,
 			zenity.Title("SK Filter"), zenity.HideText())
 		if err != nil {
-			return false
+			return pwCancel
 		}
-		return bcrypt.CompareHashAndPassword(storedHash, []byte(pw)) == nil
+		if bcrypt.CompareHashAndPassword(storedHash, []byte(pw)) == nil {
+			return pwOK
+		}
+		return pwWrong
 	}
 	defer w.Destroy()
 
+	// Retry inline: on wrong password we show the error in the modal's
+	// #err div and let the user try again, up to maxAttempts before
+	// returning pwWrong. This avoids spawning a separate WebView2 toast
+	// (slow on cold start) and keeps the password modal up so the user
+	// can see what they got wrong.
+	const maxAttempts = 3
+	var attempts int
+
 	w.Bind("kgSubmit", func(pw string) {
-		entered = pw
-		ok = true
-		w.Terminate()
+		attempts++
+		if bcrypt.CompareHashAndPassword(storedHash, []byte(pw)) == nil {
+			submitted = true
+			entered = pw
+			w.Terminate()
+			return
+		}
+		if attempts >= maxAttempts {
+			submitted = true
+			entered = pw // non-matching; final return below classifies as pwWrong
+			w.Terminate()
+			return
+		}
+		remaining := maxAttempts - attempts
+		var msg string
+		if remaining == 1 {
+			msg = "Wrong password. 1 attempt left."
+		} else {
+			msg = fmt.Sprintf("Wrong password. %d attempts left.", remaining)
+		}
+		w.Dispatch(func() {
+			w.Eval(fmt.Sprintf(`window.kgShowError && window.kgShowError(%q);`, msg))
+		})
 	})
 	w.Bind("kgCancel", func() {
 		w.Terminate()
@@ -1794,10 +2105,19 @@ func askPasswordModal(title, subtitle string) bool {
 	}()
 	w.Run()
 
-	if !ok {
-		return false
+	if !submitted {
+		return pwCancel
 	}
-	return bcrypt.CompareHashAndPassword(storedHash, []byte(entered)) == nil
+	if bcrypt.CompareHashAndPassword(storedHash, []byte(entered)) == nil {
+		return pwOK
+	}
+	return pwWrong
+}
+
+// askPasswordOK is a convenience for callers that only care about the
+// success path. Returns true only on pwOK.
+func askPasswordOK(title, subtitle string) bool {
+	return askPasswordModal(title, subtitle) == pwOK
 }
 
 // Backwards-compatible alias used by the toggle and reset paths.
@@ -1805,13 +2125,18 @@ func askPassword(label string) bool {
 	// Split the label on the first newline into title + subtitle for the
 	// modal layout. Callers like "Enter password to exit kiosk." pass a
 	// single line.
-	return askPasswordModal(label, "")
+	return askPasswordOK(label, "")
 }
 
 // promptAndReinject is the goroutine kicked off when the hook captures a
 // blocked combo. Verifies the password, then re-injects the original key
 // combo so the user's intended action goes through.
+//
+// hookPromptInFlight is set by hookCallback before this goroutine is
+// spawned; we clear it on exit so the next blocked combo can spawn a
+// fresh prompt.
 func promptAndReinject() {
+	defer hookPromptInFlight.Store(false)
 	pendingComboMu.Lock()
 	pc := pendingComboV
 	pendingComboMu.Unlock()
@@ -1819,7 +2144,7 @@ func promptAndReinject() {
 		return
 	}
 
-	verified := askPasswordModal(
+	result := askPasswordModal(
 		"This command has been locked by the SK Filter",
 		"Please enter your password to continue. The keystroke will go through once you unlock.",
 	)
@@ -1829,8 +2154,12 @@ func promptAndReinject() {
 	pendingComboV = nil
 	pendingComboMu.Unlock()
 
-	if !verified {
+	switch result {
+	case pwWrong:
 		showFailedToast()
+		return
+	case pwCancel:
+		// User dismissed — silent, no scary toast.
 		return
 	}
 	// Re-inject with a small delay so any in-flight key events the user
@@ -1859,15 +2188,19 @@ func promptAndPause() {
 		return
 	}
 
-	if !askPasswordModal(
+	switch askPasswordModal(
 		"Pause the SK Filter?",
 		"Edge will be allowed and the kiosk will close for the duration you choose. The filter resumes automatically when the timer ends.",
 	) {
+	case pwWrong:
 		showFailedToast()
+		return
+	case pwCancel:
 		return
 	}
 	dur, accepted := askPauseDuration()
 	if !accepted {
+		showTimedInfo("Pause cancelled.\nSK Filter is still active.")
 		return
 	}
 	if dur <= 0 {
@@ -1927,6 +2260,30 @@ func runLaunchKiosk() {
 // NOT password-gated — anyone can resume. Pausing still needs the
 // password.
 func runResumeInvocation() {
+	// If there's no pause in flight, no-op with feedback so a misclick is
+	// obvious rather than silently re-applying lockdown.
+	pu := loadPauseFromDisk()
+	if pu.IsZero() || !time.Now().Before(pu) {
+		showTimedInfo("SK Filter is already active.\nNothing to resume.")
+		return
+	}
+
+	// Light confirm — no password (resuming is the safe direction) but a
+	// "Yes/No" guards against accidental double-click on the shortcut
+	// during a long pause window.
+	remain := time.Until(pu).Round(time.Second)
+	if err := zenity.Question(
+		fmt.Sprintf(
+			"End the SK Filter pause now?\n\nThe pause has %s remaining (until %s).\nThe kiosk will return within a few seconds.",
+			remain, pu.Format("3:04 PM"),
+		),
+		zenity.Title("SK Filter — resume"),
+		zenity.OKLabel("Resume now"),
+		zenity.CancelLabel("Keep paused"),
+	); err != nil {
+		return
+	}
+
 	// Clear the pause file. The controller's syncFilterStateLoop picks
 	// this up within 2s and runs autoReenableFilterMode for us; we also
 	// re-apply blocks directly so the security state snaps back fast.
@@ -1960,12 +2317,15 @@ func runUninstallInvocation() {
 	}
 	storedHash = hash
 
-	if !askPasswordModal(
+	switch askPasswordModal(
 		"Uninstall the SK Filter?",
 		"You will be asked to confirm. After this completes, the kiosk-exit-guard.exe binary remains on disk — delete it manually if you want full removal.",
 	) {
+	case pwWrong:
 		showFailedToast()
 		os.Exit(1)
+	case pwCancel:
+		os.Exit(0)
 	}
 	if err := zenity.Question(
 		"Are you sure?\n\nThis removes:\n  • Chrome / Edge IFEO blocks\n  • Task Manager / Run dialog policies\n  • Stored password and kiosk URL\n  • Scheduled task\n  • Desktop shortcuts\n\nThe SK Filter will no longer enforce anything after this.",
@@ -2034,20 +2394,24 @@ func runUninstallInvocation() {
 	// 7. Verify the task is actually gone.
 	verifyCmd := exec.Command("schtasks", "/Query", "/TN", taskName)
 	verifyCmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
-	if verifyOut, verifyErr := verifyCmd.CombinedOutput(); verifyErr == nil {
+	if _, verifyErr := verifyCmd.CombinedOutput(); verifyErr == nil {
 		// Query succeeded → task still exists!
 		failures = append(failures,
-			fmt.Sprintf("Scheduled task %q still exists after delete attempt:\n  %s",
-				taskName, strings.TrimSpace(string(verifyOut))))
+			"The auto-start scheduled task could not be removed. "+
+				"Open Task Scheduler (taskschd.msc) and delete the task named \""+taskName+"\" manually.")
+	}
+	// Log the raw schtasks output for diagnosis but don't dump it on the user.
+	for _, f := range failures {
+		logf("uninstall warning: %s", f)
 	}
 
-	msg := "SK Filter uninstalled."
+	msg := "SK Filter uninstalled successfully."
 	if len(failures) > 0 {
-		msg += "\n\nSome teardown steps reported errors:\n  • " +
+		msg += "\n\nA few steps need manual cleanup:\n  • " +
 			strings.Join(failures, "\n  • ") +
-			"\n\nYou may need to manually clean those up via PowerShell/regedit."
+			"\n\nDetailed errors were written to kiosk-exit-guard.log."
 	}
-	msg += "\n\nDelete kiosk-exit-guard.exe manually to complete removal.\nReinstall Chrome from google.com/chrome if you use it."
+	msg += "\n\nNext steps:\n  • Delete kiosk-exit-guard.exe manually to finish removal.\n  • Reinstall Chrome from google.com/chrome if you use it."
 
 	_ = zenity.Info(msg, zenity.Title("SK Filter"))
 }
@@ -2204,30 +2568,67 @@ func runUpdateInvocation() {
 		return
 	}
 
-	if !askPasswordModal(
+	switch askPasswordModal(
 		"Install the update?",
 		fmt.Sprintf("Replacing the running kiosk-exit-guard.exe with v%s. Enter your admin password to confirm.", latest),
 	) {
+	case pwWrong:
 		showFailedToast()
+		return
+	case pwCancel:
 		return
 	}
 
 	tmpPath := filepath.Join(os.TempDir(), "kiosk-exit-guard.new.exe")
 	if err := downloadFile(downloadURL, tmpPath); err != nil {
-		_ = zenity.Error(fmt.Sprintf("Download failed: %v", err), zenity.Title("SK Filter — update"))
+		_ = zenity.Error(fmt.Sprintf("Download failed: %v\n\nCheck the device's internet connection and try again.", err), zenity.Title("SK Filter — update"))
 		return
 	}
 
 	exe, err := os.Executable()
 	if err != nil {
 		_ = zenity.Error(fmt.Sprintf("Could not locate current exe: %v", err), zenity.Title("SK Filter — update"))
+		_ = os.Remove(tmpPath)
 		return
 	}
+
+	// CRITICAL: stop the running controller before renaming. Windows holds
+	// an exclusive lock on a running .exe, so os.Rename(exe, ...) returns
+	// "access is denied" while the controller is alive. End the scheduled
+	// task (kills the controller via Task Scheduler) and any leftover
+	// processes, then give Windows a moment to release the file handle.
+	endCmd := exec.Command("schtasks", "/End", "/TN", taskName)
+	endCmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+	_ = endCmd.Run()
+	killRunningController()
+	tkCmd := exec.Command("taskkill", "/F", "/IM", "kiosk-exit-guard.exe",
+		"/FI", fmt.Sprintf("PID ne %d", os.Getpid()))
+	tkCmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+	_ = tkCmd.Run()
+	time.Sleep(500 * time.Millisecond)
+
 	oldPath := exe + ".old"
 	_ = os.Remove(oldPath) // clean any leftover
-	if err := os.Rename(exe, oldPath); err != nil {
+
+	// Retry the rename a few times — even after killing the controller, the
+	// file handle can linger briefly while Windows finishes tearing the
+	// process down.
+	var renameErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		renameErr = os.Rename(exe, oldPath)
+		if renameErr == nil {
+			break
+		}
+		time.Sleep(400 * time.Millisecond)
+	}
+	if renameErr != nil {
+		_ = os.Remove(tmpPath)
+		// Best-effort: restart the controller we just killed.
+		runCmd := exec.Command("schtasks", "/Run", "/TN", taskName)
+		runCmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+		_ = runCmd.Run()
 		_ = zenity.Error(
-			fmt.Sprintf("Could not move current exe aside:\n%v\n\nThe running controller may be holding the file. Try again in a moment.", err),
+			fmt.Sprintf("Could not move current exe aside:\n%v\n\nThe SK Filter has been restarted at the previous version. Try the update again in a minute.", renameErr),
 			zenity.Title("SK Filter — update"),
 		)
 		return
@@ -2235,19 +2636,19 @@ func runUpdateInvocation() {
 	if err := os.Rename(tmpPath, exe); err != nil {
 		// Rollback: put the old exe back where it was.
 		_ = os.Rename(oldPath, exe)
-		_ = zenity.Error(fmt.Sprintf("Install failed: %v\n\nReverted to previous version.", err), zenity.Title("SK Filter — update"))
+		// Re-launch the controller so the device isn't left unprotected.
+		runCmd := exec.Command("schtasks", "/Run", "/TN", taskName)
+		runCmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+		_ = runCmd.Run()
+		_ = zenity.Error(fmt.Sprintf("Install failed: %v\n\nReverted to previous version and restarted the SK Filter.", err), zenity.Title("SK Filter — update"))
 		return
 	}
 
-	// Restart the scheduled task so the new exe loads. /End kills the
-	// running controller; /Run launches a fresh instance from the new
-	// binary at the same path.
-	for _, op := range [][]string{{"/End", "/TN", taskName}, {"/Run", "/TN", taskName}} {
-		cmd := exec.Command("schtasks", op...)
-		cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
-		_ = cmd.Run()
-		time.Sleep(400 * time.Millisecond)
-	}
+	// Re-launch the scheduled task so the new exe loads.
+	runCmd := exec.Command("schtasks", "/Run", "/TN", taskName)
+	runCmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+	_ = runCmd.Run()
+	time.Sleep(400 * time.Millisecond)
 
 	_ = zenity.Info(
 		fmt.Sprintf("Updated to v%s.\n\nSK Filter reloaded automatically.\nThe previous version was saved as kiosk-exit-guard.exe.old next to the new exe.", latest),
@@ -2288,15 +2689,30 @@ func runPauseInvocation() {
 	}
 	storedHash = hash
 
-	if !askPasswordModal(
+	// Already paused? Show status read-out and exit — don't silently
+	// overwrite a longer in-flight pause with a new (possibly shorter) one.
+	if pu := loadPauseFromDisk(); !pu.IsZero() && time.Now().Before(pu) {
+		remain := time.Until(pu).Round(time.Second)
+		showTimedInfo(fmt.Sprintf(
+			"SK Filter is already paused.\nResumes in %s (at %s).\n\nUse \"Resume SK Filter\" to end early.",
+			remain, pu.Format("3:04 PM"),
+		))
+		return
+	}
+
+	switch askPasswordModal(
 		"Pause the SK Filter?",
 		"Edge will be allowed and the kiosk will close for the duration you choose. The filter resumes automatically when the timer ends.",
 	) {
+	case pwWrong:
 		showFailedToast()
 		os.Exit(1)
+	case pwCancel:
+		os.Exit(0)
 	}
 	dur, accepted := askPauseDuration()
 	if !accepted || dur <= 0 {
+		showTimedInfo("Pause cancelled.\nSK Filter is still active.")
 		return
 	}
 
@@ -2346,6 +2762,15 @@ func syncFilterStateLoop() {
 			removeIFEOBlock("chrome.exe")
 			removeIFEOBlock("msedge.exe")
 			killWebViewChild()
+		case paused && !filterMode.Load():
+			// Already paused. Detect a pause extension/replacement from
+			// another process and re-arm the timer so we don't auto-resume
+			// using the old (shorter) deadline.
+			if pu.UnixNano() != pauseUntilNano.Load() {
+				pauseUntilNano.Store(pu.UnixNano())
+				schedulePauseExpiry(time.Until(pu))
+				logf("pause re-armed from external write: now resumes at %s", pu.Format("3:04 PM"))
+			}
 		case !paused && !filterMode.Load():
 			// Pause window ended (timer fired in another process, or the
 			// file was manually cleared). Bring the lockdown back.
@@ -2430,12 +2855,15 @@ func main() {
 			os.Exit(1)
 		}
 		storedHash = hash
-		if !askPasswordModal(
+		switch askPasswordModal(
 			"Reset SK Filter",
 			"Enter your password to clear the registry lockdown, the Chrome/Edge IFEO blocks, and the filter-mode state.",
 		) {
+		case pwWrong:
 			showFailedToast()
 			os.Exit(1)
+		case pwCancel:
+			os.Exit(0)
 		}
 		removeLockdown()
 		removeIFEOBlock("chrome.exe")
@@ -2469,14 +2897,23 @@ func main() {
 			os.Exit(1)
 		}
 		storedHash = hash
-		if !askPasswordModal(
+		switch askPasswordModal(
 			"Change the kiosk URL?",
 			"Enter the admin password to confirm.",
 		) {
+		case pwWrong:
 			showFailedToast()
 			os.Exit(1)
+		case pwCancel:
+			os.Exit(0)
 		}
-		if _, err := promptForKioskURL(); err != nil {
+		newURL, err := promptForKioskURL()
+		if err != nil {
+			// User-cancel of zenity.Entry returns an error too; don't
+			// scare them with a raw error dialog — treat as cancel.
+			if errors.Is(err, zenity.ErrCanceled) {
+				return
+			}
 			_ = zenity.Error(err.Error(), zenity.Title("SK Filter"))
 			os.Exit(1)
 		}
@@ -2486,7 +2923,7 @@ func main() {
 			_ = p.Kill()
 		}
 		_ = zenity.Info(
-			"Kiosk URL updated.\nThe kiosk window will relaunch at the new URL within a few seconds.",
+			fmt.Sprintf("Kiosk URL updated to:\n%s\n\nThe kiosk window will relaunch at the new URL within a few seconds.", newURL),
 			zenity.Title("SK Filter"),
 		)
 		return
