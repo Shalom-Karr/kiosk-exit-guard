@@ -2,6 +2,13 @@
 
 Single-binary kiosk lockdown utility for **Windows 11 Home** (no Assigned Access). One ~7 MB exe contains an embedded WebView2 kiosk window, a low-level keyboard hook with re-injection, an HKLM-backed password store, Chrome / Edge launch blocks at the OS level, a Chrome uninstaller, a self-installer, a self-updater, and four desktop shortcuts for the admin.
 
+## What's in v1.1.0
+
+New in this release:
+
+- **Windows Service supervisor.** `KioskExitGuardSvc` runs as `LocalSystem` and respawns the user-session controller via `CreateProcessAsUserW`. Replaces the v1.0.x Task Scheduler watchdog — kiosk users can't reach SCM, so they can't stop it the way they could `schtasks /Delete` the old task. See [docs/architecture.md](docs/architecture.md) for the two-process model.
+- **LL-hook thread pinning.** `runtime.LockOSThread()` at the top of `main()` fixes the v1.0.6 "first-run install ignores keyboard combos" bug.
+
 ## What's in v1.0.6
 
 Pause-only model with always-on filter:
@@ -31,7 +38,7 @@ Admin UX:
 
 Robustness:
 
-- **Self-install** at startup via Task Scheduler (HIGHEST run level, no UAC prompt at logon).
+- **Self-install** as a real Windows Service (`KioskExitGuardSvc`, `LocalSystem`, Automatic) that supervises and respawns the user-session controller. Falls back to a Task Scheduler entry if Service install fails.
 - **WebView2 Runtime auto-install** — downloads evergreen bootstrapper from `go.microsoft.com` if missing (Server SKUs / stripped images).
 - **HKLM password storage** — bcrypt hash in `HKLM\Software\KioskExitGuard\PasswordHash`. Admin-write only.
 - **IFEO blocks survive Windows Update** — re-applied on every controller launch.
@@ -66,6 +73,9 @@ kiosk-exit-guard.exe --silent-exit    # internal: IFEO Debugger redirect handler
 kiosk-exit-guard.exe --set-password   # change the password
 kiosk-exit-guard.exe --set-url        # change the kiosk URL
 kiosk-exit-guard.exe --reset          # password-gated, clears all lockdowns
+kiosk-exit-guard.exe --service-run    # internal: SCM-only Service entry point
+kiosk-exit-guard.exe --service-install  # admin: register the supervising Service
+kiosk-exit-guard.exe --service-remove   # admin: stop + unregister the Service
 ```
 
 ## Build
@@ -73,7 +83,7 @@ kiosk-exit-guard.exe --reset          # password-gated, clears all lockdowns
 CI at `.github/workflows/release.yml` rebuilds + releases on every `v*` tag push.
 
 ```
-git tag v1.0.6 && git push origin v1.0.6
+git tag v1.1.0 && git push origin v1.1.0
 ```
 
 Local build:

@@ -4,6 +4,28 @@ All notable changes to kiosk-exit-guard, newest first. Versions follow [Semantic
 
 For the current state of the project, see the [landing page](https://shalom-karr.github.io/kiosk-exit-guard/), the [architecture doc](architecture.md), and the [admin runbook](admin-runbook.md).
 
+## v1.1.0 — 2026-05-11
+
+**Windows Service supervisor + LL-hook thread-pinning fix.** Replaces the v1.0.x Task-Scheduler-based auto-start with a real Windows Service running as `LocalSystem` in Session 0. The kiosk user can no longer reach `schtasks /Delete` to neutralize the watchdog — Service control requires admin rights, which the kiosk user doesn't have.
+
+Architecture:
+
+- **New supervising Service `KioskExitGuardSvc`.** Display name "Kiosk Exit Guard Service". Runs as `LocalSystem`, `StartType = Automatic`. Has no UI of its own (Services run in Session 0, isolated from user sessions since Vista). Its only job is to find the active console session via `WTSGetActiveConsoleSessionId`, get the user's token via `WTSQueryUserToken`, duplicate it to a primary token via `DuplicateTokenEx`, build a per-user environment block via `CreateEnvironmentBlock`, and spawn `kiosk-exit-guard.exe` into that session via `CreateProcessAsUserW` with `lpDesktop = "winsta0\default"`. Waits for the controller to exit, sleeps 1s, respawns. On `sc stop` it terminates the running controller via `TerminateProcess` so an unattended controller can't outlive its supervisor.
+- **Two-process model.** The Service is the supervisor; the existing controller code (LL hook, WebView2 kiosk, password modal, etc.) runs unchanged as the user-session process spawned by the Service. The same `kiosk-exit-guard.exe` binary is both — flag selects the role: `--service-run` (SCM-only), `--service-install` (admin), `--service-remove` (admin), no args = controller.
+- **First-run integration.** `firstRunWithWizard()` now calls `installService()` instead of `installStartupTask()`. The Service is registered, started, and any leftover v1.0.x scheduled task is deleted in the same call so the two managers don't fight. If service install fails (locked-down SCM, unusual SKU), falls back to the v1.0.x scheduled-task path so the device isn't left without auto-start.
+- **Uninstall integration.** `runUninstallInvocation` now stops and deletes the Service before tearing down everything else. Without this, the supervisor would respawn the controller mid-teardown.
+- **First-run guard for service-spawned controllers.** The Service sets `KIOSK_EXIT_GUARD_VIA_SERVICE=1` in the spawned controller's environment block. If the controller boots and finds no password configured, it checks for that marker — if present, it logs and exits silently instead of popping the wizard. Prevents the Service from respawn-looping a stack of first-run wizards every few seconds on a half-installed device.
+- **Update flow.** `--update` now does `sc stop KioskExitGuardSvc` before renaming the exe, and `sc start` after. Falls back to `schtasks /Run` if the service isn't registered (rare, mid-migration installs).
+
+Reliability:
+
+- **`runtime.LockOSThread()` at the top of `main()`** (v1.0.7 fix folded into this release). Pins the main goroutine to its initial OS thread for the life of the process. The Win32 LL keyboard hook installed via `SetWindowsHookExW` is bound to the thread that called it, and events only dispatch while THAT thread is running a `GetMessage` loop. If the Go runtime migrates this goroutine to a different OS thread between `SetWindowsHookExW` and `GetMessageW` (which happened reliably on first-run install because `firstRunWithWizard()` runs a WebView2 message loop that leaves the goroutine on a different thread), the hook silently goes dead — symptom: Ctrl/Win/Alt combos fall through instead of opening the password modal. Pinning at the top of `main()` keeps the hook's install thread and message-pump thread the same.
+
+Caveats:
+
+- The Service runs as `LocalSystem` because `WTSQueryUserToken` requires `SE_TCB_NAME`, which only `LocalSystem` has by default. Don't change `ServiceStartName` away from blank-(LocalSystem) without granting the new account that privilege.
+- On boot before any user logs in, the supervisor finds `WTSGetActiveConsoleSessionId == 0xFFFFFFFF` and polls every 2 s. The controller doesn't start until a user is logged into the console — same behavior the user perceives as v1.0.x's logon trigger.
+
 ## v1.0.6 — 2026-05-12
 
 **Production-readiness fixes from a multi-agent security and UX audit.**

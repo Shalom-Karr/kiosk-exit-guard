@@ -2,17 +2,22 @@
 
 A single-binary kiosk lockdown utility. One ~7.7 MB `kiosk-exit-guard.exe` selects one of several internal modes based on its first command-line argument.
 
+Starting in v1.1.0 the binary plays two roles: a **supervising Windows Service** running as `LocalSystem` in Session 0, and a **user-session controller** spawned by the Service into the active console session via `CreateProcessAsUserW`. The Service has no UI (Services have been isolated from user sessions since Vista); it just respawns the controller within seconds if it dies. The kiosk user can't reach SCM without admin rights, so they can't stop the supervisor the way they could `schtasks /Delete` the v1.0.x watchdog task.
+
 ## Modes
 
 | Mode | How it's invoked | What it does |
 |---|---|---|
-| **Controller** | no args (Task Scheduler at logon, or first manual launch) | Owns the LL keyboard hook, filter-mode state, registry lockdown, and supervises the kiosk window. Long-running. |
+| **`--service-run`** | SCM only — never run by hand | Supervising Windows Service. Finds the active console session via `WTSGetActiveConsoleSessionId`, gets the user token via `WTSQueryUserToken`, duplicates to a primary token, builds an env block, spawns the controller via `CreateProcessAsUserW`. Respawns on controller exit. On `sc stop` it `TerminateProcess`-es the controller. |
+| **`--service-install`** | first-run setup (admin) | Registers `KioskExitGuardSvc` with SCM, starts it, deletes any leftover v1.0.x scheduled task. |
+| **`--service-remove`** | `--uninstall` (admin) | Stops and unregisters the Service. |
+| **Controller** | no args — spawned by the Service into the user session, or first manual launch by the admin | Owns the LL keyboard hook, filter-mode state, registry lockdown, and supervises the kiosk window. Long-running. |
 | **`--webview`** | spawned by the controller's watchdog | Renders the fullscreen WebView2 kiosk window. Dies when filter mode becomes paused. |
 | **`--silent-exit`** | invoked by Windows when a blocked exe is launched (IFEO Debugger redirect) | Immediately returns. Used so `chrome.exe` / `msedge.exe` launches fail silently. |
 | **`--pause`** | "Pause SK Filter" desktop button | Password modal + duration picker, writes pause state, kills the kiosk child. |
 | **`--resume`** | "Resume SK Filter" desktop button | Clears the pause file, re-applies lockdown. No password (resuming is the safe direction). |
-| **`--update`** | "Update SK Filter" desktop button | Checks GitHub `/releases/latest`, password-prompts, downloads to TEMP, atomic-renames the running exe. |
-| **`--uninstall`** | "Uninstall SK Filter" desktop button | Password + confirm dialog, then full teardown of every piece of state. |
+| **`--update`** | "Update SK Filter" desktop button | Checks GitHub `/releases/latest`, password-prompts, stops the Service, atomic-renames the running exe, starts the Service. |
+| **`--uninstall`** | "Uninstall SK Filter" desktop button | Password + confirm dialog, then full teardown of every piece of state including the Service. |
 | **`--set-password`** | manual CLI | Re-runs the password prompt. |
 | **`--set-url`** | manual CLI | Re-runs the kiosk URL prompt. |
 | **`--reset`** | manual CLI (recovery) | Password-gated nuke of registry policies + IFEO blocks + filter state. |
@@ -64,11 +69,27 @@ C:\Program Files\KioskExitGuard\
 
 Legacy `password.hash` and `kiosk.url` files are migrated to HKLM on first launch of v0.5.0+, then removed.
 
-### Task Scheduler
+### Windows Service (v1.1.0+)
+
+```
+Service:        KioskExitGuardSvc
+Display name:   Kiosk Exit Guard Service
+Description:    Watches and respawns the kiosk-exit-guard user-session controller.
+Binary path:    "C:\Program Files\KioskExitGuard\kiosk-exit-guard.exe" --service-run
+StartType:      Automatic
+ServiceType:    SERVICE_WIN32_OWN_PROCESS
+Account:        LocalSystem (required for SE_TCB_NAME / WTSQueryUserToken)
+```
+
+Verify with `Get-Service KioskExitGuardSvc` or `sc query KioskExitGuardSvc`. Stop / start with `sc stop KioskExitGuardSvc` / `sc start KioskExitGuardSvc` from an admin shell. The Service can't be stopped or deleted by a non-admin user — that's the whole point of the v1.1.0 refactor.
+
+### Legacy Task Scheduler (v1.0.x fallback)
+
+Used only when `installService()` fails (locked-down SCM, unusual SKU). Indicates a degraded install — verify with `Get-ScheduledTask -TaskName KioskExitGuard`.
 
 ```
 Task: KioskExitGuard
-  Trigger:  At log on of any user
+  Trigger:  At log on of any user + every 1 minute watchdog
   Action:   Run C:\Program Files\KioskExitGuard\kiosk-exit-guard.exe
   Run as:   Highest privileges (no UAC prompt at logon)
 ```
@@ -81,6 +102,16 @@ Task: KioskExitGuard
 | Resume SK Filter.lnk | `--resume` | none |
 | Update SK Filter.lnk | `--update` | required for install |
 | Uninstall SK Filter.lnk | `--uninstall` | required + confirm |
+
+## Processes (v1.1.0+)
+
+| Process | Where it runs | Lifetime |
+|---|---|---|
+| `kiosk-exit-guard.exe --service-run` | Session 0, `LocalSystem` | Auto-started at boot by SCM. Lives until `sc stop` or shutdown. |
+| `kiosk-exit-guard.exe` (controller, no args) | active user console session, spawned by the Service via `CreateProcessAsUserW` | Lives until killed; respawned by the Service within ~1 s. |
+| `kiosk-exit-guard.exe --webview` | same user session, spawned by the controller's watchdog | Lives while the kiosk should be visible. Killed during pause. |
+
+The Service's environment block passes `KIOSK_EXIT_GUARD_VIA_SERVICE=1` so the controller knows it was spawned by the Service. If the controller boots that way with no password configured, it logs and exits immediately rather than popping the first-run wizard (which would respawn-loop on every Service cycle).
 
 ## Threads, goroutines, processes
 
@@ -195,7 +226,8 @@ saveKioskURLToRegistry()       (URL → same HKLM key)
 uninstallChrome()              (silently runs Chrome's own uninstaller)
 applyBrowserBlocks()           (sets chrome.exe + msedge.exe IFEO Debugger)
 createDesktopShortcut()        (4 .lnk files: pause/resume/update/uninstall)
-installStartupTask()           (registers KioskExitGuard scheduled task)
+installService()               (registers KioskExitGuardSvc with SCM as
+                                LocalSystem, Automatic; deletes legacy task)
         │
         ▼
 applyLockdown()

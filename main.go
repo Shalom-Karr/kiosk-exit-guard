@@ -57,7 +57,7 @@ import (
 
 // currentVersion must be kept in sync with versioninfo.json. Used by the
 // --update flow to compare against the latest GitHub release tag.
-const currentVersion = "1.0.7"
+const currentVersion = "1.1.0"
 
 // ---------- logging ----------
 
@@ -1505,12 +1505,21 @@ func firstRunWithWizard() bool {
 	applyBrowserBlocks()
 	_ = createDesktopShortcut()
 
-	taskErr := installStartupTask()
-	if taskErr != nil {
+	// v1.1.0: prefer registering a real Windows Service over the legacy
+	// Task Scheduler entry. The Service runs as LocalSystem in Session 0,
+	// supervises a user-session controller via CreateProcessAsUserW, and
+	// — unlike a scheduled task — can't be killed by the kiosk user via
+	// schtasks /Delete. installService also wipes any leftover v1.0.x
+	// scheduled task so the two managers don't fight.
+	svcErr := installService()
+	if svcErr != nil {
 		_ = zenity.Warning(
-			fmt.Sprintf("Auto-start install failed: %v\n\nThe exe is configured but won't launch automatically until you create a Task Scheduler entry manually.", taskErr),
+			fmt.Sprintf("Service install failed: %v\n\nFalling back to a Task Scheduler entry.", svcErr),
 			zenity.Title("kiosk-exit-guard"),
 		)
+		// Fallback: keep the v1.0.x mechanism so the device isn't left
+		// without auto-start.
+		_ = installStartupTask()
 	}
 	_ = zenity.Info(
 		"Setup complete.\n\n• Password and kiosk URL saved\n• Chrome uninstalled\n• Chrome and Edge launches blocked\n• Desktop shortcut created\n• Auto-start task installed\n\nThe SK Filter is ON by default and will start enforcing immediately.\nUse Ctrl+Shift+Alt+K to pause it for 1–100 minutes when needed.",
@@ -2355,7 +2364,16 @@ func runUninstallInvocation() {
 	_ = tkCmd.Run()
 	time.Sleep(300 * time.Millisecond) // let TerminateProcess settle
 
-	// 2. End any running instance of the scheduled task, then delete it.
+	// 2a. Stop and unregister the v1.1.0 Windows Service (if installed).
+	// Done before the scheduled-task teardown because the Service's
+	// supervisor would otherwise re-spawn the controller we just killed.
+	if err := removeService(); err != nil {
+		failures = append(failures, fmt.Sprintf("removeService failed: %v", err))
+	}
+
+	// 2b. End any running instance of the legacy v1.0.x scheduled task,
+	// then delete it. Still done for upgrade installs that started on
+	// v1.0.x and might have a leftover task entry.
 	endCmd := exec.Command("schtasks", "/End", "/TN", taskName)
 	endCmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
 	_ = endCmd.Run()
@@ -2423,6 +2441,12 @@ func runUninstallInvocation() {
 // (zombie controller, dangling scheduled task, stale IFEO blocks,
 // half-deleted desktop shortcuts, etc.).
 func purgeLeftoverState() {
+	// v1.1.0: kill the supervising Service first. If we just kill the
+	// controller, the Service notices and respawns it within a second,
+	// fighting the rest of this teardown. Best-effort — removeService
+	// returns nil when the service isn't registered.
+	_ = removeService()
+
 	killRunningController()
 	removeLockdown()
 	removeIFEOBlock("chrome.exe")
@@ -2595,9 +2619,14 @@ func runUpdateInvocation() {
 
 	// CRITICAL: stop the running controller before renaming. Windows holds
 	// an exclusive lock on a running .exe, so os.Rename(exe, ...) returns
-	// "access is denied" while the controller is alive. End the scheduled
-	// task (kills the controller via Task Scheduler) and any leftover
-	// processes, then give Windows a moment to release the file handle.
+	// "access is denied" while the controller is alive. On v1.1.0+ the
+	// supervising Service would also immediately respawn a fresh
+	// controller if we just killed the running one — so we stop the
+	// Service first, then end the legacy scheduled task (for upgrades
+	// from v1.0.x), then kill any orphan controllers.
+	stopCmd := exec.Command("sc", "stop", svcName)
+	stopCmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+	_ = stopCmd.Run()
 	endCmd := exec.Command("schtasks", "/End", "/TN", taskName)
 	endCmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
 	_ = endCmd.Run()
@@ -2624,10 +2653,15 @@ func runUpdateInvocation() {
 	}
 	if renameErr != nil {
 		_ = os.Remove(tmpPath)
-		// Best-effort: restart the controller we just killed.
-		runCmd := exec.Command("schtasks", "/Run", "/TN", taskName)
-		runCmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
-		_ = runCmd.Run()
+		// Best-effort: restart the controller we just killed. Try the
+		// v1.1.0 service first, fall back to the legacy task.
+		startCmd := exec.Command("sc", "start", svcName)
+		startCmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+		if err := startCmd.Run(); err != nil {
+			runCmd := exec.Command("schtasks", "/Run", "/TN", taskName)
+			runCmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+			_ = runCmd.Run()
+		}
 		_ = zenity.Error(
 			fmt.Sprintf("Could not move current exe aside:\n%v\n\nThe SK Filter has been restarted at the previous version. Try the update again in a minute.", renameErr),
 			zenity.Title("SK Filter — update"),
@@ -2638,17 +2672,28 @@ func runUpdateInvocation() {
 		// Rollback: put the old exe back where it was.
 		_ = os.Rename(oldPath, exe)
 		// Re-launch the controller so the device isn't left unprotected.
-		runCmd := exec.Command("schtasks", "/Run", "/TN", taskName)
-		runCmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
-		_ = runCmd.Run()
+		startCmd := exec.Command("sc", "start", svcName)
+		startCmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+		if err := startCmd.Run(); err != nil {
+			runCmd := exec.Command("schtasks", "/Run", "/TN", taskName)
+			runCmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+			_ = runCmd.Run()
+		}
 		_ = zenity.Error(fmt.Sprintf("Install failed: %v\n\nReverted to previous version and restarted the SK Filter.", err), zenity.Title("SK Filter — update"))
 		return
 	}
 
-	// Re-launch the scheduled task so the new exe loads.
-	runCmd := exec.Command("schtasks", "/Run", "/TN", taskName)
-	runCmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
-	_ = runCmd.Run()
+	// Re-launch the supervising Service (v1.1.0+) so the new exe loads.
+	// Fall back to the legacy scheduled task if the service isn't
+	// registered (upgrade from v1.0.x mid-update path, or a botched
+	// service install).
+	startCmd := exec.Command("sc", "start", svcName)
+	startCmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+	if err := startCmd.Run(); err != nil {
+		runCmd := exec.Command("schtasks", "/Run", "/TN", taskName)
+		runCmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+		_ = runCmd.Run()
+	}
 	time.Sleep(400 * time.Millisecond)
 
 	_ = zenity.Info(
@@ -2809,6 +2854,26 @@ func main() {
 	initLogging()
 	defer recoverAndLog("main")
 
+	// --service-run: SCM-only entry point for the Windows Service. Runs
+	// the supervisor loop that respawns the user-session controller via
+	// CreateProcessAsUserW. Returns when SCM sends Stop / Shutdown.
+	if len(os.Args) > 1 && os.Args[1] == "--service-run" {
+		runService()
+		return
+	}
+
+	// --service-install / --service-remove: admin-elevated SCM management.
+	// installService is also called inside first-run; --service-install
+	// stands alone for upgrade / repair scenarios.
+	if len(os.Args) > 1 && os.Args[1] == "--service-install" {
+		runServiceInstall()
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "--service-remove" {
+		runServiceRemove()
+		return
+	}
+
 	// WebView2 child mode — render the kiosk window and exit when closed.
 	if len(os.Args) > 1 && os.Args[1] == "--webview" {
 		runWebViewKiosk(loadKioskURL())
@@ -2964,6 +3029,15 @@ func main() {
 	hash, err := loadHash()
 	firstRun := err != nil || len(hash) == 0
 	if firstRun {
+		// If the supervising Service spawned us into a user session but
+		// the admin hasn't completed first-run yet, do NOT pop the wizard
+		// — the Service would respawn-loop a stack of wizards every few
+		// seconds. Just log and exit; the admin's manual double-click is
+		// the only legitimate path to first-run setup.
+		if isLaunchedByService() {
+			logf("service-spawned controller but no password configured; exiting without wizard")
+			return
+		}
 		// Purge any leftover state before the wizard so the user gets a
 		// truly clean install. Cheap if there's nothing to clean.
 		purgeLeftoverState()
@@ -2977,13 +3051,23 @@ func main() {
 			os.Exit(1)
 		}
 	} else {
-		// Refresh the desktop shortcuts and the scheduled task on every
-		// non-first-run launch. Both are idempotent and cheap; this is
-		// how an installed v1.0.2 or earlier auto-upgrades to the new
-		// multi-trigger task definition in v1.0.3+ — they just need to
-		// launch the new exe once.
+		// Refresh the desktop shortcuts and the auto-start mechanism on
+		// every non-first-run launch. Both are idempotent and cheap; this
+		// is how an installed v1.0.x auto-upgrades to v1.1.0's Service
+		// (and how an existing v1.1.0 install heals a damaged service
+		// registration) by just launching the new exe once.
+		//
+		// Skip when we were spawned by the Service itself — that would
+		// race the SCM and stop our own parent during steady-state
+		// operation. The admin's manual / desktop-shortcut launches still
+		// refresh.
 		_ = createDesktopShortcut()
-		_ = installStartupTask()
+		if !isLaunchedByService() {
+			if err := installService(); err != nil {
+				logf("non-first-run service refresh failed, falling back to scheduled task: %v", err)
+				_ = installStartupTask()
+			}
+		}
 	}
 	storedHash = hash
 

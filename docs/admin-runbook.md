@@ -50,16 +50,32 @@ Get-Process kiosk-exit-guard -ErrorAction SilentlyContinue |
     Select-Object Id, ProcessName, StartTime
 ```
 
-Expect: zero or one row in normal operation. The `--webview` child is a second row when the kiosk is active.
+Expect, on a v1.1.0 install: two or three rows. One is the Service (`--service-run`, owned by `SYSTEM`), one is the user-session controller (no args), and a third appears as `--webview` when the kiosk is active.
 
-### Is the scheduled task installed?
+### Is the Service installed and running? (v1.1.0+)
+
+```powershell
+Get-Service KioskExitGuardSvc -ErrorAction SilentlyContinue |
+    Select-Object Name, DisplayName, Status, StartType
+```
+
+Expect: `Status = Running`, `StartType = Automatic`. Also check via `sc`:
+
+```powershell
+sc query KioskExitGuardSvc
+sc qc KioskExitGuardSvc
+```
+
+`sc qc` should show `BINARY_PATH_NAME : "C:\Program Files\KioskExitGuard\kiosk-exit-guard.exe" --service-run` and `SERVICE_START_NAME : LocalSystem`.
+
+### Is the legacy v1.0.x scheduled task gone? (after upgrading to v1.1.0)
 
 ```powershell
 Get-ScheduledTask -TaskName KioskExitGuard -ErrorAction SilentlyContinue |
-    Select-Object TaskName, State, @{N='LastResult';E={(Get-ScheduledTaskInfo $_).LastTaskResult}}
+    Select-Object TaskName, State
 ```
 
-Expect: `State = Ready` (waiting for next logon trigger) or `Running` (controller is up). `LastResult = 0` means the last execution exited cleanly.
+Expect: no rows. `installService()` deletes the v1.0.x task during install / upgrade. If a row exists, the device is in a degraded state — manual cleanup: `schtasks /Delete /F /TN KioskExitGuard`.
 
 ### Is the HKLM config set?
 
@@ -112,8 +128,10 @@ The bcrypt hash is one-way; we cannot recover the password from it. The only rec
 
 ```powershell
 # Run as Admin.
+sc stop KioskExitGuardSvc
+sc delete KioskExitGuardSvc
 Get-Process kiosk-exit-guard | Stop-Process -Force
-schtasks /Delete /F /TN KioskExitGuard
+schtasks /Delete /F /TN KioskExitGuard   # legacy v1.0.x task, no-op on v1.1.0+
 Remove-Item -Recurse -Force "HKLM:\Software\KioskExitGuard"
 $ifeoRoot = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
 foreach ($exe in @("chrome.exe","msedge.exe","sethc.exe","osk.exe","narrator.exe","utilman.exe","magnify.exe")) {
@@ -147,6 +165,14 @@ Manual fix on a v0.5.x install:
 ```powershell
 Get-Process kiosk-exit-guard | Stop-Process -Force
 schtasks /Delete /F /TN KioskExitGuard
+```
+
+On v1.1.0+ the equivalent rescue stops the Service first so it can't respawn the controller:
+
+```powershell
+sc stop KioskExitGuardSvc
+sc delete KioskExitGuardSvc
+Get-Process kiosk-exit-guard | Stop-Process -Force
 ```
 
 Then redo Uninstall, which now also kills any process named `kiosk-exit-guard.exe` other than itself before tearing down.
@@ -186,8 +212,8 @@ There's no log file by design (kiosk machines don't have anywhere good to put on
 
 | From | Action |
 |---|---|
-| v0.4.x | Uninstall via PowerShell (legacy uninstall flag may not exist), then install v1.0.x fresh. |
+| v0.4.x | Uninstall via PowerShell (legacy uninstall flag may not exist), then install v1.1.x fresh. |
 | v0.5.0 – v0.5.5 | Double-click **Update SK Filter** desktop shortcut, or run the new exe — first-run's `purgeLeftoverState()` handles the migration. |
-| v1.0.0 – v1.0.1 | Same — Update shortcut handles it. |
+| v1.0.x | Same — Update shortcut handles it. On the next non-first-run launch, the controller calls `installService()` which registers `KioskExitGuardSvc` and deletes the v1.0.x `KioskExitGuard` scheduled task in the same step. |
 
-The atomic-rename approach in `--update` keeps the previous exe as `.old` next to the new one, so a botched update can be rolled back by renaming back.
+The atomic-rename approach in `--update` keeps the previous exe as `.old` next to the new one, so a botched update can be rolled back by renaming back. On v1.1.0+ the update flow does `sc stop KioskExitGuardSvc` before the rename and `sc start` after.
