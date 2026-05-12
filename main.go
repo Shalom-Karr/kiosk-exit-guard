@@ -29,6 +29,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -50,12 +51,18 @@ import (
 	"golang.org/x/sys/windows/registry"
 )
 
+// currentVersion must be kept in sync with versioninfo.json. Used by the
+// --update flow to compare against the latest GitHub release tag.
+const currentVersion = "0.5.5"
+
 // ---------- constants ----------
 
 const (
 	whKeyboardLL = 13
 	wmKeyDown    = 0x0100
+	wmKeyUp      = 0x0101
 	wmSysKeyDown = 0x0104
+	wmSysKeyUp   = 0x0105
 	wmClose      = 0x0010
 
 	vkF4     = 0x73
@@ -153,6 +160,12 @@ var (
 	storedHash []byte
 	promptOpen atomic.Bool
 	filterMode atomic.Bool
+
+	// winKeyChord stays true while a Win key is held with no other key
+	// pressed since. On Win up, if it's still true → "Win alone" → prompt.
+	// If any non-modifier key fires while Win is held, we clear it (this
+	// is a combo, handled by the normal combo path).
+	winKeyChord atomic.Bool
 
 	pauseUntilNano atomic.Int64
 
@@ -844,14 +857,22 @@ $lnk2.IconLocation = ('%s' + ',0')
 $lnk2.Description = 'End the current pause and re-activate the SK Filter (no password needed)'
 $lnk2.Save()
 
-$lnk3 = $ws.CreateShortcut(("$desktop\Uninstall SK Filter.lnk"))
+$lnk3 = $ws.CreateShortcut(("$desktop\Update SK Filter.lnk"))
 $lnk3.TargetPath = '%s'
-$lnk3.Arguments = '--uninstall'
+$lnk3.Arguments = '--update'
 $lnk3.WorkingDirectory = '%s'
 $lnk3.IconLocation = ('%s' + ',0')
-$lnk3.Description = 'Remove the SK Filter (password required)'
+$lnk3.Description = 'Check GitHub for a new version of the SK Filter (password required to install)'
 $lnk3.Save()
-`, exeQ, workDir, exeQ, exeQ, workDir, exeQ, exeQ, workDir, exeQ)
+
+$lnk4 = $ws.CreateShortcut(("$desktop\Uninstall SK Filter.lnk"))
+$lnk4.TargetPath = '%s'
+$lnk4.Arguments = '--uninstall'
+$lnk4.WorkingDirectory = '%s'
+$lnk4.IconLocation = ('%s' + ',0')
+$lnk4.Description = 'Remove the SK Filter (password required)'
+$lnk4.Save()
+`, exeQ, workDir, exeQ, exeQ, workDir, exeQ, exeQ, workDir, exeQ, exeQ, workDir, exeQ)
 	cmd := exec.Command("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps)
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -1295,38 +1316,67 @@ func askCustomMinutes() (time.Duration, bool) {
 // ---------- hook callback ----------
 
 func hookCallback(nCode int32, wParam uintptr, lParam uintptr) uintptr {
-	if nCode >= 0 && (wParam == wmKeyDown || wParam == wmSysKeyDown) {
+	if nCode >= 0 {
 		kb := (*kbdLLHookStruct)(unsafe.Pointer(lParam))
 		injected := (kb.Flags & llkhfInject) != 0
-		// Skip events we injected ourselves (carries our marker so SendInput
-		// re-injections after password verification pass through).
 		ourInjection := kb.DwExtraInfo == uintptr(kioskMarkerCode)
 		if !injected && !ourInjection {
-			if kb.VkCode == vkK && ctrlDown() && shiftDown() && altDown() {
-				if !promptOpen.Load() {
-					go promptAndPause()
-				}
-				return 1
-			}
-			if filterMode.Load() {
-				// Allowlist must come before the broad block so reload
-				// shortcuts get through to the kiosk.
-				if isAlwaysAllowedCombo(kb.VkCode) {
-					// fall through to procCallNextHookEx below
-				} else if !isModifierVK(kb.VkCode) && (ctrlDown() || winDown() || altDown()) {
-					// Capture the combo, swallow this event, and prompt
-					// for the password. On verification, re-inject the
-					// original combo so the user's intended action lands.
-					if !promptOpen.Load() {
+			isKeyDown := wParam == wmKeyDown || wParam == wmSysKeyDown
+			isKeyUp := wParam == wmKeyUp || wParam == wmSysKeyUp
+
+			// Win key alone — swallow + prompt on release. Without this,
+			// a single Win tap opens Start menu and the user can click
+			// into the kiosk's taskbar entry to close it. Tracking the
+			// chord flag distinguishes Win-alone (prompt) from Win+X
+			// combos (handled by the normal combo block below).
+			if filterMode.Load() && (kb.VkCode == vkLWin || kb.VkCode == vkRWin) {
+				if isKeyDown {
+					winKeyChord.Store(true)
+				} else if isKeyUp {
+					wasAlone := winKeyChord.Load()
+					winKeyChord.Store(false)
+					if wasAlone && !promptOpen.Load() {
 						pendingComboMu.Lock()
-						pendingComboV = &pendingCombo{
-							vk:        kb.VkCode,
-							modifiers: capturedModifiers(),
-						}
+						pendingComboV = &pendingCombo{vk: kb.VkCode, modifiers: nil}
 						pendingComboMu.Unlock()
 						go promptAndReinject()
 					}
+				}
+				return 1
+			}
+
+			if isKeyDown {
+				// Any non-modifier key down while Win is held → it's a
+				// combo, not a Start-menu-open attempt. Clear the
+				// chord flag so the Win-up doesn't trigger the prompt.
+				if filterMode.Load() && winDown() && !isModifierVK(kb.VkCode) {
+					winKeyChord.Store(false)
+				}
+
+				// Pause hotkey works in either filter state.
+				if kb.VkCode == vkK && ctrlDown() && shiftDown() && altDown() {
+					if !promptOpen.Load() {
+						go promptAndPause()
+					}
 					return 1
+				}
+
+				if filterMode.Load() {
+					// Allowlist (Ctrl+R, F5) before the broad block.
+					if isAlwaysAllowedCombo(kb.VkCode) {
+						// fall through to procCallNextHookEx
+					} else if !isModifierVK(kb.VkCode) && (ctrlDown() || winDown() || altDown()) {
+						if !promptOpen.Load() {
+							pendingComboMu.Lock()
+							pendingComboV = &pendingCombo{
+								vk:        kb.VkCode,
+								modifiers: capturedModifiers(),
+							}
+							pendingComboMu.Unlock()
+							go promptAndReinject()
+						}
+						return 1
+					}
 				}
 			}
 		}
@@ -1677,16 +1727,190 @@ func runUninstallInvocation() {
 	// Desktop shortcuts.
 	removeDesktopShortcuts()
 
+	// Find and kill the running controller process. Without this, the
+	// in-memory storedHash + filterMode survive the uninstall and the
+	// controller keeps enforcing the filter from cached state.
+	killRunningController()
+
 	_ = zenity.Info(
 		"SK Filter uninstalled.\n\nDelete kiosk-exit-guard.exe manually to complete removal.\nYou may want to reinstall Chrome from google.com/chrome if you use it.",
 		zenity.Title("SK Filter"),
 	)
 }
 
+// killRunningController finds and terminates any kiosk-exit-guard.exe
+// process that's not us. Used by --uninstall to make sure the controller
+// doesn't keep running with a stale in-memory password hash after the
+// HKLM key is wiped.
+func killRunningController() {
+	selfPID := int32(os.Getpid())
+	procs, err := process.Processes()
+	if err != nil {
+		return
+	}
+	for _, p := range procs {
+		if p.Pid == selfPID {
+			continue
+		}
+		name, _ := p.Name()
+		if !strings.EqualFold(name, "kiosk-exit-guard.exe") {
+			continue
+		}
+		_ = p.Kill()
+	}
+}
+
+// ---------- self-update via GitHub releases ----------
+
+const githubLatestAPI = "https://api.github.com/repos/Shalom-Karr/kiosk-exit-guard/releases/latest"
+
+type ghAsset struct {
+	Name        string `json:"name"`
+	DownloadURL string `json:"browser_download_url"`
+}
+type ghRelease struct {
+	TagName string    `json:"tag_name"`
+	Name    string    `json:"name"`
+	HTMLURL string    `json:"html_url"`
+	Assets  []ghAsset `json:"assets"`
+}
+
+// fetchLatestRelease returns (versionString, downloadURL, error). The
+// version is the tag with any leading "v" stripped so it lines up with
+// the embedded currentVersion constant.
+func fetchLatestRelease() (string, string, error) {
+	req, err := http.NewRequest("GET", githubLatestAPI, nil)
+	if err != nil {
+		return "", "", err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "kiosk-exit-guard-updater")
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return "", "", fmt.Errorf("github api returned %d", resp.StatusCode)
+	}
+	var rel ghRelease
+	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
+		return "", "", err
+	}
+	for _, a := range rel.Assets {
+		if strings.EqualFold(a.Name, "kiosk-exit-guard.exe") {
+			return strings.TrimPrefix(rel.TagName, "v"), a.DownloadURL, nil
+		}
+	}
+	return "", "", errors.New("kiosk-exit-guard.exe asset not found in latest release")
+}
+
+// runUpdateInvocation is the entry point for `--update`, wired to the
+// "Update SK Filter" desktop shortcut. Flow:
+//   1. GET the GitHub /releases/latest API
+//   2. If same version → tell the user, exit
+//   3. Otherwise → confirm dialog showing both versions
+//   4. Password prompt (admin action: rewriting the running exe)
+//   5. Download new exe to TEMP
+//   6. Rename current exe to .old (allowed even when running)
+//   7. Rename downloaded exe into the current exe's path
+//   8. Restart the KioskExitGuard scheduled task so the new exe loads
+func runUpdateInvocation() {
+	migrateLegacyHash()
+	hash, err := loadHash()
+	if err != nil || len(hash) == 0 {
+		_ = zenity.Error("SK Filter is not configured. Run first-run setup first.", zenity.Title("SK Filter"))
+		os.Exit(1)
+	}
+	storedHash = hash
+
+	showTimedInfo("Checking GitHub for updates…")
+
+	latest, downloadURL, err := fetchLatestRelease()
+	if err != nil {
+		_ = zenity.Error(
+			fmt.Sprintf("Could not reach GitHub:\n%v\n\nMake sure the device has internet access.", err),
+			zenity.Title("SK Filter — update"),
+		)
+		return
+	}
+
+	if latest == currentVersion {
+		_ = zenity.Info(
+			fmt.Sprintf("You're on the latest version (v%s).\n\nNo update needed.", currentVersion),
+			zenity.Title("SK Filter — update"),
+		)
+		return
+	}
+
+	if qerr := zenity.Question(
+		fmt.Sprintf(
+			"A new version is available.\n\nCurrent: v%s\nLatest:  v%s\n\nDownload and install?",
+			currentVersion, latest,
+		),
+		zenity.Title("SK Filter — update available"),
+		zenity.OKLabel("Update now"),
+		zenity.CancelLabel("Maybe later"),
+	); qerr != nil {
+		return
+	}
+
+	if !askPasswordModal(
+		"Install the update?",
+		fmt.Sprintf("Replacing the running kiosk-exit-guard.exe with v%s. Enter your admin password to confirm.", latest),
+	) {
+		showFailedToast()
+		return
+	}
+
+	tmpPath := filepath.Join(os.TempDir(), "kiosk-exit-guard.new.exe")
+	if err := downloadFile(downloadURL, tmpPath); err != nil {
+		_ = zenity.Error(fmt.Sprintf("Download failed: %v", err), zenity.Title("SK Filter — update"))
+		return
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		_ = zenity.Error(fmt.Sprintf("Could not locate current exe: %v", err), zenity.Title("SK Filter — update"))
+		return
+	}
+	oldPath := exe + ".old"
+	_ = os.Remove(oldPath) // clean any leftover
+	if err := os.Rename(exe, oldPath); err != nil {
+		_ = zenity.Error(
+			fmt.Sprintf("Could not move current exe aside:\n%v\n\nThe running controller may be holding the file. Try again in a moment.", err),
+			zenity.Title("SK Filter — update"),
+		)
+		return
+	}
+	if err := os.Rename(tmpPath, exe); err != nil {
+		// Rollback: put the old exe back where it was.
+		_ = os.Rename(oldPath, exe)
+		_ = zenity.Error(fmt.Sprintf("Install failed: %v\n\nReverted to previous version.", err), zenity.Title("SK Filter — update"))
+		return
+	}
+
+	// Restart the scheduled task so the new exe loads. /End kills the
+	// running controller; /Run launches a fresh instance from the new
+	// binary at the same path.
+	for _, op := range [][]string{{"/End", "/TN", taskName}, {"/Run", "/TN", taskName}} {
+		cmd := exec.Command("schtasks", op...)
+		cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+		_ = cmd.Run()
+		time.Sleep(400 * time.Millisecond)
+	}
+
+	_ = zenity.Info(
+		fmt.Sprintf("Updated to v%s.\n\nSK Filter reloaded automatically.\nThe previous version was saved as kiosk-exit-guard.exe.old next to the new exe.", latest),
+		zenity.Title("SK Filter — update complete"),
+	)
+}
+
 func removeDesktopShortcuts() {
 	ps := `
 $desktop = [Environment]::GetFolderPath('Desktop')
-foreach ($n in @('Kiosk Exit Guard.lnk','Pause SK Filter.lnk','Resume SK Filter.lnk','Uninstall SK Filter.lnk')) {
+foreach ($n in @('Kiosk Exit Guard.lnk','Pause SK Filter.lnk','Resume SK Filter.lnk','Update SK Filter.lnk','Uninstall SK Filter.lnk')) {
     Remove-Item -Path (Join-Path $desktop $n) -Force -ErrorAction SilentlyContinue
 }
 `
@@ -1809,6 +2033,15 @@ func main() {
 	// No password — resuming makes the system more locked-down.
 	if len(os.Args) > 1 && os.Args[1] == "--resume" {
 		runResumeInvocation()
+		return
+	}
+
+	// --update: triggered by the "Update SK Filter" desktop shortcut.
+	// Checks GitHub for a newer release. If found and confirmed, password
+	// prompts then downloads + atomic-renames the new exe in place and
+	// restarts the scheduled task.
+	if len(os.Args) > 1 && os.Args[1] == "--update" {
+		runUpdateInvocation()
 		return
 	}
 

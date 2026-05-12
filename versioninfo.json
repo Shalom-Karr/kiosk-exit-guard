@@ -1,7 +1,7 @@
 {
   "FixedFileInfo": {
-    "FileVersion":    {"Major": 0, "Minor": 5, "Patch": 4, "Build": 0},
-    "ProductVersion": {"Major": 0, "Minor": 5, "Patch": 4, "Build": 0},
+    "FileVersion":    {"Major": 0, "Minor": 5, "Patch": 5, "Build": 0},
+    "ProductVersion": {"Major": 0, "Minor": 5, "Patch": 5, "Build": 0},
     "FileFlagsMask":  "3f",
     "FileFlags":      "00",
     "FileOS":         "040004",
@@ -11,11 +11,11 @@
   "StringFileInfo": {
     "CompanyName":      "Shalom-Karr",
     "FileDescription":  "Kiosk lockdown utility for Windows 11 Home",
-    "FileVersion":      "0.5.4",
+    "FileVersion":      "0.5.5",
     "InternalName":     "kiosk-exit-guard",
     "OriginalFilename": "kiosk-exit-guard.exe",
     "ProductName":      "kiosk-exit-guard",
-    "ProductVersion":   "0.5.4"
+    "ProductVersion":   "0.5.5"
   },
   "VarFileInfo": {
     "Translation": {"LangID": "0409", "CharsetID": "04B0"}

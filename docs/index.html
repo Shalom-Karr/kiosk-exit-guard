@@ -155,7 +155,7 @@
 <div class="wrap">
 
 <header>
-  <h1>kiosk-exit-guard <span class="version-pill">v0.5.4</span></h1>
+  <h1>kiosk-exit-guard <span class="version-pill">v0.5.5</span></h1>
   <p class="tagline">Single-binary kiosk lockdown for Windows 11 Home. Embedded WebView2 kiosk window, password-gated keyboard, Chrome uninstalled, Edge launches blocked at the OS level — all from one exe.</p>
 </header>
 
@@ -183,11 +183,15 @@
   <a href="#build">Build</a>
 </nav>
 
-<h2 id="whats-new">What's new in v0.5.4</h2>
+<h2 id="whats-new">What's new in v0.5.5</h2>
 
 <div class="callout callout-good">
-  <strong>v0.5.4 highlights:</strong> the password modal is now <strong>frameless</strong> — no title bar X button, so killing the modal can no longer bypass the password gate. The modal-hang bug from v0.5.3 is fixed (single topmost call instead of a racing retry loop). A <strong>"Resume SK Filter"</strong> shortcut now appears on the desktop (no password — resuming is the safe direction) plus an <strong>"Uninstall SK Filter"</strong> shortcut (password-gated, with a confirm dialog).
+  <strong>v0.5.5 highlights:</strong> built-in self-update flow — new <strong>"Update SK Filter"</strong> desktop shortcut talks to GitHub's release API, downloads the latest exe to TEMP, swaps it in place via rename, restarts the scheduled task. <strong>Windows key alone</strong> now opens the password modal (was a hole — single Win tap opened Start menu, letting the kiosk be closed from the taskbar). Plus the v0.5.4 frameless modal + Resume + Uninstall shortcuts.
 </div>
+
+<div class="feature-grid">
+  <div class="feature"><h4><span class="dot new"></span>"Update SK Filter" shortcut<span class="badge">v0.5.5</span></h4><p>Talks to <code>api.github.com/repos/Shalom-Karr/kiosk-exit-guard/releases/latest</code>. Shows current vs latest. If newer, password-prompts, downloads to TEMP, atomic-renames the running exe to <code>.old</code> and the new exe into place, then restarts the scheduled task.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>Windows key alone → modal<span class="badge">v0.5.5</span></h4><p>Single Win tap used to open Start menu and let the user reach the kiosk's taskbar entry. Now: Win down is swallowed; on Win up (if no other key was pressed in between), the password modal opens. Win+R / Win+E / etc. still flow through the combo block as before.</p></div>
 
 <div class="feature-grid">
   <div class="feature"><h4><span class="dot new"></span>Frameless password modal<span class="badge">v0.5.4</span></h4><p>No title bar, no X button, no taskbar entry, no Alt+Tab. The only way to dismiss is the in-page Cancel button or the correct password. Closes the "kill the modal to bypass the SK Filter" hole.</p></div>
@@ -418,6 +422,7 @@
 <pre>kiosk-exit-guard.exe                  # normal — controller + hook + watchdog
 kiosk-exit-guard.exe --pause          # password + duration picker, pause the filter (desktop button)
 kiosk-exit-guard.exe --resume         # end the pause early (no password — desktop button)
+kiosk-exit-guard.exe --update         # check GitHub for new version, download + replace (desktop button)
 kiosk-exit-guard.exe --uninstall      # password + confirm dialog, full teardown (desktop button)
 kiosk-exit-guard.exe --webview        # internal: renders the kiosk window
 kiosk-exit-guard.exe --silent-exit    # internal: IFEO Debugger redirect handler
