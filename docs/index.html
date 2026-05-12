@@ -155,8 +155,8 @@
 <div class="wrap">
 
 <header>
-  <h1>kiosk-exit-guard <span class="version-pill">v0.5.5</span></h1>
-  <p class="tagline">Single-binary kiosk lockdown for Windows 11 Home. Embedded WebView2 kiosk window, password-gated keyboard, Chrome uninstalled, Edge launches blocked at the OS level — all from one exe.</p>
+  <h1>kiosk-exit-guard <span class="version-pill">v1.0.0</span></h1>
+  <p class="tagline">Single-binary kiosk lockdown for Windows 11 Home. Embedded WebView2 kiosk, password-gated keyboard, Chrome uninstalled, Edge launches blocked at the OS level, self-installing, self-updating, all from one ~7&nbsp;MB exe.</p>
 </header>
 
 <div class="download-card">
@@ -183,10 +183,16 @@
   <a href="#build">Build</a>
 </nav>
 
-<h2 id="whats-new">What's new in v0.5.5</h2>
+<h2 id="whats-new">v1.0.0 — feature-complete</h2>
 
 <div class="callout callout-good">
-  <strong>v0.5.5 highlights:</strong> built-in self-update flow — new <strong>"Update SK Filter"</strong> desktop shortcut talks to GitHub's release API, downloads the latest exe to TEMP, swaps it in place via rename, restarts the scheduled task. <strong>Windows key alone</strong> now opens the password modal (was a hole — single Win tap opened Start menu, letting the kiosk be closed from the taskbar). Plus the v0.5.4 frameless modal + Resume + Uninstall shortcuts.
+  <strong>This is the 1.0.0 release.</strong> Everything from the 0.x line is in: WebView2 kiosk window, default-ON pause-only model, password-gated keyboard with re-injection, four UAC-elevated desktop shortcuts (Pause / Resume / Update / Uninstall), self-installing scheduled task, self-updating via the GitHub releases API, Chrome uninstall, Edge IFEO block, Windows-key-alone gate, frameless modal with autofocus, branded WebView2 first-run wizard, WebView2 Runtime auto-install for Server SKUs. Plus: taskbar + desktop right-click context menus disabled, and a clean-slate install that wipes any leftover state from previous installs.
+</div>
+
+<div class="feature-grid">
+  <div class="feature"><h4><span class="dot new"></span>Taskbar right-click disabled<span class="badge">v1.0.0</span></h4><p><code>NoTrayContextMenu=1</code> + <code>NoViewContextMenu=1</code> under HKCU when the filter is active. Closes the "Win → right-click taskbar → Close Window" bypass that worked even with our Windows-key gate.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>Clean-slate install<span class="badge">v1.0.0</span></h4><p>First-run now purges anything a prior install might have left behind — zombie controller processes, stale IFEO blocks, dangling Task Scheduler entries, half-deleted shortcuts, orphan state files — before the wizard. Reinstall always starts from zero.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>Anti-zombie controller kill<span class="badge">v1.0.0</span></h4><p>Controller startup now kills any other kiosk-exit-guard.exe instance found running. Prevents the "previous controller still enforcing with a stale in-memory password hash" issue that bit v0.5.4 uninstalls.</p></div>
 </div>
 
 <div class="feature-grid">

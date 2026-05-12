@@ -53,7 +53,7 @@ import (
 
 // currentVersion must be kept in sync with versioninfo.json. Used by the
 // --update flow to compare against the latest GitHub release tag.
-const currentVersion = "0.5.5"
+const currentVersion = "1.0.0"
 
 // ---------- constants ----------
 
@@ -83,8 +83,10 @@ const (
 	// HKCU policy paths used for Task Manager + Run dialog lockdown
 	regPolicySystem   = `Software\Microsoft\Windows\CurrentVersion\Policies\System`
 	regPolicyExplorer = `Software\Microsoft\Windows\CurrentVersion\Policies\Explorer`
-	regDisableTaskMgr = "DisableTaskMgr"
-	regNoRun          = "NoRun"
+	regDisableTaskMgr     = "DisableTaskMgr"
+	regNoRun              = "NoRun"
+	regNoTrayContextMenu  = "NoTrayContextMenu"
+	regNoViewContextMenu  = "NoViewContextMenu"
 
 	regAppKey    = `Software\KioskExitGuard`
 	regHashValue = "PasswordHash"
@@ -152,7 +154,6 @@ var (
 	procSetWindowLongPtrW   = user32.NewProc("SetWindowLongPtrW")
 	procSetWindowPos        = user32.NewProc("SetWindowPos")
 	procGetSystemMetrics    = user32.NewProc("GetSystemMetrics")
-	procShowWindow          = user32.NewProc("ShowWindow")
 	procSendInput           = user32.NewProc("SendInput")
 	procSetForegroundWindow = user32.NewProc("SetForegroundWindow")
 	procBringWindowToTop    = user32.NewProc("BringWindowToTop")
@@ -432,11 +433,19 @@ func deletePolicyValue(subkey, name string) error {
 func applyLockdown() {
 	_ = setPolicyDWORD(regPolicySystem, regDisableTaskMgr, 1)
 	_ = setPolicyDWORD(regPolicyExplorer, regNoRun, 1)
+	// Disable right-click context menus on the taskbar and the desktop.
+	// Otherwise the user could right-click the kiosk's taskbar thumbnail
+	// and pick "Close Window", bypassing our Alt+F4 password gate. Same
+	// menu also exposes Task Manager from some shells.
+	_ = setPolicyDWORD(regPolicyExplorer, regNoTrayContextMenu, 1)
+	_ = setPolicyDWORD(regPolicyExplorer, regNoViewContextMenu, 1)
 }
 
 func removeLockdown() {
 	_ = deletePolicyValue(regPolicySystem, regDisableTaskMgr)
 	_ = deletePolicyValue(regPolicyExplorer, regNoRun)
+	_ = deletePolicyValue(regPolicyExplorer, regNoTrayContextMenu)
+	_ = deletePolicyValue(regPolicyExplorer, regNoViewContextMenu)
 }
 
 // ---------- IFEO browser launch block ----------
@@ -1738,6 +1747,40 @@ func runUninstallInvocation() {
 	)
 }
 
+// purgeLeftoverState wipes anything a prior install (or partial uninstall)
+// might have left behind. Called at the start of first-run so the user
+// gets a truly clean install regardless of what state the box is in
+// (zombie controller, dangling scheduled task, stale IFEO blocks,
+// half-deleted desktop shortcuts, etc.).
+func purgeLeftoverState() {
+	killRunningController()
+	removeLockdown()
+	removeIFEOBlock("chrome.exe")
+	removeIFEOBlock("msedge.exe")
+
+	cmd := exec.Command("schtasks", "/Delete", "/F", "/TN", taskName)
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+	_ = cmd.Run()
+
+	removeDesktopShortcuts()
+
+	// Wipe HKLM config so the wizard genuinely starts from zero. (We're
+	// about to write to it via setPassword.)
+	if k, err := registry.OpenKey(registry.LOCAL_MACHINE, regAppKey, registry.ALL_ACCESS); err == nil {
+		_ = k.DeleteValue(regHashValue)
+		_ = k.DeleteValue(regURLValue)
+		k.Close()
+	}
+	_ = registry.DeleteKey(registry.LOCAL_MACHINE, regAppKey)
+
+	// Wipe state files next to the exe.
+	for _, fn := range []string{stateFileName, pauseFileName, hashFileName, kioskURLFileName} {
+		if p, err := nextToExe(fn); err == nil {
+			_ = os.Remove(p)
+		}
+	}
+}
+
 // killRunningController finds and terminates any kiosk-exit-guard.exe
 // process that's not us. Used by --uninstall to make sure the controller
 // doesn't keep running with a stale in-memory password hash after the
@@ -2112,9 +2155,19 @@ func main() {
 		)
 	}
 
+	// If there's a leftover controller from a previous install still
+	// running (orphaned by a partial uninstall, an aborted update, etc.),
+	// kill it before we start. Otherwise two controllers fight over the
+	// hook and the new install's password doesn't match the old one's
+	// in-memory cached hash.
+	killRunningController()
+
 	hash, err := loadHash()
 	firstRun := err != nil || len(hash) == 0
 	if firstRun {
+		// Purge any leftover state before the wizard so the user gets a
+		// truly clean install. Cheap if there's nothing to clean.
+		purgeLeftoverState()
 		if !firstRunWithWizard() {
 			// User cancelled the wizard or setup failed mid-flow. Bail.
 			os.Exit(1)
