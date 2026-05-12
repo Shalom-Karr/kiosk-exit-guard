@@ -58,7 +58,7 @@ import (
 
 // currentVersion must be kept in sync with versioninfo.json. Used by the
 // --update flow to compare against the latest GitHub release tag.
-const currentVersion = "1.1.3"
+const currentVersion = "1.1.4"
 
 // ---------- logging ----------
 
@@ -745,18 +745,28 @@ func uninstallChrome() error {
 // ---------- self-install via schtasks ----------
 
 // installStartupTask registers the controller's auto-launch via the
-// PowerShell ScheduledTasks module (more capable than schtasks CLI):
+// PowerShell ScheduledTasks module:
 //
-//   - Trigger 1: at logon of any user
-//   - Trigger 2: every 1 minute (watchdog — re-fires if controller died)
-//   - MultipleInstances=IgnoreNew → duplicate fires no-op when already running
-//   - AllowStartIfOnBatteries=true + DontStopIfGoingOnBatteries=true
-//   - StartWhenAvailable=true (catch up missed fires after sleep/reboot)
+//   - Single AtLogon trigger (no every-minute watchdog from v1.0.x —
+//     the v1.1.x Windows Service handles respawn supervision; the
+//     scheduled task is purely a logon-time "make sure it starts"
+//     fallback for installs where the Service spawn path fails).
+//   - MultipleInstances=IgnoreNew → re-logons during a session don't
+//     stack instances
+//   - AllowStartIfOnBatteries / DontStopIfGoingOnBatteries / StartWhenAvailable
 //   - ExecutionTimeLimit=0 (no timeout — controller runs until killed)
 //   - RestartOnFailure: 3 retries, 1 minute apart
 //   - RunLevel=Highest (no UAC prompt at fire time; admin token from task)
 //
 // Idempotent: -Force replaces any existing task with the same name.
+//
+// v1.1.4 changes: dropped the every-1-minute repetition that v1.0.x
+// used for watchdog respawn. The Service is the respawn supervisor
+// now. Keeping the every-minute trigger alongside the Service caused
+// kill/respawn churn — both auto-start paths would fire, the second
+// to start would killRunningController() the first, the loser's
+// supervisor would respawn, repeat. AtLogon-only stabilizes the
+// race to a single contention at boot.
 func installStartupTask() error {
 	exe, err := os.Executable()
 	if err != nil {
@@ -766,10 +776,9 @@ func installStartupTask() error {
 	ps := fmt.Sprintf(`
 $action  = New-ScheduledTaskAction -Execute '%s'
 $logon   = New-ScheduledTaskTrigger -AtLogOn
-$watch   = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration ([TimeSpan]::MaxValue)
 $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -Hidden
 $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -RunLevel Highest -LogonType Interactive
-Register-ScheduledTask -TaskName '%s' -Action $action -Trigger @($logon,$watch) -Settings $settings -Principal $principal -Force | Out-Null
+Register-ScheduledTask -TaskName '%s' -Action $action -Trigger $logon -Settings $settings -Principal $principal -Force | Out-Null
 `, exeQ, taskName)
 	cmd := exec.Command("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps)
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
@@ -1529,21 +1538,32 @@ func firstRunWithWizard() bool {
 	applyBrowserBlocks()
 	_ = createDesktopShortcut()
 
-	// v1.1.0: prefer registering a real Windows Service over the legacy
-	// Task Scheduler entry. The Service runs as LocalSystem in Session 0,
-	// supervises a user-session controller via CreateProcessAsUserW, and
-	// — unlike a scheduled task — can't be killed by the kiosk user via
-	// schtasks /Delete. installService also wipes any leftover v1.0.x
-	// scheduled task so the two managers don't fight.
+	// v1.1.4: belt-and-suspenders. v1.1.0 switched to a Service-only
+	// auto-start and deleted any leftover scheduled task. In the field
+	// this turned out to be brittle — on some Win11 Home installs
+	// WTSQueryUserToken and even the v1.1.3 explorer-token fallback can
+	// fail, leaving the kiosk with zero protection after reboot. So we
+	// now install BOTH the Service AND the scheduled task at every
+	// non-service-spawn launch. killRunningController() at controller
+	// startup guarantees only one controller runs at a time regardless
+	// of which auto-start mechanism fired first.
 	svcErr := installService()
 	if svcErr != nil {
 		_ = zenity.Warning(
-			fmt.Sprintf("Service install failed: %v\n\nFalling back to a Task Scheduler entry.", svcErr),
+			fmt.Sprintf("Service install failed: %v\n\nThe scheduled task is still installed so the filter will auto-start on logon, but the Windows Service (which the kiosk user can't disable) was not registered.", svcErr),
 			zenity.Title("kiosk-exit-guard"),
 		)
-		// Fallback: keep the v1.0.x mechanism so the device isn't left
-		// without auto-start.
-		_ = installStartupTask()
+	}
+	if taskErr := installStartupTask(); taskErr != nil {
+		logf("first-run: installStartupTask failed: %v", taskErr)
+		if svcErr != nil {
+			// Both failed — surface this loudly so the admin knows the
+			// kiosk has no auto-start at all.
+			_ = zenity.Error(
+				fmt.Sprintf("Auto-start install FAILED.\n\nService: %v\nTask: %v\n\nThe kiosk will run while this exe stays open, but it will NOT auto-start after reboot. Try running the installer from a fully elevated admin shell.", svcErr, taskErr),
+				zenity.Title("kiosk-exit-guard"),
+			)
+		}
 	}
 	_ = zenity.Info(
 		"Setup complete.\n\n• Password and kiosk URL saved\n• Chrome uninstalled\n• Chrome and Edge launches blocked\n• Desktop shortcut created\n• Auto-start task installed\n\nThe SK Filter is ON by default and will start enforcing immediately.\nUse Ctrl+Shift+Alt+K to pause it for 1–100 minutes when needed.",
@@ -3192,9 +3212,18 @@ func main() {
 		// refresh.
 		_ = createDesktopShortcut()
 		if !isLaunchedByService() {
+			// v1.1.4: always refresh BOTH the Service and the scheduled
+			// task. Either alone has been observed to fail in the field
+			// (WTSQueryUserToken NO_TOKEN on some Win11 Home machines
+			// kills the Service spawn path even when Service itself is
+			// happily registered), so we keep both auto-start mechanisms
+			// alive. killRunningController() prevents two controllers
+			// from running simultaneously.
 			if err := installService(); err != nil {
-				logf("non-first-run service refresh failed, falling back to scheduled task: %v", err)
-				_ = installStartupTask()
+				logf("non-first-run service refresh failed: %v", err)
+			}
+			if err := installStartupTask(); err != nil {
+				logf("non-first-run scheduled-task refresh failed: %v", err)
 			}
 		}
 	}

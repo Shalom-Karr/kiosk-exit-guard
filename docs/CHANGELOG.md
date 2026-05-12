@@ -4,6 +4,22 @@ All notable changes to kiosk-exit-guard, newest first. Versions follow [Semantic
 
 For the current state of the project, see the [landing page](https://shalom-karr.github.io/kiosk-exit-guard/), the [architecture doc](architecture.md), and the [admin runbook](admin-runbook.md).
 
+## v1.1.4 — 2026-05-12
+
+**Belt-and-suspenders auto-start: Service AND scheduled task co-installed.**
+
+Field report: "right now the filter only runs when I re-click the exe file from the downloads folder" — even after v1.1.3's explorer-token fallback shipped, the auto-start was still flaky on the affected machine. v1.1.0 had aggressively switched to Service-only and deleted any leftover v1.0.x scheduled task on install. That made the kiosk completely unprotected after reboot whenever the Service spawn path failed.
+
+Fix: install BOTH the Windows Service and the scheduled task at first-run and on every non-service-spawn launch. Whichever auto-start mechanism fires first wins; `killRunningController()` at controller startup guarantees only one controller process runs at a time. Concrete changes:
+
+- `firstRunWithWizard` now calls `installStartupTask()` *in addition to* `installService()` (not "if service install failed" — always).
+- `installService` no longer deletes the scheduled task. v1.1.0–v1.1.3 wiped it to prevent two controllers fighting; v1.1.4 trusts `killRunningController()` to keep things sane.
+- Non-first-run launches refresh BOTH managers.
+- Scheduled task is now AtLogon-only (no every-minute repetition that v1.0.x used). The Service is the in-session respawn supervisor; the task is purely a logon-time fallback for installs where the Service spawn path fails. Dropping the per-minute watchdog avoids kill/respawn churn between the two auto-start mechanisms.
+- If both auto-start installs fail, surface a loud `zenity.Error` so the admin can't silently end up with a kiosk that doesn't reboot-survive.
+
+Threat-model note: the scheduled task is technically weaker than the Service (a kiosk user with admin privileges could `schtasks /Delete` it). On a non-admin kiosk user account the task is admin-only to delete, same as the Service. "Weaker auto-start that works" beats "stronger auto-start that doesn't fire" — the failure mode in the field was zero protection after reboot, which is the worst outcome.
+
 ## v1.1.3 — 2026-05-12
 
 **Two critical bugs the v1.1.0–v1.1.2 line missed.** Reported from production logs.

@@ -28,7 +28,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -167,15 +166,14 @@ func installService() error {
 		logf("installService: Service.Start failed: %v", err)
 	}
 
-	// Wipe any leftover v1.0.x scheduled task — both managers running
-	// would step on each other (two controllers fighting over the LL hook,
-	// stale password hash in one of them, etc.).
-	endCmd := exec.Command("schtasks", "/End", "/TN", taskName)
-	endCmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
-	_ = endCmd.Run()
-	delCmd := exec.Command("schtasks", "/Delete", "/F", "/TN", taskName)
-	delCmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
-	_ = delCmd.Run()
+	// v1.1.4: do NOT wipe the scheduled task. v1.1.0–v1.1.3 deleted it
+	// here so the two managers wouldn't "fight", but in the field that
+	// turned out to leave the kiosk unprotected whenever the Service
+	// spawn path failed (e.g. WTSQueryUserToken NO_TOKEN on Win11 Home).
+	// The Service and the scheduled task are now co-installed as
+	// belt-and-suspenders. killRunningController() at every controller
+	// startup keeps exactly one controller alive regardless of who fired
+	// first.
 
 	return nil
 }

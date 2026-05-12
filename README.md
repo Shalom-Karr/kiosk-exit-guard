@@ -2,6 +2,17 @@
 
 Single-binary kiosk lockdown utility for **Windows 11 Home** (no Assigned Access). One ~7 MB exe contains an embedded WebView2 kiosk window, a low-level keyboard hook with re-injection, an HKLM-backed password store, Chrome / Edge launch blocks at the OS level, a Chrome uninstaller, a self-installer, a self-updater, and four desktop shortcuts for the admin.
 
+## What's in v1.1.4
+
+Field report: "right now the filter only runs when I re-click the exe file from the downloads folder." Even after v1.1.3's explorer-token fallback shipped, the auto-start was still flaky on the affected machine. v1.1.0 had aggressively switched to Service-only and deleted any leftover scheduled task on install — which made the kiosk unprotected after reboot whenever the Service spawn path failed.
+
+Fix: install BOTH auto-start mechanisms on first-run and on every non-service launch:
+
+- **Windows Service** as the in-session respawn supervisor (LocalSystem in Session 0; kiosk user can't disable).
+- **Scheduled task** as the AtLogon fallback for installs where the Service spawn path fails.
+
+The v1.0.x every-1-minute watchdog repetition is dropped — the Service handles in-session respawn now, and keeping both watchdogs caused kill/respawn churn. The task is a single AtLogon trigger only. `installService` no longer wipes the scheduled task; `killRunningController()` at controller startup keeps exactly one controller alive regardless of which mechanism fired.
+
 ## What's in v1.1.3
 
 Two production-reported bugs the v1.1.0–v1.1.2 line missed:

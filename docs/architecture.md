@@ -4,6 +4,8 @@ A single-binary kiosk lockdown utility. One ~7.7 MB `kiosk-exit-guard.exe` selec
 
 Starting in v1.1.0 the binary plays two roles: a **supervising Windows Service** running as `LocalSystem` in Session 0, and a **user-session controller** spawned by the Service into the active console session via `CreateProcessAsUserW`. The Service has no UI (Services have been isolated from user sessions since Vista); it just respawns the controller within seconds if it dies. The kiosk user can't reach SCM without admin rights, so they can't stop the supervisor the way they could `schtasks /Delete` the v1.0.x watchdog task.
 
+**v1.1.4 update**: auto-start is now belt-and-suspenders. Both the Windows Service AND a scheduled task are installed at first-run. The Service is the in-session respawn supervisor. The task fires once AtLogon (no repetition watchdog — removed because it churned with the Service's own respawn loop). On installs where the Service spawn path fails (e.g. `WTSQueryUserToken` returning `ERROR_NO_TOKEN` even with v1.1.3's `explorer.exe`-token fallback), the scheduled task still gets the kiosk running at logon. `killRunningController()` at controller startup keeps exactly one controller alive regardless of which mechanism fired first.
+
 ## Modes
 
 | Mode | How it's invoked | What it does |
