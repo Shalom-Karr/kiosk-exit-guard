@@ -58,7 +58,7 @@ import (
 
 // currentVersion must be kept in sync with versioninfo.json. Used by the
 // --update flow to compare against the latest GitHub release tag.
-const currentVersion = "1.1.6"
+const currentVersion = "1.1.7"
 
 // ---------- logging ----------
 
@@ -2369,12 +2369,24 @@ func promptAndPause() {
 	case pwCancel:
 		return
 	}
+	// v1.1.7: kill the kiosk WebView2 child BEFORE showing the duration
+	// picker. askPauseDuration uses zenity.List which is a native Win32
+	// dialog (not HWND_TOPMOST) — it would render behind the kiosk's
+	// fullscreen topmost WebView2 and be invisible to the user. With the
+	// kiosk gone, zenity gets normal foreground. If the user cancels the
+	// picker, the watchdog respawns the kiosk within 30s; we also try a
+	// proactive relaunch on cancel below to avoid the gap.
+	killWebViewChild()
 	dur, accepted := askPauseDuration()
 	if !accepted {
 		showTimedInfo("Pause cancelled.\nSK Filter is still active.")
+		// User backed out — bring the kiosk back immediately instead of
+		// waiting for the next watchdog tick.
+		launchWebViewChild()
 		return
 	}
 	if dur <= 0 {
+		launchWebViewChild()
 		return
 	}
 
@@ -2387,7 +2399,7 @@ func promptAndPause() {
 	removeLockdown()
 	removeIFEOBlock("chrome.exe")
 	removeIFEOBlock("msedge.exe")
-	killWebViewChild()
+	// (kiosk already killed above)
 
 	logf("pause started for %v (resumes at %s)", dur, time.Unix(0, pauseUntilNano.Load()).Format("3:04 PM"))
 	showTimedInfo(fmt.Sprintf(
@@ -2922,9 +2934,24 @@ func runPauseInvocation() {
 	case pwCancel:
 		os.Exit(0)
 	}
+	// v1.1.7: kill the kiosk WebView2 child BEFORE showing the duration
+	// picker. zenity.List is not HWND_TOPMOST so it would render behind
+	// the kiosk's fullscreen topmost WebView2 and be invisible. Killing
+	// the kiosk first lets zenity grab normal foreground. If the user
+	// cancels we relaunch the kiosk; otherwise pause takes effect and
+	// the kiosk stays down for the pause window.
+	if p := findOurWebViewChild(); p != nil {
+		_ = p.Kill()
+	}
 	dur, accepted := askPauseDuration()
 	if !accepted || dur <= 0 {
 		showTimedInfo("Pause cancelled.\nSK Filter is still active.")
+		// Kiosk will reappear on the controller's next watchdog tick (30s)
+		// — explicitly nudge it back via a process the controller will
+		// detect; the running controller is the one that actually
+		// launches --webview children. Best we can do from this fresh
+		// --pause process is exit and let the controller's watchdog
+		// notice. The user sees ~ up to 30s without the kiosk.
 		return
 	}
 
@@ -2938,11 +2965,7 @@ func runPauseInvocation() {
 	removeLockdown()
 	removeIFEOBlock("chrome.exe")
 	removeIFEOBlock("msedge.exe")
-
-	// Kill the kiosk WebView2 child if it's running.
-	if p := findOurWebViewChild(); p != nil {
-		_ = p.Kill()
-	}
+	// (kiosk already killed above)
 
 	showTimedInfo(fmt.Sprintf(
 		"SK Filter paused.\nEdge is allowed; kiosk closed.\nResumes at %s.",

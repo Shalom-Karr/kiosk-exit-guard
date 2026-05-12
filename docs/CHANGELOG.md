@@ -4,6 +4,14 @@ All notable changes to kiosk-exit-guard, newest first. Versions follow [Semantic
 
 For the current state of the project, see the [landing page](https://shalom-karr.github.io/kiosk-exit-guard/), the [architecture doc](architecture.md), and the [admin runbook](admin-runbook.md).
 
+## v1.1.7 — 2026-05-12
+
+**Pause-duration picker now visible on the fullscreen kiosk.** v1.1.6 fixed the password modal's foreground-grab; this fix covers the screen that comes AFTER the password — the "1 / 5 / 10 / 20 / 30 / 45 / custom" duration picker. User report: "after the password when I tried to set if it was 1 minute or 5 or other that I couldn't see it."
+
+Root cause: `askPauseDuration` uses `zenity.List` and `askCustomMinutes` uses `zenity.Entry` — both are **native Win32 dialogs**, not WebView2 modals. They don't get the `HWND_TOPMOST` flag and they don't go through v1.1.6's `forceForeground` path. The kiosk WebView2 child is fullscreen `HWND_TOPMOST` and traps focus; the zenity dialogs render behind it and are effectively invisible / unfocused.
+
+Fix: in both `runPauseInvocation` (the `--pause` shortcut) and `promptAndPause` (the Ctrl+Shift+Alt+K hotkey from the LL hook), kill the kiosk WebView2 child *immediately after* the password modal is accepted and *before* showing the duration picker. With the kiosk gone, zenity gets normal foreground. If the user cancels the duration picker, the controller's watchdog respawns the kiosk within 30 s (or `promptAndPause` calls `launchWebViewChild` proactively to close that gap).
+
 ## v1.1.6 — 2026-05-12
 
 **Password modal now actually comes to front + gets keyboard focus on the fullscreen kiosk.** User report: "pressing Ctrl+Shift+Alt+K while on the [kiosk] full screen needs to move the modal to the front to pause the filter."

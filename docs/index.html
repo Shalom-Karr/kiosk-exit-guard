@@ -155,7 +155,7 @@
 <div class="wrap">
 
 <header>
-  <h1>kiosk-exit-guard <span class="version-pill">v1.1.6</span></h1>
+  <h1>kiosk-exit-guard <span class="version-pill">v1.1.7</span></h1>
   <p class="tagline">Single-binary kiosk lockdown for Windows 11 Home. Embedded WebView2 kiosk, password-gated keyboard, Chrome uninstalled, Edge launches blocked at the OS level, self-installing, self-updating, all from one ~7&nbsp;MB exe.</p>
 </header>
 
@@ -186,7 +186,13 @@
   <a href="#build">Build</a>
 </nav>
 
-<h2 id="whats-new">v1.1.6 — what's in the box</h2>
+<h2 id="whats-new">v1.1.7 — what's in the box</h2>
+
+<div class="callout callout-good">
+  <strong>Pause-duration picker visible on the fullscreen kiosk.</strong> v1.1.6 fixed the password modal's foreground-grab; this covers the screen AFTER the password — the "1 / 5 / 10 / 20 / 30 / 45 / custom" picker. User: "after the password when I tried to set if it was 1 minute or 5 or other that I couldn't see it." Root cause: <code>askPauseDuration</code> uses <code>zenity.List</code> (native Win32 dialog, not <code>HWND_TOPMOST</code>) — renders behind the kiosk's fullscreen topmost WebView2. Fix: kill the kiosk WebView2 child immediately after password accept and BEFORE the duration picker, so zenity gets normal foreground. On cancel the watchdog respawns the kiosk (or <code>promptAndPause</code> calls <code>launchWebViewChild</code> proactively).
+</div>
+
+<h2 id="v116">v1.1.6 — password modal focus</h2>
 
 <div class="callout callout-good">
   <strong>Password modal now actually comes to front + gets keyboard focus on the fullscreen kiosk.</strong> User report: "pressing Ctrl+Shift+Alt+K while on the kiosk full screen needs to move the modal to the front to pause the filter." Root cause: both the kiosk window and the modal child were <code>HWND_TOPMOST</code>; the modal's z-order beat the kiosk visually, but keyboard focus stayed with the kiosk because the modal never called <code>SetForegroundWindow</code> (and Windows would have rejected the call anyway — only the foreground process can grant foreground to another). Fix: <code>forceForeground</code> uses the <code>AttachThreadInput</code> idiom — temporarily merge the modal thread's input queue with the foreground thread's queue, call <code>SetForegroundWindow</code> (Windows now treats them as one process for foreground-grant), detach. Bypasses the eligibility rules without the v0.5.4 modal-hang risk that originally caused the v1.0.3 strip.
