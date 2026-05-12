@@ -54,7 +54,7 @@ import (
 
 // currentVersion must be kept in sync with versioninfo.json. Used by the
 // --update flow to compare against the latest GitHub release tag.
-const currentVersion = "1.0.4"
+const currentVersion = "1.0.5"
 
 // ---------- logging ----------
 
@@ -115,6 +115,41 @@ func recoverAndLog(where string) {
 	}
 }
 
+// scaleToastDim scales toast dimensions by the system DPI factor so
+// toasts stay visually similar across DPI settings without going
+// fullscreen (which would be overkill for a brief notification).
+// Uses GetDpiForSystem on Win10 1607+, fallback 96 elsewhere.
+func scaleToastDim(logical int) uint {
+	dpi := uint(96)
+	if err := procGetDpiForSystem.Find(); err == nil {
+		if ret, _, _ := procGetDpiForSystem.Call(); ret != 0 {
+			dpi = uint(ret)
+		}
+	}
+	return uint(logical) * dpi / 96
+}
+
+// makeModalFullscreenTopmost makes a window fill the entire screen and
+// sits topmost. Used for the password modal and first-run wizard so DPI
+// scaling doesn't matter — the HTML's centered card lays itself out
+// against whatever physical screen size we get. Sidesteps the "modal
+// is too small on 4K displays" issue from v1.0.3-v1.0.4 entirely.
+func makeModalFullscreenTopmost(hwnd uintptr) {
+	if hwnd == 0 {
+		return
+	}
+	const (
+		wsExToolWindow = 0x00000080
+		swpShow        = 0x0040
+		swpFrameChang  = 0x0020
+	)
+	cx, _, _ := procGetSystemMetrics.Call(smCXScreen)
+	cy, _, _ := procGetSystemMetrics.Call(smCYScreen)
+	procSetWindowLongPtrW.Call(hwnd, uintptr(gwlStyleU), uintptr(wsPopup|wsVisible))
+	procSetWindowLongPtrW.Call(hwnd, uintptr(gwlExStyleU), uintptr(wsExTopmost|wsExToolWindow))
+	procSetWindowPos.Call(hwnd, hwndTopmost, 0, 0, cx, cy, uintptr(swpShow|swpFrameChang))
+}
+
 // ---------- constants ----------
 
 const (
@@ -148,9 +183,11 @@ const (
 	regNoTrayContextMenu  = "NoTrayContextMenu"
 	regNoViewContextMenu  = "NoViewContextMenu"
 
-	regAppKey    = `Software\KioskExitGuard`
-	regHashValue = "PasswordHash"
-	regURLValue  = "KioskURL"
+	regAppKey         = `Software\KioskExitGuard`
+	regHashValue      = "PasswordHash"
+	regURLValue       = "KioskURL"
+	regFilterModeVal  = "FilterMode"     // DWORD: 1 = active, 0 = paused
+	regPauseUntilVal  = "PauseUntilNano" // QWORD: unix nano of pause expiry, 0 = no pause
 
 	ifeoBase = `Software\Microsoft\Windows NT\CurrentVersion\Image File Execution Options`
 
@@ -217,6 +254,7 @@ var (
 	procSendInput           = user32.NewProc("SendInput")
 	procSetForegroundWindow = user32.NewProc("SetForegroundWindow")
 	procBringWindowToTop    = user32.NewProc("BringWindowToTop")
+	procGetDpiForSystem     = user32.NewProc("GetDpiForSystem")
 
 	storedHash []byte
 	promptOpen atomic.Bool
@@ -394,56 +432,86 @@ func promptForKioskURL() (string, error) {
 
 // ---------- filter mode + pause persistence ----------
 
+// Filter mode + pause state both live in HKLM\Software\KioskExitGuard
+// alongside the password hash, so they're admin-write-only and a
+// standard kiosk user can't tamper by editing a file. The functions
+// below keep the original names for call-site compatibility but back
+// onto the registry. (Files in C:\Program Files were already admin-
+// write-only in practice, but the registry path doesn't depend on the
+// install location's ACLs.)
+
 func loadFilterModeFromDisk() bool {
-	p, err := statePath()
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, regAppKey, registry.QUERY_VALUE)
 	if err != nil {
-		return false
+		return true // default-ON
 	}
-	data, err := os.ReadFile(p)
+	defer k.Close()
+	v, _, err := k.GetIntegerValue(regFilterModeVal)
 	if err != nil {
-		return false
+		return true
 	}
-	return strings.TrimSpace(string(data)) == "1"
+	return v == 1
 }
 
 func saveFilterModeToDisk(on bool) {
-	p, err := statePath()
+	k, _, err := registry.CreateKey(registry.LOCAL_MACHINE, regAppKey, registry.SET_VALUE)
 	if err != nil {
 		return
 	}
-	val := []byte("0")
+	defer k.Close()
+	var v uint32 = 0
 	if on {
-		val = []byte("1")
+		v = 1
 	}
-	_ = os.WriteFile(p, val, 0o600)
+	_ = k.SetDWordValue(regFilterModeVal, v)
 }
 
 func savePauseToDisk(until time.Time) {
-	p, err := pausePath()
+	k, _, err := registry.CreateKey(registry.LOCAL_MACHINE, regAppKey, registry.SET_VALUE)
 	if err != nil {
 		return
 	}
+	defer k.Close()
 	if until.IsZero() {
-		_ = os.Remove(p)
+		_ = k.DeleteValue(regPauseUntilVal)
 		return
 	}
-	_ = os.WriteFile(p, []byte(fmt.Sprintf("%d", until.UnixNano())), 0o600)
+	_ = k.SetQWordValue(regPauseUntilVal, uint64(until.UnixNano()))
 }
 
 func loadPauseFromDisk() time.Time {
-	p, err := pausePath()
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, regAppKey, registry.QUERY_VALUE)
 	if err != nil {
 		return time.Time{}
 	}
-	data, err := os.ReadFile(p)
-	if err != nil {
+	defer k.Close()
+	v, _, err := k.GetIntegerValue(regPauseUntilVal)
+	if err != nil || v == 0 {
 		return time.Time{}
 	}
-	var nano int64
-	if _, err := fmt.Sscanf(strings.TrimSpace(string(data)), "%d", &nano); err != nil {
-		return time.Time{}
+	return time.Unix(0, int64(v))
+}
+
+// migrateLegacyState copies v1.0.4-and-earlier file-based state into the
+// HKLM registry then deletes the file. Idempotent — no-op if files are
+// missing or registry already has the values.
+func migrateLegacyState() {
+	if p, err := statePath(); err == nil {
+		if data, rerr := os.ReadFile(p); rerr == nil {
+			on := strings.TrimSpace(string(data)) == "1"
+			saveFilterModeToDisk(on)
+			_ = os.Remove(p)
+		}
 	}
-	return time.Unix(0, nano)
+	if p, err := pausePath(); err == nil {
+		if data, rerr := os.ReadFile(p); rerr == nil {
+			var nano int64
+			if _, serr := fmt.Sscanf(strings.TrimSpace(string(data)), "%d", &nano); serr == nil && nano > 0 {
+				savePauseToDisk(time.Unix(0, nano))
+			}
+			_ = os.Remove(p)
+		}
+	}
 }
 
 func isPaused() bool {
@@ -826,8 +894,8 @@ func showFrontmostToast(text string, duration time.Duration) {
 		AutoFocus: false,
 		WindowOptions: webview2.WindowOptions{
 			Title:  "SK Filter",
-			Width:  480,
-			Height: 110,
+			Width:  scaleToastDim(480),
+			Height: scaleToastDim(120),
 			Center: true,
 		},
 	})
@@ -1184,8 +1252,8 @@ func runFirstRunWizard() *firstRunInput {
 		AutoFocus: true,
 		WindowOptions: webview2.WindowOptions{
 			Title:  "kiosk-exit-guard — first run",
-			Width:  620,
-			Height: 680,
+			Width:  720, // overridden by makeModalFullscreenTopmost
+			Height: 780,
 			Center: true,
 		},
 	})
@@ -1208,13 +1276,17 @@ func runFirstRunWizard() *firstRunInput {
 	// runs so the input's value is correct on first paint.
 	w.Init(fmt.Sprintf(`window.__defaultURL = %q;`, loadKioskURL()))
 	w.SetHtml(firstRunHTML)
+	// Fullscreen the wizard so it's impossible to miss and DPI-agnostic.
+	// The CSS centers the setup card on whatever screen size we get.
 	go func() {
-		time.Sleep(220 * time.Millisecond)
-		h := uintptr(w.Window())
-		if h != 0 {
-			// First-run wizard runs before any kiosk window exists, so a
-			// plain topmost is fine — no need to strip the frame.
-			makeWindowTopmostFront(h)
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			h := uintptr(w.Window())
+			if h != 0 {
+				makeModalFullscreenTopmost(h)
+				return
+			}
+			time.Sleep(15 * time.Millisecond)
 		}
 	}()
 	w.Run()
@@ -1677,8 +1749,8 @@ func askPasswordModal(title, subtitle string) bool {
 		AutoFocus: true,
 		WindowOptions: webview2.WindowOptions{
 			Title:  "SK Filter — password required",
-			Width:  520,
-			Height: 360,
+			Width:  640, // overridden by makeModalFullscreenTopmost
+			Height: 420,
 			Center: true,
 		},
 	})
@@ -1705,16 +1777,16 @@ func askPasswordModal(title, subtitle string) bool {
 
 	w.Init(fmt.Sprintf(`window.__title = %q; window.__subtitle = %q;`, title, subtitle))
 	w.SetHtml(passwordPromptHTML)
-	// Tight HWND poll — apply frameless + topmost the instant the
-	// WebView2 has a valid HWND. Single application (no retry storm
-	// that hangs the message pump), but fast detection so the modal is
-	// never visible behind the kiosk window.
+	// Fullscreen the modal so DPI scaling doesn't matter — the CSS
+	// centers the card inside whatever screen size we get. Also makes
+	// the modal impossible to miss (covers the entire screen, sits
+	// above the kiosk window).
 	go func() {
 		deadline := time.Now().Add(2 * time.Second)
 		for time.Now().Before(deadline) {
 			h := uintptr(w.Window())
 			if h != 0 {
-				makeModalFrameless(h)
+				makeModalFullscreenTopmost(h)
 				return
 			}
 			time.Sleep(15 * time.Millisecond)
@@ -2345,6 +2417,7 @@ func main() {
 	}
 
 	migrateLegacyHash()
+	migrateLegacyState()
 
 	switch {
 	case len(os.Args) > 1 && os.Args[1] == "--reset":
