@@ -2,7 +2,7 @@
 
 Single-binary kiosk lockdown utility for **Windows 11 Home** (no Assigned Access). One ~7 MB exe contains an embedded WebView2 kiosk window, a low-level keyboard hook with re-injection, an HKLM-backed password store, Chrome / Edge launch blocks at the OS level, a Chrome uninstaller, a self-installer, a self-updater, and four desktop shortcuts for the admin.
 
-## What's in v1.0.0
+## What's in v1.0.6
 
 Pause-only model with always-on filter:
 
@@ -73,7 +73,7 @@ kiosk-exit-guard.exe --reset          # password-gated, clears all lockdowns
 CI at `.github/workflows/release.yml` rebuilds + releases on every `v*` tag push.
 
 ```
-git tag v1.0.0 && git push origin v1.0.0
+git tag v1.0.6 && git push origin v1.0.6
 ```
 
 Local build:

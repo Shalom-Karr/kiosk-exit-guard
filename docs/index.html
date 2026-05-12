@@ -155,7 +155,7 @@
 <div class="wrap">
 
 <header>
-  <h1>kiosk-exit-guard <span class="version-pill">v1.0.4</span></h1>
+  <h1>kiosk-exit-guard <span class="version-pill">v1.0.6</span></h1>
   <p class="tagline">Single-binary kiosk lockdown for Windows 11 Home. Embedded WebView2 kiosk, password-gated keyboard, Chrome uninstalled, Edge launches blocked at the OS level, self-installing, self-updating, all from one ~7&nbsp;MB exe.</p>
 </header>
 
@@ -186,22 +186,29 @@
   <a href="#build">Build</a>
 </nav>
 
-<h2 id="whats-new">v1.0.4 — what's in the box</h2>
+<h2 id="whats-new">v1.0.6 — what's in the box</h2>
 
 <div class="callout callout-good">
-  <strong>Current state of the 1.0.x line.</strong> Everything from the 0.x prototyping is in, plus four 1.0.x patch releases addressing live-deployment issues:
+  <strong>Production-readiness fixes from a multi-agent security audit.</strong> v1.0.6 closes six concrete escape paths in the 1.0.x line — five new bypasses an attacker with code-execution on the kiosk user could have used, plus two TOCTOU races in the hook itself:
   <ul style="margin: 0.6rem 0 0; padding-left: 1.25rem;">
-    <li><strong>Core kiosk</strong>: WebView2 fullscreen kiosk window, password-gated keyboard with re-injection (every Ctrl/Win/Alt combo + Windows-key-alone), Ctrl+R / F5 allowlisted for reload, frameless autofocused modal, branded first-run wizard.</li>
-    <li><strong>Lockdown</strong>: Chrome uninstalled, Edge launches IFEO-blocked, Task Manager + Run dialog + taskbar/desktop right-click context menus disabled while active.</li>
-    <li><strong>Pause-only model</strong>: filter is always ON; pause for 1–100 minutes via password modal; auto-resumes on timer; no toggle-off path.</li>
-    <li><strong>Six desktop shortcuts</strong>: Pause / Resume / Launch Kiosk / Change Kiosk URL / Update / Uninstall — all UAC-elevated, three password-gated.</li>
-    <li><strong>Robustness</strong>: multi-trigger Task Scheduler (logon + 1-min watchdog + restart-on-failure), per-monitor DPI awareness for 4K, WebView2 Runtime auto-install for stripped Server SKUs, clean-slate first-run that wipes any leftover state, log file with panic recovery, self-updating from GitHub releases.</li>
+    <li><strong>Random per-process re-injection nonce</strong> replaces the fixed <code>0xC0DE</code> marker — another process can no longer call <code>SendInput</code> with a known ExtraInfo value to slip past the LL hook.</li>
+    <li><strong>Taskbar hidden</strong> via <code>NoTaskbar=1</code> while active, closing the Start-button left-click → click kiosk taskbar entry → close escape.</li>
+    <li><strong>WebView2 hardening</strong>: context menus, dev tools, status bar, zoom, and <code>NewWindowRequested</code> all disabled / rejected.</li>
+    <li><strong>Accessibility helpers IFEO-blocked</strong>: <code>sethc</code>, <code>osk</code>, <code>narrator</code>, <code>utilman</code>, <code>magnify</code> — closes Sticky-Keys-5x-Shift and the Ease-of-Access escape.</li>
+    <li><strong>Atomic CAS on the in-flight prompt flag</strong> inside <code>hookCallback</code> — a rapid second blocked combo can no longer race past the first and re-inject the wrong keystroke after auth.</li>
+    <li><strong>Modifier snapshot taken synchronously</strong> inside the hook — re-injection always uses the modifier state at press time, even if the user lets go before the WebView2 modal opens.</li>
   </ul>
 </div>
 
 <p style="margin: 1rem 0 1.5rem;">For the full release-by-release breakdown, see the <a href="https://github.com/Shalom-Karr/kiosk-exit-guard/blob/main/docs/CHANGELOG.md" style="color: var(--accent);">changelog</a>.</p>
 
 <div class="feature-grid">
+  <div class="feature"><h4><span class="dot new"></span>Random re-injection nonce<span class="badge">v1.0.6</span></h4><p>The fixed <code>0xC0DE</code> ExtraInfo marker is replaced with a <code>uintptr</code> drawn from <code>crypto/rand</code> at controller startup. Another process can no longer forge a <code>SendInput</code> call that bypasses the LL hook. Never written to the log.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>Taskbar hidden while active<span class="badge">v1.0.6</span></h4><p><code>NoTaskbar=1</code> under HKCU Explorer policies; Explorer is restarted so the change takes effect immediately. Closes the Start-button left-click escape (click Start → click the kiosk's taskbar entry → close).</p></div>
+  <div class="feature"><h4><span class="dot new"></span>WebView2 kiosk hardening<span class="badge">v1.0.6</span></h4><p>Default context menus, dev tools (F12 / Ctrl+Shift+I), status bar, and zoom controls disabled via WebView2 <code>Settings</code>. <code>NewWindowRequested</code> rejected so popups, <code>target=_blank</code>, and <code>window.open</code> can't spawn a second window outside the kiosk.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>Accessibility helpers IFEO-blocked<span class="badge">v1.0.6</span></h4><p><code>sethc.exe</code>, <code>osk.exe</code>, <code>narrator.exe</code>, <code>utilman.exe</code>, <code>magnify.exe</code> redirect to <code>--silent-exit</code> alongside <code>chrome.exe</code> / <code>msedge.exe</code>. Closes Sticky-Keys-5x-Shift, Narrator, and Ease-of-Access escapes.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>Atomic CAS on prompt flag<span class="badge">v1.0.6</span></h4><p><code>hookCallback</code> now does a <code>CompareAndSwap</code> on <code>promptOpen</code> before queuing the prompt. A rapid second blocked combo can no longer race past the first and overwrite <code>pendingComboV</code> — only one in-flight prompt exists at a time.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>Synchronous modifier snapshot<span class="badge">v1.0.6</span></h4><p><code>capturedModifiers()</code> runs inside <code>hookCallback</code> at the moment the blocked event fires, not 200+ ms later after the WebView2 spawn delay. Releasing modifiers before the modal opens no longer causes a bare key to be re-injected after auth.</p></div>
   <div class="feature"><h4><span class="dot new"></span>Log file + panic recovery<span class="badge">v1.0.4</span></h4><p><code>kiosk-exit-guard.log</code> next to the exe captures controller startup, hook installation, pauses, auto-resumes, errors, and panic stack traces. 5 MB rotation (renames to <code>.log.old</code>).</p></div>
   <div class="feature"><h4><span class="dot new"></span>Modal hang fix<span class="badge">v1.0.3</span></h4><p>Stripped <code>SetForegroundWindow</code> and <code>BringWindowToTop</code> from the topmost path — they have eligibility rules that caused the modal to render blank white and go "Not Responding" on Server SKUs.</p></div>
   <div class="feature"><h4><span class="dot new"></span>Per-monitor DPI awareness<span class="badge">v1.0.3</span></h4><p>Manifest now declares <code>PerMonitorV2</code> awareness. <code>GetSystemMetrics(SM_CXSCREEN)</code> returns physical pixels on 4K — kiosk window covers the full native resolution instead of scaled logical area.</p></div>

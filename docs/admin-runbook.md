@@ -74,19 +74,22 @@ Expect: `PasswordHash` is a non-empty bcrypt blob, `KioskURL` is your kiosk URL.
 
 ```powershell
 Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\System" -Name DisableTaskMgr -ErrorAction SilentlyContinue
-Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer" -Name NoRun, NoTrayContextMenu, NoViewContextMenu -ErrorAction SilentlyContinue
+Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer" -Name NoRun, NoTrayContextMenu, NoViewContextMenu, NoTaskbar -ErrorAction SilentlyContinue
 ```
 
-Expect, while filter is active: all four values present and `= 1`. During a pause: all four values absent.
+Expect, while filter is active: all five values present and `= 1` (`NoTaskbar` added in v1.0.6 — hides the taskbar to close the Start-button left-click escape). During a pause: all five values absent.
 
 ### Are the IFEO blocks in place?
 
 ```powershell
-Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\chrome.exe" -Name Debugger -ErrorAction SilentlyContinue
-Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\msedge.exe" -Name Debugger -ErrorAction SilentlyContinue
+$ifeoRoot = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
+foreach ($exe in @("chrome.exe","msedge.exe","sethc.exe","osk.exe","narrator.exe","utilman.exe","magnify.exe")) {
+    Get-ItemProperty "$ifeoRoot\$exe" -Name Debugger -ErrorAction SilentlyContinue |
+        Select-Object @{N='Exe';E={$exe}}, Debugger
+}
 ```
 
-Expect: `Debugger = "C:\Program Files\KioskExitGuard\kiosk-exit-guard.exe" --silent-exit`. **Permanent** — applies whether the filter is active or paused.
+Expect: every row has `Debugger = "C:\Program Files\KioskExitGuard\kiosk-exit-guard.exe" --silent-exit`. **Permanent** — applies whether the filter is active or paused. The five accessibility helpers (`sethc`, `osk`, `narrator`, `utilman`, `magnify`) were added in v1.0.6 to close the Sticky-Keys-5x-Shift and Ease-of-Access escapes.
 
 ### Is a pause currently active?
 
@@ -112,10 +115,12 @@ The bcrypt hash is one-way; we cannot recover the password from it. The only rec
 Get-Process kiosk-exit-guard | Stop-Process -Force
 schtasks /Delete /F /TN KioskExitGuard
 Remove-Item -Recurse -Force "HKLM:\Software\KioskExitGuard"
-Remove-Item -Recurse -Force "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\chrome.exe"
-Remove-Item -Recurse -Force "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\msedge.exe"
+$ifeoRoot = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
+foreach ($exe in @("chrome.exe","msedge.exe","sethc.exe","osk.exe","narrator.exe","utilman.exe","magnify.exe")) {
+    Remove-Item -Recurse -Force "$ifeoRoot\$exe" -ErrorAction SilentlyContinue
+}
 Remove-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\System" -Name DisableTaskMgr -ErrorAction SilentlyContinue
-Remove-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer" -Name NoRun, NoTrayContextMenu, NoViewContextMenu -ErrorAction SilentlyContinue
+Remove-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer" -Name NoRun, NoTrayContextMenu, NoViewContextMenu, NoTaskbar -ErrorAction SilentlyContinue
 Remove-Item -Recurse -Force "C:\Program Files\KioskExitGuard\filter_mode.state","C:\Program Files\KioskExitGuard\pause_until.state" -ErrorAction SilentlyContinue
 ```
 
@@ -129,7 +134,7 @@ Use `--reset` to clear the registry lockdown without uninstalling everything:
 "C:\Program Files\KioskExitGuard\kiosk-exit-guard.exe" --reset
 ```
 
-Password-gated. Clears `DisableTaskMgr`, `NoRun`, `NoTrayContextMenu`, `NoViewContextMenu`, the IFEO blocks, and resets `filter_mode.state`. The scheduled task and the HKLM config survive — so on the next launch the controller starts up clean with the same password.
+Password-gated. Clears `DisableTaskMgr`, `NoRun`, `NoTrayContextMenu`, `NoViewContextMenu`, `NoTaskbar`, all IFEO blocks (browsers and accessibility helpers), and resets `filter_mode.state`. The scheduled task and the HKLM config survive — so on the next launch the controller starts up clean with the same password.
 
 If `--reset` itself fails (HKLM gone, no password to verify), fall back to "I lost the password" above.
 

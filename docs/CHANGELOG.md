@@ -4,6 +4,36 @@ All notable changes to kiosk-exit-guard, newest first. Versions follow [Semantic
 
 For the current state of the project, see the [landing page](https://shalom-karr.github.io/kiosk-exit-guard/), the [architecture doc](architecture.md), and the [admin runbook](admin-runbook.md).
 
+## v1.0.6 — 2026-05-12
+
+**Production-readiness fixes from a multi-agent security and UX audit.**
+
+Security:
+
+- Per-process random re-injection nonce. The old `kioskMarkerCode = 0xC0DE` fixed constant meant any other process could call `SendInput` with that ExtraInfo value and bypass the LL keyboard hook. Replaced with a `uintptr` drawn from `crypto/rand` at controller startup and never written to the log file. Every process restart re-randomizes; no attacker-observable value.
+- Taskbar hidden while the filter is active. `applyLockdown` now writes `NoTaskbar=1` under `HKCU\…\Policies\Explorer` and restarts Explorer so the change takes effect immediately. Closes the Start-button left-click escape — a user could previously click Start, then click the kiosk's taskbar entry to focus and close it.
+- WebView2 kiosk hardening. Default context menus, dev tools (F12 / Ctrl+Shift+I), the status bar, and zoom controls are disabled via the WebView2 `Settings` object. `NewWindowRequested` is handled and rejected, so popups, target=_blank links, and `window.open` calls cannot spawn a second WebView2 window outside the kiosk. Closes the file-picker, dev-tools, and child-window escape paths.
+- IFEO Debugger redirects extended to accessibility helpers. `sethc.exe`, `osk.exe`, `narrator.exe`, `utilman.exe`, and `magnify.exe` now redirect to `kiosk-exit-guard --silent-exit` alongside `chrome.exe` / `msedge.exe`. Closes the Sticky-Keys-five-shifts / Narrator / Ease-of-Access escape that ran an accessibility tool above the kiosk.
+- Atomic CompareAndSwap on `promptOpen` inside `hookCallback`. The previous check-then-set was TOCTOU — a second blocked combo arriving while the first was still being dispatched to the goroutine could overwrite `pendingComboV` and re-inject the wrong keystroke after auth. The hook itself now owns the CAS so only one in-flight prompt can exist.
+- Modifier snapshot captured inside `hookCallback` synchronously. `capturedModifiers()` used to be called by the goroutine after the 200+ ms WebView2 modal spawn delay; a user who released the modifiers in that window would re-inject a bare key on success. Captured at the moment the LL hook fires now, so re-injection always uses the modifier state at press time.
+
+UX:
+
+- Password modals now distinguish cancel from wrong-password. `askPasswordModal` returns a `passwordResult` enum (`pwOK` / `pwWrong` / `pwCancel`); every call site was rewritten so a user clicking Cancel no longer triggers the "Wrong password" toast. Cancelling the pause / update / uninstall / reset / set-url flows is now silent (the correct affordance) rather than shaming.
+- Wrong-password retry happens inline inside the modal. Up to 3 attempts; the error appears in the modal's `#err` div (kept hidden until needed) with "N attempts left" feedback. Eliminates the cold-start delay of spawning a second WebView2 host just to render a "Wrong password" toast — the existing modal stays up and the input is re-focused and cleared.
+- Cross-process modal serialization via a `Global\KioskExitGuardPromptMutex` named mutex. Previously, double-clicking the "Pause SK Filter" shortcut twice in quick succession opened two stacked fullscreen modals. The second `askPasswordModal` call now detects the existing owner, shows "Another SK Filter prompt is already open — finish that one first", and returns immediately.
+- `--pause` shortcut now refuses to re-pause when a pause is already in flight. Previously it would silently overwrite a 100-minute pause with a fresh 5-minute one. Now shows the existing pause's remaining time and points the user at "Resume SK Filter" to end early.
+- `--resume` shortcut shows a confirm dialog with the remaining pause time before clearing the pause. Prevents misclicks during long pause windows from snapping the kiosk back. Also no-ops with feedback if no pause is in flight.
+- `sync` loop gained a third branch: if the on-disk pause deadline is rewritten while the controller is already paused (a future feature: extending a pause from another process), the controller re-arms its `time.AfterFunc` timer to the new deadline rather than auto-resuming early based on the old one.
+- `--update` flow now stops the controller's scheduled task before attempting the exe rename. Previously the rename failed with "access is denied" because Windows held an exclusive lock on the running .exe, and the admin had no in-UI path forward. The update now: `schtasks /End` → `taskkill` → 500 ms settle → up-to-5 rename retries → `schtasks /Run`. On rename failure the controller is automatically restarted so the device isn't left unprotected.
+- First-run wizard falls back to plain zenity dialogs when WebView2 creation fails. Previously a WebView2 crash on a stripped Windows image left the admin with no setup path and a silent `os.Exit(1)`.
+- First-run wizard cancel/X-out now shows an explanatory dialog instead of a silent exit so the admin understands they need to re-launch.
+- Chrome silent uninstall is now bounded by a 60s `context.WithTimeout`. Hung uninstallers no longer freeze first-run setup; the IFEO block is what actually prevents kiosk-escape via Chrome, so a leftover install is non-fatal.
+- Kiosk URL prompt validates the scheme (`https://`, `http://`, `file:///`). Previously a typo like `htttp://example.com` saved silently and the WebView2 child showed a Chromium error page; the prompt now loops with a warning until the URL is valid.
+- Uninstall reports failures in plain English mapped to remediation ("Open Task Scheduler and delete the task named …") instead of dumping raw `schtasks` output into a zenity dialog. Raw output is still written to `kiosk-exit-guard.log` for diagnosis.
+- Pause-duration cancel now shows "Pause cancelled. SK Filter is still active." so a misclick is obvious instead of silent.
+- Set-URL flow recognizes the zenity-cancel error and treats it as a clean exit rather than surfacing the raw "dialog cancelled" error message.
+
 ## v1.0.4 — 2026-05-11
 
 **Logging + panic recovery.**
