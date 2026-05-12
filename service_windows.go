@@ -491,6 +491,25 @@ func tokenFromExplorerInSession(sessionID uint32) (windows.Token, error) {
 			continue
 		}
 
+		// v1.1.8 HIGH#3 + MEDIUM#6: validate the process image path
+		// before trusting its token. gopsutil's Name() returns the
+		// process name from a user-readable enumeration that doesn't
+		// authenticate identity — a kiosk user can spawn a renamed-
+		// to-explorer.exe binary, and on the next supervisor tick we'd
+		// open its token, unwrap to the linked elevated half, and
+		// CreateProcessAsUser attacker code as the admin user. By
+		// calling QueryFullProcessImageName on the same handle we used
+		// for OpenProcessToken we re-derive the image from the kernel
+		// at the moment of token capture, which also closes the PID-
+		// recycle race (the OS guarantees the handle still refers to
+		// the originally-opened process for the lifetime of the
+		// handle). Reject anything that isn't %SystemRoot%\explorer.exe.
+		if !isLegitimateExplorerHandle(hProc) {
+			logf("service: rejecting non-system explorer.exe pid=%d (image path mismatch)", pid)
+			_ = windows.CloseHandle(hProc)
+			continue
+		}
+
 		var token windows.Token
 		tErr := windows.OpenProcessToken(
 			hProc,
@@ -520,6 +539,37 @@ func tokenFromExplorerInSession(sessionID uint32) (windows.Token, error) {
 		return 0, fmt.Errorf("no usable explorer.exe in session %d (last error: %v)", sessionID, lastErr)
 	}
 	return 0, fmt.Errorf("no explorer.exe found in session %d (is a user logged in?)", sessionID)
+}
+
+// isLegitimateExplorerHandle reports whether the process referred to by
+// hProc has an image path equal to %SystemRoot%\explorer.exe (case-
+// insensitive). Called inside tokenFromExplorerInSession right after a
+// successful OpenProcess so we authenticate the process by its on-disk
+// image — not by its enumerable name — before unwrapping its token.
+//
+// Closes v1.1.8 HIGH#3 (kiosk user spawns renamed-to-explorer.exe to
+// have the Service unwrap its linked elevated token and execute
+// attacker code) and v1.1.8 MEDIUM#6 (PID-recycle race: between
+// gopsutil's enumeration and OpenProcess the PID could in theory have
+// been recycled — but the open handle pins the original kernel object,
+// so QueryFullProcessImageName on that handle returns the image of
+// whatever-the-kernel-currently-knows-as that handle, which is the
+// process we opened, not a recycled one).
+func isLegitimateExplorerHandle(hProc windows.Handle) bool {
+	systemRoot := os.Getenv("SystemRoot")
+	if systemRoot == "" {
+		systemRoot = `C:\Windows`
+	}
+	expected := strings.ToLower(systemRoot + `\explorer.exe`)
+
+	buf := make([]uint16, windows.MAX_PATH)
+	size := uint32(len(buf))
+	if err := windows.QueryFullProcessImageName(hProc, 0, &buf[0], &size); err != nil {
+		logf("isLegitimateExplorerHandle: QueryFullProcessImageName failed: %v", err)
+		return false
+	}
+	actual := strings.ToLower(windows.UTF16ToString(buf[:size]))
+	return actual == expected
 }
 
 // elevatedLinkedToken returns the elevated counterpart of a UAC-split
@@ -641,10 +691,94 @@ func runServiceRemove() {
 	logf("service: remove complete")
 }
 
-// isLaunchedByService reports whether the current process has the env
-// marker we set in spawnControllerInSession. Controllers spawned this way
-// must NOT trigger first-run setup — the admin owns that path, not the
-// supervising Service.
+// isLaunchedByService reports whether the current process was spawned
+// by the supervising Service. v1.1.8 LOW#9 hardening: previously this
+// just checked the KIOSK_EXIT_GUARD_VIA_SERVICE environment variable,
+// which any process can forge before exec'ing kiosk-exit-guard.exe. A
+// kiosk user who can reach a shell could set the env var, run the exe
+// manually, and have it suppress the first-run wizard — leaving the
+// device with no password configured AND no kiosk lockdown, then
+// trick the admin into running the exe in a clean shell to complete
+// setup.
+//
+// New gating: look up our parent PID via CreateToolhelp32Snapshot,
+// then use QueryFullProcessImageName to read the parent's exe path.
+// If it's %SystemRoot%\System32\services.exe we were genuinely
+// spawned by the SCM-launched Service, since CreateProcessAsUserW
+// makes the supervising service the parent process of the spawned
+// controller. Otherwise treat as a manual launch.
+//
+// The env var is still honored as a hint when the parent lookup
+// fails (snapshot creation can fail on stripped SKUs) so we don't
+// regress the v1.1.0 behavior — but the parent path is the source of
+// truth when available.
 func isLaunchedByService() bool {
-	return strings.EqualFold(os.Getenv(envViaService), "1")
+	parentPath, ok := parentProcessImagePath()
+	if !ok {
+		// Fall back to the legacy env-var hint. Logged so audits can
+		// see when we couldn't authenticate the parent.
+		hint := strings.EqualFold(os.Getenv(envViaService), "1")
+		logf("isLaunchedByService: parent lookup failed, env hint=%v", hint)
+		return hint
+	}
+	systemRoot := os.Getenv("SystemRoot")
+	if systemRoot == "" {
+		systemRoot = `C:\Windows`
+	}
+	expected := strings.ToLower(systemRoot + `\System32\services.exe`)
+	actual := strings.ToLower(parentPath)
+	return actual == expected
+}
+
+// parentProcessImagePath returns the full path to our parent process's
+// exe, using a toolhelp snapshot to find the parent PID and
+// QueryFullProcessImageName to read the path from the kernel. Returns
+// ok=false on any failure so the caller can fall back to the env hint.
+// v1.1.8 LOW#9.
+func parentProcessImagePath() (string, bool) {
+	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		logf("parentProcessImagePath: CreateToolhelp32Snapshot failed: %v", err)
+		return "", false
+	}
+	defer windows.CloseHandle(snap)
+
+	var entry windows.ProcessEntry32
+	entry.Size = uint32(unsafe.Sizeof(entry))
+	if err := windows.Process32First(snap, &entry); err != nil {
+		logf("parentProcessImagePath: Process32First failed: %v", err)
+		return "", false
+	}
+	selfPID := uint32(os.Getpid())
+	var parentPID uint32
+	found := false
+	for {
+		if entry.ProcessID == selfPID {
+			parentPID = entry.ParentProcessID
+			found = true
+			break
+		}
+		if err := windows.Process32Next(snap, &entry); err != nil {
+			break
+		}
+	}
+	if !found || parentPID == 0 {
+		logf("parentProcessImagePath: own PID %d not found in snapshot", selfPID)
+		return "", false
+	}
+
+	hProc, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, parentPID)
+	if err != nil {
+		logf("parentProcessImagePath: OpenProcess(parent=%d) failed: %v", parentPID, err)
+		return "", false
+	}
+	defer windows.CloseHandle(hProc)
+
+	buf := make([]uint16, windows.MAX_PATH)
+	size := uint32(len(buf))
+	if err := windows.QueryFullProcessImageName(hProc, 0, &buf[0], &size); err != nil {
+		logf("parentProcessImagePath: QueryFullProcessImageName(parent=%d) failed: %v", parentPID, err)
+		return "", false
+	}
+	return windows.UTF16ToString(buf[:size]), true
 }

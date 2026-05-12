@@ -2,6 +2,21 @@
 
 Single-binary kiosk lockdown utility for **Windows 11 Home** (no Assigned Access). One ~7 MB exe contains an embedded WebView2 kiosk window, a low-level keyboard hook with re-injection, an HKLM-backed password store, Chrome / Edge launch blocks at the OS level, a Chrome uninstaller, a self-installer, a self-updater, and four desktop shortcuts for the admin.
 
+## What's in v1.1.8
+
+Security-audit pass — nine findings across the install, update, service-spawn, and registry-storage paths all closed:
+
+- **Install path locked down.** First-run now relocates the exe to `%ProgramFiles%\KioskExitGuard\kiosk-exit-guard.exe` before registering the Service binary path, scheduled task, and desktop shortcuts. Previously the SCM-registered path was wherever the admin double-clicked from — usually `Downloads`, which is kiosk-user-writable; a kiosk user could swap the binary and have the supervising Service respawn attacker code as LocalSystem.
+- **`--update` integrity verified.** Downloaded exe now stages under `%ProgramData%\KioskExitGuard\staging\` (admin-only DACL via `icacls`) instead of `%TEMP%` (user-writable), and the SHA-256 is verified against a new `kiosk-exit-guard.exe.sha256` sidecar asset published by the release workflow. Mismatch aborts the update.
+- **Explorer-token fallback authenticated.** The Service's `WTSQueryUserToken`-NO_TOKEN fallback (v1.1.3) trusted any process named `explorer.exe`. It now `QueryFullProcessImageName`s the kernel handle to confirm the image is `%SystemRoot%\explorer.exe` before unwrapping the linked elevated token — closes the "kiosk user spawns renamed-to-explorer.exe to get LocalSystem code-exec" path and the PID-recycle race.
+- **WebView2 profile admin-only.** All four `webview2.NewWithOptions` call sites (password modal, toast, first-run wizard, kiosk page) now share `%ProgramData%\KioskExitGuard\WebView2\` with the same locked-down DACL. The default `%LOCALAPPDATA%` profile was user-writable — a poisoned service worker could intercept the password modal's `kgSubmit` host-object call.
+- **HKLM password-hash DACL tightened.** Default `HKLM\Software` inherits `BUILTIN\Users:KEY_READ` — the bcrypt hash was readable by any local user (offline-crackable). Tightened via `SetNamedSecurityInfo(SE_REGISTRY_KEY, SDDL=D:PAI(A;CI;KA;;;SY)(A;CI;KA;;;BA))` on every controller startup so existing installs heal.
+- **LL keyboard hook installed earlier in `main()`.** Previously the gap between `killRunningController()` and `SetWindowsHookExW` (seconds for first-run, ~half a second for steady-state) was unprotected. Moved the hook install up so the new hook is alive before the old controller is killed.
+- **PowerShell injection prep.** `installStartupTask` now passes the exe path and task name via `$env:KEG_EXE` / `$env:KEG_TASKNAME` and the script body via `-EncodedCommand <base64-utf16le>` instead of `fmt.Sprintf` into a heredoc — not exploitable today, but future-proof.
+- **`isLaunchedByService` authenticated via parent PID.** Previously the `KIOSK_EXIT_GUARD_VIA_SERVICE` env var was the entire gate; any process could forge it. Now uses `CreateToolhelp32Snapshot` to look up the parent PID and `QueryFullProcessImageName` to confirm the parent is `%SystemRoot%\System32\services.exe`.
+
+Detailed root-cause + fix breakdown in [docs/CHANGELOG.md](docs/CHANGELOG.md).
+
 ## What's in v1.1.5
 
 `Ctrl+0` (zoom reset), `Ctrl+-` (zoom out), and `Ctrl++` / `Ctrl+=` (zoom in) — plus numpad equivalents — now pass through the LL hook to the kiosk WebView2 page instead of triggering the password modal. Joins the existing always-allowed list of `F5` and `Ctrl+R`. Still Ctrl-only: `Win+0` / `Alt+-` etc. continue to hit the lockdown path.

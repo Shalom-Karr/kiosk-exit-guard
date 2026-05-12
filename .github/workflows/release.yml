@@ -36,9 +36,27 @@ jobs:
           GOARCH: amd64
         run: go build -ldflags="-H windowsgui -s -w" -o kiosk-exit-guard.exe .
 
+      # v1.1.8 CRITICAL#2: publish a sidecar SHA-256 file alongside the
+      # exe so the in-app `--update` flow can verify integrity before
+      # replacing the running binary. fetchExpectedSHA256 in main.go
+      # reads the first whitespace-delimited token, so the canonical
+      # Get-FileHash output ("HEX") works directly. ASCII / no BOM /
+      # no trailing newline (-NoNewline) keeps the file as small and
+      # parser-tolerant as possible.
+      - name: Generate SHA-256 sidecar
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Algorithm SHA256 kiosk-exit-guard.exe).Hash.ToLower()
+          [System.IO.File]::WriteAllText(
+            (Join-Path $PWD 'kiosk-exit-guard.exe.sha256'),
+            $hash,
+            [System.Text.UTF8Encoding]::new($false))
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: kiosk-exit-guard.exe
+          files: |
+            kiosk-exit-guard.exe
+            kiosk-exit-guard.exe.sha256
           generate_release_notes: true
           name: ${{ github.ref_name }}

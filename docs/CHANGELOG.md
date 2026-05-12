@@ -4,6 +4,80 @@ All notable changes to kiosk-exit-guard, newest first. Versions follow [Semantic
 
 For the current state of the project, see the [landing page](https://shalom-karr.github.io/kiosk-exit-guard/), the [architecture doc](architecture.md), and the [admin runbook](admin-runbook.md).
 
+## v1.1.8 — 2026-05-12
+
+**Security audit pass: every finding addressed.** Nine concrete fixes spanning install-path hardening, update-flow integrity, identity authentication of the explorer-token fallback, WebView2 profile isolation, registry DACL tightening, hook-install ordering, PowerShell injection prep, and parent-PID authentication.
+
+### CRITICAL #1 — exe relocated to %ProgramFiles% before SCM registers its path
+
+**Root cause:** `installService` (`service_windows.go:111`) called `os.Executable()` and registered whatever path the admin double-clicked from. On this user's machine that was `C:\Users\<user>\Downloads\kiosk-exit-guard.exe` — kiosk-user-writable. The kiosk user could swap the binary and on the next Service start the supervisor (LocalSystem) would respawn attacker code as LocalSystem.
+
+**Fix:** new `relocateToProgramFilesIfNeeded()` (`main.go`) runs at the top of `firstRunWithWizard`. Detects whether the running exe is already at `%ProgramFiles%\KioskExitGuard\kiosk-exit-guard.exe`; if not, mkdir + copy + re-exec the canonical copy with the original argv, and `os.Exit(0)` the staging process. The re-exec'd canonical copy completes first-run from the admin-only directory so `installService`, `installStartupTask`, and `createDesktopShortcut` all register the ProgramFiles path. Uses `os.Getenv("ProgramFiles")` so non-en-US installs land in the localized path. On any failure (mkdir / copy / exec) we fall back to installing from the current location with a logged warning — kiosk-user gets weaker but still some protection, which beats none.
+
+`runUninstallInvocation` now calls a companion `cleanupInstallDir()` (`main.go`) that walks `%ProgramFiles%\KioskExitGuard` and removes every file except the running exe (Windows file-locks it), then schedules the running exe + containing directory for delete-on-reboot via `MoveFileExW(MOVEFILE_DELAY_UNTIL_REBOOT)`. Skipped if the running exe isn't at the canonical path (don't nuke `~/Downloads/`).
+
+### CRITICAL #2 — `--update` now stages in %ProgramData% and verifies SHA-256
+
+**Root cause:** `runUpdateInvocation` (`main.go:2702`) downloaded the new exe to `os.TempDir()`. `%TEMP%` is user-writable. Between `downloadFile` and `os.Rename` a kiosk user could swap the temp file and have us atomically install attacker code as part of the legitimate update flow. There was also no integrity check on the downloaded bytes — a GitHub Releases compromise (token leak, supply-chain) would replace the running controller silently.
+
+**Fix:** two layers.
+
+- **Admin-only staging directory.** `tmpPath` is now `%ProgramData%\KioskExitGuard\staging\kiosk-exit-guard.new.exe`. A new shared helper `ensureAdminOnlyDir(path)` (`main.go`) mkdir's the directory and invokes `icacls /inheritance:r /grant:r "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F"` so even a kiosk-user-writable inheritance from `%ProgramData%` can't widen the ACL. Same helper is reused by HIGH#4 for the WebView2 user-data folder. Update aborts with `zenity.Error` if the staging dir can't be locked down.
+- **SHA-256 sidecar verification.** `fetchLatestRelease` returns three values now (`version`, `exeURL`, `shaURL`); it also scans release assets for `kiosk-exit-guard.exe.sha256`. If present, `fetchExpectedSHA256` downloads the sidecar (first whitespace-delimited token, accept canonical `Get-FileHash` output), `fileSHA256` hashes the downloaded exe, and a `strings.EqualFold` mismatch aborts the update with a `zenity.Error` pointing at the issue tracker. If the sidecar is absent (legacy releases), log a warning and proceed — refusing updates without an integrity proof would brick existing installs that pre-date this fix.
+
+The release workflow (`.github/workflows/release.yml`) gained a "Generate SHA-256 sidecar" step that runs `Get-FileHash -Algorithm SHA256 kiosk-exit-guard.exe` and writes the lowercase hex digest to `kiosk-exit-guard.exe.sha256` (ASCII, no BOM, no trailing newline) which is then attached to the release alongside the exe.
+
+### HIGH #3 — `tokenFromExplorerInSession` now authenticates explorer.exe by image path
+
+**Root cause:** `service_windows.go:468` trusted any process whose `gopsutil` `Name()` matched `explorer.exe`. A kiosk user can spawn a renamed-to-explorer.exe binary in the active console session; on the next supervisor tick the Service opens its token, unwraps the linked elevated half via `TokenLinkedToken`, and `CreateProcessAsUserW`'s attacker code as the admin user. Also a PID-recycle race window between the gopsutil enumeration and `OpenProcess` (MEDIUM #6 — same fix closes both).
+
+**Fix:** new `isLegitimateExplorerHandle(hProc windows.Handle)` (`service_windows.go`) called immediately after the successful `OpenProcess`. It calls `windows.QueryFullProcessImageName` on the kernel handle we just opened (NOT on the PID, which closes the recycle race — the handle pins the original kernel object regardless of PID reuse), and lowercases-compares the returned path against `%SystemRoot%\explorer.exe`. Anything else is rejected with a logged warning and the loop continues to the next candidate explorer.exe.
+
+### HIGH #4 — WebView2 user-data folder moved to admin-only %ProgramData% path
+
+**Root cause:** `go-webview2`'s default `DataPath` lands under `%LOCALAPPDATA%\<exe>.WebView2` — kiosk-user-writable. A kiosk user can plant a service-worker script in the profile that's then loaded by the `--ask-password` child WebView2 instance; the worker can intercept the `kgSubmit` host-object call and exfiltrate the plaintext password before bcrypt comparison.
+
+**Fix:** new `webView2DataPath()` returns `%ProgramData%\KioskExitGuard\WebView2`; `ensureWebView2DataDir()` lazily creates + DACL-tightens it via `ensureAdminOnlyDir` (shared with CRITICAL#2). Every `webview2.NewWithOptions` call site (`askPasswordModalInProcess`, `showFrontmostToast`, `runFirstRunWizard`, `runWebViewKiosk`) now passes `DataPath: ensureWebView2DataDir()` so all four in-process WebView2 instances share the same locked-down profile root. Verified `WebViewOptions.DataPath` is the top-level field name in the `github.com/jchv/go-webview2` v0.0.0-20260205173254-56598839c808 release (`webview.go:75`).
+
+### HIGH #5 — HKLM\Software\KioskExitGuard DACL now admin-only
+
+**Root cause:** default `HKLM\Software` ACL inherits `BUILTIN\Users:KEY_READ`. Any local user could read `HKLM\Software\KioskExitGuard\PasswordHash` and run an offline bcrypt-dictionary attack against it; the password becomes the kiosk-bypass + uninstall + update authorization across the whole device.
+
+**Fix:** new `tightenHKLMConfigDACL()` (`main.go`) calls `windows.SetNamedSecurityInfo` with `SE_REGISTRY_KEY`, object name `MACHINE\Software\KioskExitGuard`, and a DACL parsed from the SDDL `D:PAI(A;CI;KA;;;SY)(A;CI;KA;;;BA)` — protected (no inherit from HKLM\Software so the BUILTIN\Users:KEY_READ ACE doesn't leak in), auto-inherited (child keys inherit our DACL), SYSTEM full control + container-inherit, Administrators full control + container-inherit. Called from `saveHashToRegistry` (so first-run installs are tight from the first write) AND unconditionally on every controller startup right after `migrateLegacyHash` (so existing v1.1.7-and-earlier installs heal on first launch of v1.1.8). The `--ask-password` child runs as the same admin user that launched the controller, so granting BUILTIN\Administrators is sufficient for every internal call site.
+
+### MEDIUM #6 — PID-recycle race in explorer-token path
+
+Covered by HIGH #3's `isLegitimateExplorerHandle` — image path is re-derived from the kernel via `QueryFullProcessImageName` on the same handle we used for `OpenProcessToken`, so the race window between gopsutil's enumeration and our open is closed (the handle pins the original kernel object regardless of whether the PID is recycled later).
+
+### MEDIUM #7 — LL keyboard hook installed BEFORE `killRunningController()`
+
+**Root cause:** `main.go:3176` ran `killRunningController()` then `firstRunWithWizard` / `ensureWebView2Installed` / state loading, with the `SetWindowsHookExW` call only happening at the very end (`:3265`). In the seconds between the old controller dying and the new hook installing, no other controller was alive AND no hook was up — the kiosk was briefly unprotected.
+
+**Fix:** moved the `procSetWindowHookExW.Call` block to immediately after the `--reset` / `--set-password` / `--set-url` switch and `ensureWebView2Installed`, before `killRunningController`. The hook reads `filterMode.Load()` (default-false `atomic.Bool`) and `storedHash` (nil at this point) — since `filterMode` is still off, the hook is a structural no-op until the "default-ON" branch below flips it on. Once flipped, the hook is already running and starts intercepting immediately. The `GetMessageW` pump still lives at the bottom of `main()` (`runtime.LockOSThread` at the top guarantees it runs on the same thread that installed the hook for the controller's lifetime).
+
+### MEDIUM #8 — PowerShell injection hardening in `installStartupTask`
+
+**Root cause:** `main.go:776` used `fmt.Sprintf` to interpolate `taskName` and the `exe` path into a PowerShell heredoc with a single-quote-doubling escape. Not exploitable today — `taskName` is a compile-time constant and `os.Executable()` returns a kernel-derived path — but fragile.
+
+**Fix:** the exe path and task name flow through environment variables (`KEG_EXE`, `KEG_TASKNAME`) on the spawned PowerShell process; the script body references `$env:KEG_EXE` / `$env:KEG_TASKNAME` so no values are interpolated into PS source text. The script body itself is now passed via `-EncodedCommand <base64-of-UTF-16-LE>` to dodge any quoting / parser edge cases in argument transit between Go's `exec.Command` and PowerShell's argv parser. `cmd.Env = append(os.Environ(), ...)` keeps the temporary env vars out of the calling Go process's environment. New helper `utf16LEBytes(s string)` encodes the script body for `-EncodedCommand`.
+
+### LOW #9 — `isLaunchedByService` now authenticates via parent-PID lookup
+
+**Root cause:** `service_windows.go:649` decided whether to suppress first-run by checking the `KIOSK_EXIT_GUARD_VIA_SERVICE` env var. Any process can set the env var before exec'ing `kiosk-exit-guard.exe`. A kiosk user with shell access could set it, run the exe manually, and have first-run suppressed — leaving the device with no password and no lockdown applied, ready for the admin to walk into a half-installed state.
+
+**Fix:** new `parentProcessImagePath()` (`service_windows.go`) uses `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)` + `Process32First` / `Process32Next` to find our own PID's entry, reads `ParentProcessID`, then `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` + `QueryFullProcessImageName` to read the parent's image. `isLaunchedByService` now compares against `%SystemRoot%\System32\services.exe` — `CreateProcessAsUserW` from the SCM-launched Service makes services.exe (the parent of the Service) the parent of the spawned controller. The env var is kept as a fallback hint when the snapshot path fails (stripped SKUs / locked-down SCM) to avoid regressing v1.1.0 behavior, but the parent path is the source of truth when available.
+
+### Shared helpers
+
+- **`ensureAdminOnlyDir(path string)`** (`main.go`): mkdir + icacls inheritance/grant. Used by CRITICAL#2 (staging dir) and HIGH#4 (WebView2 user-data dir).
+- **`canonicalInstallDir() / canonicalInstallPath()`** (`main.go`): env-resolved `%ProgramFiles%\KioskExitGuard\...` paths for the relocation logic.
+- **`programDataDir() / webView2DataPath()`** (`main.go`): env-resolved `%ProgramData%\KioskExitGuard\...` roots.
+- **`utf16LEBytes(s string)`** (`main.go`): UTF-16-LE encoder for PowerShell `-EncodedCommand`.
+
+### Build
+
+`goversioninfo -64 versioninfo.json` regenerated the resource. `go build -ldflags="-H windowsgui -s -w" -o kiosk-exit-guard.exe ./...` produces a 7.88 MB binary (was 7.79 MB on v1.1.7).
+
 ## v1.1.7 — 2026-05-12
 
 **Pause-duration picker now visible on the fullscreen kiosk.** v1.1.6 fixed the password modal's foreground-grab; this fix covers the screen that comes AFTER the password — the "1 / 5 / 10 / 20 / 30 / 45 / custom" duration picker. User report: "after the password when I tried to set if it was 1 minute or 5 or other that I couldn't see it."

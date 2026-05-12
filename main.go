@@ -30,7 +30,10 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -53,12 +56,13 @@ import (
 	"github.com/ncruces/zenity"
 	"github.com/shirou/gopsutil/v4/process"
 	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 )
 
 // currentVersion must be kept in sync with versioninfo.json. Used by the
 // --update flow to compare against the latest GitHub release tag.
-const currentVersion = "1.1.7"
+const currentVersion = "1.1.8"
 
 // ---------- logging ----------
 
@@ -365,6 +369,89 @@ func statePath() (string, error)    { return nextToExe(stateFileName) }
 func kioskURLPath() (string, error) { return nextToExe(kioskURLFileName) }
 func pausePath() (string, error)    { return nextToExe(pauseFileName) }
 
+// canonicalInstallDir returns the canonical install directory under
+// %ProgramFiles%\KioskExitGuard. Using %ProgramFiles% (env-resolved, not
+// hardcoded) means we land in C:\Program Files on a normal Win11 box and
+// in the localized path on non-en-US installs. Admin-write-only by
+// default DACL inherited from %ProgramFiles%.
+func canonicalInstallDir() string {
+	pf := os.Getenv("ProgramFiles")
+	if pf == "" {
+		pf = `C:\Program Files`
+	}
+	return filepath.Join(pf, "KioskExitGuard")
+}
+
+// canonicalInstallPath is the canonical exe location v1.1.8+ relocates
+// to on first run so the SCM-registered binary path can't be replaced
+// by the kiosk user. v1.1.8 security fix CRITICAL#1.
+func canonicalInstallPath() string {
+	return filepath.Join(canonicalInstallDir(), "kiosk-exit-guard.exe")
+}
+
+// programDataDir returns %ProgramData%\KioskExitGuard — the admin-only
+// staging + WebView2 user-data root. Created lazily by ensureAdminOnlyDir.
+func programDataDir() string {
+	pd := os.Getenv("ProgramData")
+	if pd == "" {
+		pd = `C:\ProgramData`
+	}
+	return filepath.Join(pd, "KioskExitGuard")
+}
+
+// ensureAdminOnlyDir creates dir (and any missing parents) and tightens
+// the DACL via icacls so only SYSTEM and BUILTIN\Administrators can read
+// or write. Idempotent — safe to call on every controller startup. Used
+// for the v1.1.8 update-staging dir (CRITICAL#2) and the WebView2
+// user-data dir (HIGH#4) so a non-admin kiosk user can't poison either.
+//
+// Returns nil on success. On failure logs and returns the error; callers
+// generally treat failure as fatal for the operation they were trying to
+// secure (e.g. abort the --update flow).
+func ensureAdminOnlyDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("mkdir %s: %w", dir, err)
+	}
+	// icacls returns 0 on success and a non-zero code with a message on
+	// failure. The "/inheritance:r" removes inherited ACEs so a less-
+	// restrictive %ProgramData% inheritance can't widen access; the two
+	// /grant:r entries then re-add only SYSTEM and Administrators with
+	// (OI)(CI)F = full control, object + container inherit. Result: any
+	// new file under dir is also admin-only by inheritance.
+	cmd := exec.Command("icacls", dir,
+		"/inheritance:r",
+		"/grant:r", "SYSTEM:(OI)(CI)F",
+		"/grant:r", "Administrators:(OI)(CI)F")
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		// Log but don't fail — the directory still exists, just with
+		// inherited (potentially broader) ACL. Callers can decide whether
+		// that's acceptable.
+		logf("ensureAdminOnlyDir(%s): icacls failed: %v: %s", dir, err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("icacls %s: %w", dir, err)
+	}
+	return nil
+}
+
+// webView2DataPath is the admin-only WebView2 user-data folder shared
+// across all in-process WebView2 instances (password modal, toast,
+// first-run wizard). v1.1.8 security fix HIGH#4 — moves the profile out
+// of %LOCALAPPDATA% where a kiosk user could write a service-worker
+// script that intercepts the password modal's kgSubmit binding.
+func webView2DataPath() string {
+	return filepath.Join(programDataDir(), "WebView2")
+}
+
+// ensureWebView2DataDir lazily creates the admin-only WebView2 user-
+// data directory. Idempotent. Best-effort — if it fails we still pass
+// the path to WebView2 (it'll create what it can with default ACLs); the
+// security guarantee is weaker but the modal still works.
+func ensureWebView2DataDir() string {
+	p := webView2DataPath()
+	_ = ensureAdminOnlyDir(p)
+	return p
+}
+
 // ---------- HKLM password / URL storage ----------
 
 func loadHashFromRegistry() ([]byte, error) {
@@ -392,7 +479,63 @@ func saveHashToRegistry(hash []byte) error {
 		return fmt.Errorf("open %s: %w", regAppKey, err)
 	}
 	defer k.Close()
-	return k.SetBinaryValue(regHashValue, hash)
+	if err := k.SetBinaryValue(regHashValue, hash); err != nil {
+		return err
+	}
+	// v1.1.8 HIGH#5: HKLM\Software inherits BUILTIN\Users:KEY_READ by
+	// default, so the bcrypt hash was readable by any local user (and
+	// thus targetable by an offline crack). Tighten the DACL right
+	// after a successful write so existing installs heal on first
+	// launch of the new exe. tightenHKLMConfigDACL is idempotent.
+	tightenHKLMConfigDACL()
+	return nil
+}
+
+// tightenHKLMConfigDACL installs an admin-only DACL on the HKLM config
+// key (HKLM\Software\KioskExitGuard) so the bcrypt password hash is not
+// readable by BUILTIN\Users. The default %SystemRoot% ACL inherits
+// BUILTIN\Users:KEY_READ from HKLM\Software, which exposes the hash to
+// any local user — they can then target the hash with an offline
+// dictionary crack. After this call the key (and any subkey created
+// later, via the CI = container-inherit flag in the SDDL) is readable
+// and writable only by SYSTEM and BUILTIN\Administrators.
+//
+// SDDL meaning: D:PAI(A;CI;KA;;;SY)(A;CI;KA;;;BA)
+//   - D: → DACL section
+//   - P → SE_DACL_PROTECTED (do NOT inherit from HKLM\Software, which
+//     is the entire point — otherwise BUILTIN\Users:KEY_READ leaks in)
+//   - AI → SE_DACL_AUTO_INHERITED (well-formed; child keys inherit)
+//   - (A;CI;KA;;;SY) → ALLOW SYSTEM KEY_ALL_ACCESS, container-inherit
+//   - (A;CI;KA;;;BA) → ALLOW BUILTIN\Administrators KEY_ALL_ACCESS, CI
+//
+// The --ask-password child runs as the same admin user that launched
+// the controller, so granting BUILTIN\Administrators is sufficient for
+// every internal call site. Idempotent: re-applies the same DACL on
+// every saveHashToRegistry call and on every controller startup.
+func tightenHKLMConfigDACL() {
+	const sddl = `D:PAI(A;CI;KA;;;SY)(A;CI;KA;;;BA)`
+	sd, err := windows.SecurityDescriptorFromString(sddl)
+	if err != nil {
+		logf("tightenHKLMConfigDACL: SecurityDescriptorFromString failed: %v", err)
+		return
+	}
+	dacl, _, err := sd.DACL()
+	if err != nil {
+		logf("tightenHKLMConfigDACL: SECURITY_DESCRIPTOR.DACL() failed: %v", err)
+		return
+	}
+	// SetNamedSecurityInfo with SE_REGISTRY_KEY: object name uses the
+	// "MACHINE\..." prefix (NOT the registry path syntax the registry
+	// package wants — the Win32 advapi32 API takes a different shape).
+	objName := `MACHINE\` + regAppKey
+	if err := windows.SetNamedSecurityInfo(
+		objName,
+		windows.SE_REGISTRY_KEY,
+		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
+		nil, nil, dacl, nil,
+	); err != nil {
+		logf("tightenHKLMConfigDACL: SetNamedSecurityInfo(%s) failed: %v", objName, err)
+	}
 }
 
 func loadKioskURLFromRegistry() string {
@@ -829,20 +972,59 @@ func installStartupTask() error {
 	if err != nil {
 		return err
 	}
-	exeQ := strings.ReplaceAll(exe, `'`, `''`)
-	ps := fmt.Sprintf(`
-$action  = New-ScheduledTaskAction -Execute '%s'
+	// v1.1.8 MEDIUM#8: PowerShell-injection hardening. Previously the
+	// exe path + task name were interpolated into the PowerShell
+	// heredoc via fmt.Sprintf with a single-quote escape. Not
+	// exploitable today because os.Executable returns a kernel-derived
+	// path and taskName is a compile-time constant, but fragile — any
+	// future change letting attacker-controlled data flow into either
+	// variable becomes a code-execution bug. Pass both via environment
+	// variables ($env:KEG_EXE / $env:KEG_TASKNAME) and base64-encode
+	// the script body so quoting / parser edge cases in the values
+	// can't escape into the surrounding shell syntax.
+	//
+	// PowerShell's -EncodedCommand expects a UTF-16-LE base64-encoded
+	// script. cmd.Env scoping keeps KEG_EXE/KEG_TASKNAME out of the
+	// parent process's environment.
+	const psScript = `
+$action  = New-ScheduledTaskAction -Execute $env:KEG_EXE
 $logon   = New-ScheduledTaskTrigger -AtLogOn
 $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -Hidden
 $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -RunLevel Highest -LogonType Interactive
-Register-ScheduledTask -TaskName '%s' -Action $action -Trigger $logon -Settings $settings -Principal $principal -Force | Out-Null
-`, exeQ, taskName)
-	cmd := exec.Command("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps)
+Register-ScheduledTask -TaskName $env:KEG_TASKNAME -Action $action -Trigger $logon -Settings $settings -Principal $principal -Force | Out-Null
+`
+	utf16 := utf16LEBytes(psScript)
+	encoded := base64.StdEncoding.EncodeToString(utf16)
+	cmd := exec.Command("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded)
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+	cmd.Env = append(os.Environ(),
+		"KEG_EXE="+exe,
+		"KEG_TASKNAME="+taskName,
+	)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("Register-ScheduledTask failed: %v: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// utf16LEBytes encodes a Go string into the little-endian UTF-16 byte
+// sequence PowerShell -EncodedCommand expects. Pure helper; no error
+// path because surrogate-pair handling is delegated to utf16.Encode
+// inside syscall.UTF16FromString which is well-tested for this exact
+// use case. v1.1.8 MEDIUM#8 helper.
+func utf16LEBytes(s string) []byte {
+	enc, _ := syscall.UTF16FromString(s)
+	// syscall.UTF16FromString terminates with a NUL; strip it so the
+	// PowerShell parser doesn't see a stray null at end-of-script.
+	if n := len(enc); n > 0 && enc[n-1] == 0 {
+		enc = enc[:n-1]
+	}
+	out := make([]byte, len(enc)*2)
+	for i, w := range enc {
+		out[i*2] = byte(w)
+		out[i*2+1] = byte(w >> 8)
+	}
+	return out
 }
 
 // ---------- key state ----------
@@ -1093,9 +1275,15 @@ const toastHTML = `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 // above the fullscreen topmost kiosk window. Falls back to zenity if
 // WebView2 fails (Runtime missing).
 func showFrontmostToast(text string, duration time.Duration) {
+	// v1.1.8 HIGH#4: pin the WebView2 user-data folder to an admin-only
+	// directory under %ProgramData% so a kiosk user can't poison the
+	// profile (service worker that scrapes the kgSubmit binding's
+	// password, persisted permissions, etc.). Default DataPath lives
+	// under %LOCALAPPDATA% which IS user-writable.
 	w := webview2.NewWithOptions(webview2.WebViewOptions{
 		Debug:     false,
 		AutoFocus: false,
+		DataPath:  ensureWebView2DataDir(),
 		WindowOptions: webview2.WindowOptions{
 			Title:  "SK Filter",
 			Width:  scaleToastDim(480),
@@ -1474,9 +1662,12 @@ type firstRunInput struct {
 // without submitting.
 func runFirstRunWizard() *firstRunInput {
 	result := &firstRunInput{}
+	// v1.1.8 HIGH#4: shared admin-only WebView2 data path. See
+	// askPasswordModalInProcess / showFrontmostToast.
 	w := webview2.NewWithOptions(webview2.WebViewOptions{
 		Debug:     false,
 		AutoFocus: true,
+		DataPath:  ensureWebView2DataDir(),
 		WindowOptions: webview2.WindowOptions{
 			Title:  "kiosk-exit-guard — first run",
 			Width:  720, // overridden by makeModalFullscreenTopmost
@@ -1566,11 +1757,97 @@ func firstRunZenityFallback() *firstRunInput {
 	return &firstRunInput{password: pw1, url: url, ok: true}
 }
 
+// relocateToProgramFilesIfNeeded ensures the exe is running from the
+// canonical %ProgramFiles%\KioskExitGuard directory before any of the
+// auto-start install paths (installService, installStartupTask,
+// createDesktopShortcut) register its current path. Without this the
+// SCM binary path / scheduled task / shortcut "TargetPath" all point
+// at wherever the admin first double-clicked the exe — which on this
+// user's machine was %USERPROFILE%\Downloads\, a kiosk-user-writable
+// directory. The kiosk user could swap the binary there and on next
+// service start the supervising Service (LocalSystem) would respawn
+// attacker code as LocalSystem.
+//
+// Returns true if we relocated and re-exec'd — caller MUST exit.
+// Returns false on any failure (mkdir, copy, exec) so the caller can
+// continue installing from the current location with a warning rather
+// than aborting the whole install. v1.1.8 CRITICAL#1 fix.
+func relocateToProgramFilesIfNeeded() bool {
+	exe, err := os.Executable()
+	if err != nil {
+		logf("relocate: os.Executable failed: %v", err)
+		return false
+	}
+	canonical := canonicalInstallPath()
+	if strings.EqualFold(exe, canonical) {
+		// Already running from the canonical path. Nothing to do.
+		return false
+	}
+	dir := canonicalInstallDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		logf("relocate: MkdirAll(%s) failed: %v — continuing from current location", dir, err)
+		return false
+	}
+
+	// Copy the running exe to the canonical path. Use a temp + rename
+	// so a partial copy can't leave behind a half-written canonical
+	// binary that the next launch would try to execute.
+	tmp := canonical + ".staging"
+	src, err := os.Open(exe)
+	if err != nil {
+		logf("relocate: open running exe failed: %v", err)
+		return false
+	}
+	dst, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
+	if err != nil {
+		src.Close()
+		logf("relocate: open destination %s failed: %v", tmp, err)
+		return false
+	}
+	if _, err := io.Copy(dst, src); err != nil {
+		src.Close()
+		dst.Close()
+		_ = os.Remove(tmp)
+		logf("relocate: io.Copy failed: %v", err)
+		return false
+	}
+	src.Close()
+	dst.Close()
+	// Replace any existing canonical exe so an upgrade-from-Downloads
+	// install correctly updates the on-disk binary.
+	_ = os.Remove(canonical)
+	if err := os.Rename(tmp, canonical); err != nil {
+		_ = os.Remove(tmp)
+		logf("relocate: rename %s -> %s failed: %v", tmp, canonical, err)
+		return false
+	}
+
+	logf("relocate: copied exe to canonical path %s — re-executing", canonical)
+	cmd := exec.Command(canonical, os.Args[1:]...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+	if err := cmd.Start(); err != nil {
+		logf("relocate: exec.Command(canonical).Start failed: %v — continuing from current location", err)
+		return false
+	}
+	return true
+}
+
 // firstRunWithWizard runs the full first-run sequence using the WebView2
 // wizard for password + URL, then performs the system-setup steps
 // (Chrome uninstall, IFEO blocks, Task Scheduler, desktop shortcut).
 // Returns whether setup completed cleanly.
 func firstRunWithWizard() bool {
+	// v1.1.8 CRITICAL#1: relocate to %ProgramFiles%\KioskExitGuard before
+	// registering any auto-start path so the SCM binary path / scheduled
+	// task / desktop shortcut all reference an admin-only directory.
+	// Best-effort: on any failure we keep going from the current
+	// location with a warning rather than aborting setup (kiosk-user
+	// still gets some protection, which beats none).
+	if relocateToProgramFilesIfNeeded() {
+		// New process now owns first-run; this process exits cleanly
+		// so the wizard doesn't pop twice.
+		os.Exit(0)
+	}
 	input := runFirstRunWizard()
 	if input == nil {
 		// WebView2 failed entirely — fall back to plain zenity so the
@@ -1658,9 +1935,13 @@ func makeFullscreenTopmost(hwnd uintptr) {
 // runWebViewKiosk renders the kiosk URL in a fullscreen WebView2 window.
 // Blocks until the window is destroyed.
 func runWebViewKiosk(url string) {
+	// v1.1.8 HIGH#4: admin-only WebView2 data path. The kiosk page
+	// itself rarely cares (it's the URL the admin configured) but
+	// consistency means the same profile DACL applies everywhere.
 	w := webview2.NewWithOptions(webview2.WebViewOptions{
 		Debug:     false,
 		AutoFocus: true,
+		DataPath:  ensureWebView2DataDir(),
 		WindowOptions: webview2.WindowOptions{
 			Title:  "Kiosk",
 			Width:  1024,
@@ -2195,9 +2476,14 @@ func askPasswordModalInProcess(title, subtitle string) passwordResult {
 		submitted bool
 	)
 
+	// v1.1.8 HIGH#4: see showFrontmostToast for rationale. The password
+	// modal is the highest-value WebView2 instance to protect — a
+	// poisoned profile injects a service worker that reads the input
+	// before kgSubmit fires.
 	w := webview2.NewWithOptions(webview2.WebViewOptions{
 		Debug:     false,
 		AutoFocus: true,
+		DataPath:  ensureWebView2DataDir(),
 		WindowOptions: webview2.WindowOptions{
 			Title:  "SK Filter — password required",
 			Width:  640, // overridden by makeModalFullscreenTopmost
@@ -2583,6 +2869,16 @@ func runUninstallInvocation() {
 	// 6. Remove desktop shortcuts.
 	removeDesktopShortcuts()
 
+	// v1.1.8 CRITICAL#1 cleanup: if we installed into
+	// %ProgramFiles%\KioskExitGuard, remove the directory and all
+	// contents EXCEPT the running exe (Windows file-locks it). Schedule
+	// the running exe for delete on reboot via MoveFileExW so the admin
+	// doesn't have to manually delete it. If the running exe lives
+	// somewhere else (e.g. relocation failed and we installed in place
+	// from Downloads), skip — we don't want to nuke the user's
+	// Downloads directory.
+	cleanupInstallDir()
+
 	// 7. Verify the task is actually gone.
 	verifyCmd := exec.Command("schtasks", "/Query", "/TN", taskName)
 	verifyCmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
@@ -2606,6 +2902,68 @@ func runUninstallInvocation() {
 	msg += "\n\nNext steps:\n  • Delete kiosk-exit-guard.exe manually to finish removal.\n  • Reinstall Chrome from google.com/chrome if you use it."
 
 	_ = zenity.Info(msg, zenity.Title("SK Filter"))
+}
+
+// cleanupInstallDir is the v1.1.8 CRITICAL#1 uninstall companion to
+// relocateToProgramFilesIfNeeded. If the running exe lives at the
+// canonical %ProgramFiles%\KioskExitGuard\kiosk-exit-guard.exe, walk
+// the install directory and remove every file EXCEPT the running exe
+// (Windows holds an exclusive lock on it). Schedule the running exe
+// itself for deletion on next reboot via MoveFileExW with
+// MOVEFILE_DELAY_UNTIL_REBOOT so the admin doesn't have to manually
+// remove the directory after uninstall.
+//
+// If the running exe is anywhere else (relocation failed at first
+// run, or the admin installed in place from Downloads on a v1.1.7-or-
+// older install upgrading to v1.1.8 mid-uninstall), do nothing — we
+// don't want to nuke arbitrary directories.
+func cleanupInstallDir() {
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	canonical := canonicalInstallPath()
+	if !strings.EqualFold(exe, canonical) {
+		return
+	}
+	dir := filepath.Dir(canonical)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		logf("cleanupInstallDir: ReadDir(%s) failed: %v", dir, err)
+		return
+	}
+	for _, e := range entries {
+		p := filepath.Join(dir, e.Name())
+		if strings.EqualFold(p, exe) {
+			continue
+		}
+		if e.IsDir() {
+			_ = os.RemoveAll(p)
+		} else {
+			_ = os.Remove(p)
+		}
+	}
+	// Schedule the running exe (and the now-empty containing dir) for
+	// deletion on next reboot via MoveFileExW(MOVEFILE_DELAY_UNTIL_REBOOT).
+	scheduleDeleteOnReboot(exe)
+	scheduleDeleteOnReboot(dir)
+}
+
+// scheduleDeleteOnReboot calls MoveFileExW with MOVEFILE_DELAY_UNTIL_REBOOT
+// and lpNewFileName = NULL, which queues the path for deletion on the
+// next reboot. Used by cleanupInstallDir to remove the running exe
+// (file-locked) and its containing directory once the admin reboots.
+// Best-effort; failures are logged but not surfaced.
+func scheduleDeleteOnReboot(path string) {
+	const moveFileDelayUntilReboot = 0x4
+	pPath, err := syscall.UTF16PtrFromString(path)
+	if err != nil {
+		logf("scheduleDeleteOnReboot: UTF16PtrFromString(%s) failed: %v", path, err)
+		return
+	}
+	if err := windows.MoveFileEx(pPath, nil, moveFileDelayUntilReboot); err != nil {
+		logf("scheduleDeleteOnReboot: MoveFileEx(%s) failed: %v", path, err)
+	}
 }
 
 // purgeLeftoverState wipes anything a prior install (or partial uninstall)
@@ -2685,35 +3043,98 @@ type ghRelease struct {
 	Assets  []ghAsset `json:"assets"`
 }
 
-// fetchLatestRelease returns (versionString, downloadURL, error). The
-// version is the tag with any leading "v" stripped so it lines up with
-// the embedded currentVersion constant.
-func fetchLatestRelease() (string, string, error) {
+// fetchLatestRelease returns (versionString, downloadURL, sha256URL, error).
+// The version is the tag with any leading "v" stripped so it lines up with
+// the embedded currentVersion constant. sha256URL is the download URL of
+// the kiosk-exit-guard.exe.sha256 sidecar asset if present in the release;
+// empty string if the release doesn't publish one. v1.1.8 CRITICAL#2:
+// callers SHA-256-verify the downloaded exe against this sidecar before
+// installing.
+func fetchLatestRelease() (string, string, string, error) {
 	req, err := http.NewRequest("GET", githubLatestAPI, nil)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", "kiosk-exit-guard-updater")
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		return "", "", fmt.Errorf("github api returned %d", resp.StatusCode)
+		return "", "", "", fmt.Errorf("github api returned %d", resp.StatusCode)
 	}
 	var rel ghRelease
 	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
+	var exeURL, shaURL string
 	for _, a := range rel.Assets {
-		if strings.EqualFold(a.Name, "kiosk-exit-guard.exe") {
-			return strings.TrimPrefix(rel.TagName, "v"), a.DownloadURL, nil
+		switch {
+		case strings.EqualFold(a.Name, "kiosk-exit-guard.exe"):
+			exeURL = a.DownloadURL
+		case strings.EqualFold(a.Name, "kiosk-exit-guard.exe.sha256"):
+			shaURL = a.DownloadURL
 		}
 	}
-	return "", "", errors.New("kiosk-exit-guard.exe asset not found in latest release")
+	if exeURL == "" {
+		return "", "", "", errors.New("kiosk-exit-guard.exe asset not found in latest release")
+	}
+	return strings.TrimPrefix(rel.TagName, "v"), exeURL, shaURL, nil
+}
+
+// fetchExpectedSHA256 downloads the SHA-256 sidecar text from shaURL and
+// returns the expected lowercase hex digest. Tolerant of the canonical
+// release artifact format ("HEX  filename" or just "HEX"); the first
+// whitespace-delimited token is taken as the digest. v1.1.8 CRITICAL#2.
+func fetchExpectedSHA256(shaURL string) (string, error) {
+	req, err := http.NewRequest("GET", shaURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "kiosk-exit-guard-updater")
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("sha256 sidecar http %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return "", err
+	}
+	fields := strings.Fields(strings.TrimSpace(string(body)))
+	if len(fields) == 0 {
+		return "", errors.New("sha256 sidecar empty")
+	}
+	digest := strings.ToLower(fields[0])
+	if len(digest) != 64 {
+		return "", fmt.Errorf("sha256 sidecar malformed (got %d hex chars, want 64)", len(digest))
+	}
+	if _, err := hex.DecodeString(digest); err != nil {
+		return "", fmt.Errorf("sha256 sidecar not valid hex: %w", err)
+	}
+	return digest, nil
+}
+
+// fileSHA256 computes the lowercase hex SHA-256 of the file at path.
+// v1.1.8 CRITICAL#2.
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // runUpdateInvocation is the entry point for `--update`, wired to the
@@ -2742,7 +3163,7 @@ func runUpdateInvocation() {
 	// instance panic.
 	showTimedInfo("Checking GitHub for updates…")
 
-	latest, downloadURL, err := fetchLatestRelease()
+	latest, downloadURL, shaURL, err := fetchLatestRelease()
 	if err != nil {
 		_ = zenity.Error(
 			fmt.Sprintf("Could not reach GitHub:\n%v\n\nMake sure the device has internet access.", err),
@@ -2782,10 +3203,51 @@ func runUpdateInvocation() {
 		return
 	}
 
-	tmpPath := filepath.Join(os.TempDir(), "kiosk-exit-guard.new.exe")
+	// v1.1.8 CRITICAL#2: stage the downloaded exe in an admin-only
+	// directory under %ProgramData% rather than %TEMP%. %TEMP% is
+	// user-writable, so a kiosk user could swap the downloaded exe
+	// between downloadFile and os.Rename and have us install attacker
+	// code. ensureAdminOnlyDir tightens the DACL via icacls so only
+	// SYSTEM + Administrators can write into the staging directory.
+	stagingDir := filepath.Join(programDataDir(), "staging")
+	if err := ensureAdminOnlyDir(stagingDir); err != nil {
+		_ = zenity.Error(fmt.Sprintf("Could not prepare staging directory: %v", err), zenity.Title("SK Filter — update"))
+		return
+	}
+	tmpPath := filepath.Join(stagingDir, "kiosk-exit-guard.new.exe")
 	if err := downloadFile(downloadURL, tmpPath); err != nil {
 		_ = zenity.Error(fmt.Sprintf("Download failed: %v\n\nCheck the device's internet connection and try again.", err), zenity.Title("SK Filter — update"))
 		return
+	}
+
+	// v1.1.8 CRITICAL#2: verify the downloaded exe's SHA-256 against
+	// the kiosk-exit-guard.exe.sha256 sidecar asset (also published
+	// by the release workflow). If the sidecar is absent on this
+	// release, log a warning and proceed — older releases didn't
+	// publish one, and refusing all updates would leave installs
+	// stuck. If it's present and the digest doesn't match, abort.
+	if shaURL != "" {
+		expected, sErr := fetchExpectedSHA256(shaURL)
+		if sErr != nil {
+			_ = os.Remove(tmpPath)
+			_ = zenity.Error(fmt.Sprintf("Could not verify the download:\n%v\n\nUpdate aborted.", sErr), zenity.Title("SK Filter — update"))
+			return
+		}
+		actual, hErr := fileSHA256(tmpPath)
+		if hErr != nil {
+			_ = os.Remove(tmpPath)
+			_ = zenity.Error(fmt.Sprintf("Could not hash the downloaded file:\n%v\n\nUpdate aborted.", hErr), zenity.Title("SK Filter — update"))
+			return
+		}
+		if !strings.EqualFold(actual, expected) {
+			_ = os.Remove(tmpPath)
+			logf("update: SHA-256 mismatch! expected=%s actual=%s", expected, actual)
+			_ = zenity.Error(fmt.Sprintf("Update aborted: the downloaded file does not match the published SHA-256.\n\nExpected: %s\nActual:   %s\n\nIf this persists, report it at https://github.com/Shalom-Karr/kiosk-exit-guard/issues — the GitHub release may have been tampered with.", expected, actual), zenity.Title("SK Filter — update"))
+			return
+		}
+		logf("update: SHA-256 verification OK (%s)", expected)
+	} else {
+		logf("update: release has no kiosk-exit-guard.exe.sha256 sidecar; proceeding without integrity verification (legacy release)")
 	}
 
 	exe, err := os.Executable()
@@ -3165,6 +3627,12 @@ func main() {
 
 	migrateLegacyHash()
 	migrateLegacyState()
+	// v1.1.8 HIGH#5: tighten the HKLM config key's DACL on every
+	// controller startup so an existing v1.1.7-and-earlier install
+	// heals on first launch of the new exe (the default ACL inherits
+	// BUILTIN\Users:KEY_READ from HKLM\Software, exposing the bcrypt
+	// hash to offline cracking by any local user). Idempotent.
+	tightenHKLMConfigDACL()
 
 	switch {
 	case len(os.Args) > 1 && os.Args[1] == "--reset":
@@ -3262,11 +3730,35 @@ func main() {
 		)
 	}
 
+	// v1.1.8 MEDIUM#7: install the LL keyboard hook BEFORE killing any
+	// leftover controller from a prior install. Previously the hook was
+	// installed at the very bottom of main(), well after
+	// killRunningController() ran — during the gap (seconds while
+	// purgeLeftoverState, firstRunWithWizard, ensureWebView2Installed,
+	// etc. run) no controller was alive AND no hook was installed,
+	// leaving the kiosk briefly unprotected. The hook reads filterMode
+	// (atomic.Bool default-false) and storedHash (nil at this point) —
+	// since filterMode is still off, the hook is a no-op until the
+	// "default-ON" branch below flips it. Once flipped, the hook is
+	// already running and starts intercepting immediately.
+	cb := syscall.NewCallback(hookCallback)
+	hookHandle, _, hookErr := procSetWindowHookExW.Call(uintptr(whKeyboardLL), cb, 0, 0)
+	if hookHandle == 0 {
+		logf("ERROR: SetWindowsHookEx (early-install) failed: %v", hookErr)
+		_ = zenity.Error(
+			fmt.Sprintf("SetWindowsHookEx failed: %v", hookErr),
+			zenity.Title("kiosk-exit-guard"),
+		)
+		os.Exit(1)
+	}
+	logf("LL keyboard hook installed early (handle=%d) before killRunningController", hookHandle)
+	defer procUnhookWindowsHookEx.Call(hookHandle)
+
 	// If there's a leftover controller from a previous install still
 	// running (orphaned by a partial uninstall, an aborted update, etc.),
-	// kill it before we start. Otherwise two controllers fight over the
-	// hook and the new install's password doesn't match the old one's
-	// in-memory cached hash.
+	// kill it after our hook is in place. Otherwise two controllers fight
+	// over the hook and the new install's password doesn't match the old
+	// one's in-memory cached hash.
 	killRunningController()
 
 	hash, err := loadHash()
@@ -3356,20 +3848,11 @@ func main() {
 	go func() { defer recoverAndLog("watchdog"); runWatchdog() }()
 	go func() { defer recoverAndLog("syncLoop"); syncFilterStateLoop() }()
 
-	cb := syscall.NewCallback(hookCallback)
-	h, _, callErr := procSetWindowHookExW.Call(uintptr(whKeyboardLL), cb, 0, 0)
-	if h == 0 {
-		logf("ERROR: SetWindowsHookEx failed: %v", callErr)
-		removeLockdown()
-		_ = zenity.Error(
-			fmt.Sprintf("SetWindowsHookEx failed: %v", callErr),
-			zenity.Title("kiosk-exit-guard"),
-		)
-		os.Exit(1)
-	}
-	logf("LL keyboard hook installed (handle=%d)", h)
-	defer procUnhookWindowsHookEx.Call(h)
-
+	// LL keyboard hook was installed early (v1.1.8 MEDIUM#7 fix) — the
+	// GetMessageW pump below still has to live on the same thread as
+	// the SetWindowsHookExW call (runtime.LockOSThread at the top of
+	// main() guarantees this) so the hook stays alive for the
+	// controller's lifetime.
 	var m msgT
 	for {
 		ret, _, _ := procGetMessageW.Call(uintptr(unsafe.Pointer(&m)), 0, 0, 0)
