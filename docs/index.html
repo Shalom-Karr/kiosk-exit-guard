@@ -155,7 +155,7 @@
 <div class="wrap">
 
 <header>
-  <h1>kiosk-exit-guard <span class="version-pill">v1.1.0</span></h1>
+  <h1>kiosk-exit-guard <span class="version-pill">v1.1.2</span></h1>
   <p class="tagline">Single-binary kiosk lockdown for Windows 11 Home. Embedded WebView2 kiosk, password-gated keyboard, Chrome uninstalled, Edge launches blocked at the OS level, self-installing, self-updating, all from one ~7&nbsp;MB exe.</p>
 </header>
 
@@ -186,7 +186,17 @@
   <a href="#build">Build</a>
 </nav>
 
-<h2 id="whats-new">v1.1.0 — what's in the box</h2>
+<h2 id="whats-new">v1.1.2 — what's in the box</h2>
+
+<div class="callout callout-good">
+  <strong>Win key fell through to Explorer after a pause auto-expired — root-caused and fixed.</strong> Users hit a "SK Filter is already active" message from the Resume shortcut while the Windows key wasn't actually being blocked. Root cause: <code>showTimedInfo</code> still rendered the toast in-process via <code>go-webview2</code>. The controller had already used WebView2 once during the first-run wizard, so when <code>autoReenableFilterMode</code> fired at pause expiry, its <code>showTimedInfo("Pause ended.")</code> call was the second <code>NewWithOptions</code> in the controller's process. <code>go-webview2</code> panics on the second instance per process (<code>chromium.go:131</code>, same bug class as v1.1.1's <code>--update</code> fix). The panic ran on the <code>time.AfterFunc</code> timer goroutine with no <code>recover</code> — the entire controller crashed. The supervising Service respawned it within ~1 s, but in that window the LL keyboard hook was gone and Win / Ctrl / Alt combos leaked through to Explorer. The same path bit every flow that paired <code>askPasswordModal</code> with a follow-up <code>showFailedToast</code> on wrong password (<code>--pause</code>, <code>--update</code>, <code>--uninstall</code>, <code>--set-url</code>, <code>--reset</code>).
+  <ul style="margin: 0.6rem 0 0; padding-left: 1.25rem;">
+    <li><strong>All toasts now spawn a <code>--show-toast</code> child process.</strong> <code>showTimedInfo</code> exec's <code>kiosk-exit-guard.exe --show-toast &lt;ms&gt; &lt;text&gt;</code> as fire-and-forget; the child's WebView2 is always its first; it exits when the toast dismisses. The caller process never instantiates a second WebView2 itself, so the panic class is structurally eliminated.</li>
+    <li><strong>Cleanup of v1.1.1's per-call workaround.</strong> <code>runUpdateInvocation</code>'s manual <code>exec.Command(exe, "--show-toast", ...)</code> from v1.1.1 is reverted to a plain <code>showTimedInfo</code> call now that the universal path does the same thing.</li>
+  </ul>
+</div>
+
+<h2 id="v110">v1.1.0 — Windows Service supervisor</h2>
 
 <div class="callout callout-good">
   <strong>Windows Service supervisor + LL-hook thread-pinning fix.</strong> v1.1.0 replaces the v1.0.x Task-Scheduler watchdog with a real Windows Service running as <code>LocalSystem</code>. The kiosk user can no longer reach <code>schtasks /Delete</code> to neutralize the auto-restart — Service control requires admin rights they don't have. The supervisor itself has no UI (Session 0 isolation since Vista); it spawns the existing controller into the active console session via <code>CreateProcessAsUserW</code> and respawns it within seconds if killed.
@@ -217,6 +227,9 @@
 <p style="margin: 1rem 0 1.5rem;">For the full release-by-release breakdown, see the <a href="https://github.com/Shalom-Karr/kiosk-exit-guard/blob/main/docs/CHANGELOG.md" style="color: var(--accent);">changelog</a>.</p>
 
 <div class="feature-grid">
+  <div class="feature"><h4><span class="dot new"></span>Toasts via child process<span class="badge">v1.1.2</span></h4><p><code>showTimedInfo</code> always spawns <code>kiosk-exit-guard.exe --show-toast</code> as a fire-and-forget child. The caller's process is never the one to instantiate a second WebView2, structurally eliminating the <code>go-webview2</code> double-instance panic that crashed the controller every time a pause auto-expired (and dropped the LL keyboard hook for ~1 s while the Service respawned).</p></div>
+  <div class="feature"><h4><span class="dot new"></span>Pause-expiry crash fix<span class="badge">v1.1.2</span></h4><p>Symptom users hit: Resume shortcut said "SK Filter is already active" but the Win key wasn't blocked. Root cause: <code>autoReenableFilterMode</code>'s "Pause ended." toast was the controller's second in-process WebView2, panic'd on the <code>time.AfterFunc</code> goroutine (no <code>recover</code>), killed the controller. Same path bit every flow pairing <code>askPasswordModal</code> with <code>showFailedToast</code>. Fix in v1.1.2 routes all toasts through a separate process.</p></div>
+  <div class="feature"><h4><span class="dot new"></span><code>--update</code> panic fix<span class="badge">v1.1.1</span></h4><p><code>runUpdateInvocation</code> called <code>showTimedInfo("Checking GitHub for updates…")</code> then <code>askPasswordModal</code> in the same process — two WebView2 instances, panic at <code>chromium.go:131</code>. v1.1.1 spawned the toast as a separate process; v1.1.2 generalizes this to every toast call site.</p></div>
   <div class="feature"><h4><span class="dot new"></span>Windows Service supervisor<span class="badge">v1.1.0</span></h4><p>New <code>KioskExitGuardSvc</code> running as <code>LocalSystem</code> in Session 0 replaces the v1.0.x Task Scheduler watchdog. Spawns the user-session controller via <code>CreateProcessAsUserW</code> and respawns within seconds if killed. The kiosk user can't reach SCM, so they can't stop the supervisor the way they could <code>schtasks /Delete</code> the old task.</p></div>
   <div class="feature"><h4><span class="dot new"></span>Two-process model<span class="badge">v1.1.0</span></h4><p>Same <code>kiosk-exit-guard.exe</code> binary; flag selects role. <code>--service-run</code> (SCM-only), <code>--service-install</code>, <code>--service-remove</code>, no args = controller. Service uses <code>WTSQueryUserToken</code> + <code>DuplicateTokenEx</code> to get a primary token, <code>CreateEnvironmentBlock</code> to build per-user env, <code>lpDesktop = "winsta0\\default"</code> so the controller can still show its modals.</p></div>
   <div class="feature"><h4><span class="dot new"></span>Service-spawn first-run guard<span class="badge">v1.1.0</span></h4><p>Service sets <code>KIOSK_EXIT_GUARD_VIA_SERVICE=1</code> in the spawned controller's env. If the controller boots with no password configured (half-installed device), the marker tells it to exit silently — Service does not respawn-loop a stack of first-run wizards every few seconds.</p></div>

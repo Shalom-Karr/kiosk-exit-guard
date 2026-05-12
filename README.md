@@ -2,9 +2,11 @@
 
 Single-binary kiosk lockdown utility for **Windows 11 Home** (no Assigned Access). One ~7 MB exe contains an embedded WebView2 kiosk window, a low-level keyboard hook with re-injection, an HKLM-backed password store, Chrome / Edge launch blocks at the OS level, a Chrome uninstaller, a self-installer, a self-updater, and four desktop shortcuts for the admin.
 
-## What's in v1.1.0
+## What's in v1.1.2
 
-New in this release:
+- **Pause-expiry crash fix.** Symptom: Resume shortcut said "SK Filter is already active" but the Win key wasn't actually blocked. Root cause: `autoReenableFilterMode`'s "Pause ended." toast was the controller's second in-process WebView2, which `go-webview2` panics on (same bug class as v1.1.1's `--update` fix). The panic ran on `time.AfterFunc`'s goroutine with no `recover` — the controller crashed and the LL hook went with it. Same path bit any flow pairing `askPasswordModal` with `showFailedToast` on wrong-password. Fix: all toasts now route through a `--show-toast` child process, so the caller never instantiates a second WebView2. See [docs/CHANGELOG.md](docs/CHANGELOG.md) for the full diagnosis.
+
+## What's in v1.1.0
 
 - **Windows Service supervisor.** `KioskExitGuardSvc` runs as `LocalSystem` and respawns the user-session controller via `CreateProcessAsUserW`. Replaces the v1.0.x Task Scheduler watchdog — kiosk users can't reach SCM, so they can't stop it the way they could `schtasks /Delete` the old task. See [docs/architecture.md](docs/architecture.md) for the two-process model.
 - **LL-hook thread pinning.** `runtime.LockOSThread()` at the top of `main()` fixes the v1.0.6 "first-run install ignores keyboard combos" bug.

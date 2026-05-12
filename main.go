@@ -41,6 +41,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -57,7 +58,7 @@ import (
 
 // currentVersion must be kept in sync with versioninfo.json. Used by the
 // --update flow to compare against the latest GitHub release tag.
-const currentVersion = "1.1.1"
+const currentVersion = "1.1.2"
 
 // ---------- logging ----------
 
@@ -1053,8 +1054,31 @@ func showFrontmostToast(text string, duration time.Duration) {
 	w.Run()
 }
 
+// showTimedInfo renders a brief branded toast. Always spawned as a
+// `--show-toast` child process — never an in-process WebView2 — so the
+// caller's process can use WebView2 for a password modal, first-run
+// wizard, etc. without hitting the go-webview2 second-instance panic.
+// Fire-and-forget; the child auto-dismisses after toastTimeoutMs ms.
+//
+// History: pre-v1.1.2 this called showFrontmostToast in-process. The
+// controller (which uses WebView2 for first-run setup) would then crash
+// the first time autoReenableFilterMode fired after a pause expired,
+// because that toast was the 2nd WebView2 in the controller's lifetime.
+// The crash dropped the LL keyboard hook and the Win key fell through
+// until the supervising Service respawned the controller. Spawning a
+// child sidesteps the issue: the child's WebView2 is always its first.
 func showTimedInfo(text string) {
-	showFrontmostToast(text, toastTimeoutMs*time.Millisecond)
+	exe, err := os.Executable()
+	if err != nil {
+		// Last-resort fallback. If we can't locate ourselves we have no
+		// way to spawn the child; the original in-process path may panic
+		// but is better than no feedback.
+		showFrontmostToast(text, toastTimeoutMs*time.Millisecond)
+		return
+	}
+	cmd := exec.Command(exe, "--show-toast", strconv.Itoa(toastTimeoutMs), text)
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+	_ = cmd.Start()
 }
 
 func showFailedToast() { showTimedInfo("Wrong password.") }
@@ -2562,17 +2586,12 @@ func runUpdateInvocation() {
 	}
 	storedHash = hash
 
-	// CRITICAL: must NOT call showTimedInfo here (which instantiates a
-	// WebView2 in this process). The askPasswordModal call later in this
-	// function would then be the second WebView2 in the same process, and
-	// go-webview2 panics on the second NewWithOptions. Spawn a separate
-	// child process for the toast so this process has zero WebView2
-	// instances active until the password modal opens.
-	if exe, err := os.Executable(); err == nil {
-		cmd := exec.Command(exe, "--show-toast", "2000", "Checking GitHub for updates…")
-		cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
-		_ = cmd.Start() // fire-and-forget; the child auto-dismisses at 2s
-	}
+	// As of v1.1.2 showTimedInfo always spawns a --show-toast child
+	// process, so calling it before askPasswordModal is safe (the modal's
+	// WebView2 is still this process's first). Earlier versions had to
+	// manually exec the child here to dodge the go-webview2 double-
+	// instance panic.
+	showTimedInfo("Checking GitHub for updates…")
 
 	latest, downloadURL, err := fetchLatestRelease()
 	if err != nil {

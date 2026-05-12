@@ -4,6 +4,22 @@ All notable changes to kiosk-exit-guard, newest first. Versions follow [Semantic
 
 For the current state of the project, see the [landing page](https://shalom-karr.github.io/kiosk-exit-guard/), the [architecture doc](architecture.md), and the [admin runbook](admin-runbook.md).
 
+## v1.1.2 — 2026-05-11
+
+**Hook stayed dead after pause auto-expired — root cause of "Win key not blocked" reports.**
+
+Symptom: user resumes (or pause auto-expires), shortcut says "SK Filter is already active", but the Windows key is no longer blocked.
+
+Root cause: `showTimedInfo` in v1.1.0/v1.1.1 still rendered the toast in-process via `go-webview2`. The controller had already created one WebView2 instance during the first-run wizard. When `autoReenableFilterMode` fired at pause expiry, its `showTimedInfo("Pause ended. SK Filter is back on.")` was the second `NewWithOptions` call in the controller's lifetime — `go-webview2` panics on the second instance per process (`chromium.go:131`, the same root cause as v1.1.1's `--update` fix). The panic ran on the `time.AfterFunc` goroutine which has no recovery, so the controller process crashed. The supervising Service respawned it within ~1 second, but in that gap the LL keyboard hook was gone and the Win key fell through. Same path bit any flow that combined `askPasswordModal` with a follow-up `showFailedToast` (wrong-password feedback after the modal): pause shortcut, update shortcut, uninstall shortcut, set-URL shortcut, reset.
+
+Fix: `showTimedInfo` now always spawns `kiosk-exit-guard.exe --show-toast <ms> <text>` as a fire-and-forget child process instead of instantiating WebView2 in the caller's process. The child's WebView2 is always its first (the child exits as soon as the toast dismisses). The caller process is left with its WebView2 budget intact for password modals, the kiosk window, the first-run wizard, etc. This generalizes the per-call workaround `runUpdateInvocation` carried in v1.1.1 — that manual `exec.Command` is removed in favor of the single shared path.
+
+Concretely: this fixes the user-visible bug where after a pause expired (or after typing the wrong password into any modal), the controller's hook went dead and Win/Ctrl/Alt combos fell through to Explorer until the Service respawned the controller.
+
+## v1.1.1 — 2026-05-11
+
+**`--update` panic from go-webview2 double-instance.** The "Update SK Filter" shortcut launched a toast ("Checking GitHub for updates…") via in-process WebView2 and then opened the password modal as a second WebView2 in the same process. `go-webview2` panics on the second `NewWithOptions` call. Worked around in v1.1.1 by spawning the toast in a separate `--show-toast` child process; v1.1.2 generalizes this to every toast call site.
+
 ## v1.1.0 — 2026-05-11
 
 **Windows Service supervisor + LL-hook thread-pinning fix.** Replaces the v1.0.x Task-Scheduler-based auto-start with a real Windows Service running as `LocalSystem` in Session 0. The kiosk user can no longer reach `schtasks /Delete` to neutralize the watchdog — Service control requires admin rights, which the kiosk user doesn't have.
