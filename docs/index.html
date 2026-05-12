@@ -178,6 +178,7 @@
   <a href="#how">How it works</a>
   <a href="https://github.com/Shalom-Karr/kiosk-exit-guard/blob/main/docs/architecture.md">Architecture</a>
   <a href="https://github.com/Shalom-Karr/kiosk-exit-guard/blob/main/docs/admin-runbook.md">Admin runbook</a>
+  <a href="https://github.com/Shalom-Karr/kiosk-exit-guard/blob/main/docs/CHANGELOG.md">Changelog</a>
   <a href="#flow">Filter mode flow</a>
   <a href="#setup">Setup</a>
   <a href="#flags">CLI flags</a>
@@ -185,11 +186,20 @@
   <a href="#build">Build</a>
 </nav>
 
-<h2 id="whats-new">v1.0.0 — feature-complete</h2>
+<h2 id="whats-new">v1.0.4 — what's in the box</h2>
 
 <div class="callout callout-good">
-  <strong>This is the 1.0.0 release.</strong> Everything from the 0.x line is in: WebView2 kiosk window, default-ON pause-only model, password-gated keyboard with re-injection, four UAC-elevated desktop shortcuts (Pause / Resume / Update / Uninstall), self-installing scheduled task, self-updating via the GitHub releases API, Chrome uninstall, Edge IFEO block, Windows-key-alone gate, frameless modal with autofocus, branded WebView2 first-run wizard, WebView2 Runtime auto-install for Server SKUs. Plus: taskbar + desktop right-click context menus disabled, and a clean-slate install that wipes any leftover state from previous installs.
+  <strong>Current state of the 1.0.x line.</strong> Everything from the 0.x prototyping is in, plus four 1.0.x patch releases addressing live-deployment issues:
+  <ul style="margin: 0.6rem 0 0; padding-left: 1.25rem;">
+    <li><strong>Core kiosk</strong>: WebView2 fullscreen kiosk window, password-gated keyboard with re-injection (every Ctrl/Win/Alt combo + Windows-key-alone), Ctrl+R / F5 allowlisted for reload, frameless autofocused modal, branded first-run wizard.</li>
+    <li><strong>Lockdown</strong>: Chrome uninstalled, Edge launches IFEO-blocked, Task Manager + Run dialog + taskbar/desktop right-click context menus disabled while active.</li>
+    <li><strong>Pause-only model</strong>: filter is always ON; pause for 1–100 minutes via password modal; auto-resumes on timer; no toggle-off path.</li>
+    <li><strong>Six desktop shortcuts</strong>: Pause / Resume / Launch Kiosk / Change Kiosk URL / Update / Uninstall — all UAC-elevated, three password-gated.</li>
+    <li><strong>Robustness</strong>: multi-trigger Task Scheduler (logon + 1-min watchdog + restart-on-failure), per-monitor DPI awareness for 4K, WebView2 Runtime auto-install for stripped Server SKUs, clean-slate first-run that wipes any leftover state, log file with panic recovery, self-updating from GitHub releases.</li>
+  </ul>
 </div>
+
+<p style="margin: 1rem 0 1.5rem;">For the full release-by-release breakdown, see the <a href="https://github.com/Shalom-Karr/kiosk-exit-guard/blob/main/docs/CHANGELOG.md" style="color: var(--accent);">changelog</a>.</p>
 
 <div class="feature-grid">
   <div class="feature"><h4><span class="dot new"></span>Log file + panic recovery<span class="badge">v1.0.4</span></h4><p><code>kiosk-exit-guard.log</code> next to the exe captures controller startup, hook installation, pauses, auto-resumes, errors, and panic stack traces. 5 MB rotation (renames to <code>.log.old</code>).</p></div>
