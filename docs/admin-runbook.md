@@ -263,14 +263,29 @@ Both directories survive uninstall as a courtesy (delete manually for full remov
 
 ## Logs and diagnostics
 
-There's no log file by design (kiosk machines don't have anywhere good to put one). For diagnostics during development:
+The controller writes `kiosk-exit-guard.log` next to the exe (since v1.0.4). Append-only with a naive 5 MB rotation to `.log.old`. Captures controller startup, hook installation, pause start / expire, service supervisor session picks (v1.1.11), errors, and panic stack traces. `--silent-exit` skips log init to keep IFEO redirects fast.
+
+```powershell
+Get-Content "C:\Program Files\KioskExitGuard\kiosk-exit-guard.log" -Tail 100
+```
+
+The Service supervisor logs to the same file (since v1.1.0). Useful greps:
+
+```powershell
+$log = "C:\Program Files\KioskExitGuard\kiosk-exit-guard.log"
+Get-Content $log -Tail 200 | Select-String "service:"          # supervisor activity
+Get-Content $log -Tail 200 | Select-String "spawning controller"  # which session won (v1.1.11)
+Get-Content $log -Tail 200 | Select-String "panic|ERROR"       # crashes and fatal errors
+```
+
+For development diagnostics:
 
 - Build without `-H windowsgui` to get a console window for `fmt.Println` output:
   ```
   go build -ldflags="-s -w" -o kiosk-exit-guard-debug.exe
   ```
 - Run as a non-elevated user to see UAC prompts and zenity dialogs without the kiosk fighting for focus.
-- Use Process Hacker / Process Explorer to inspect the `kiosk-exit-guard.exe` and `kiosk-exit-guard.exe --webview` processes, their HWNDs, and the LL hook installation.
+- Use Process Hacker / Process Explorer to inspect the `kiosk-exit-guard.exe --service-run`, controller, and `--webview` processes, their HWNDs, and the LL hook installation.
 
 ## Upgrading from older versions
 

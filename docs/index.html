@@ -189,173 +189,47 @@
 <h2 id="whats-new">v1.1.11 — Server 2022 RDP session-id fix</h2>
 
 <div class="callout callout-good">
-  <strong>The kiosk now actually spawns the controller on a headless RDP'd Server 2022.</strong> Field discovery: the affected install is Windows Server 2022 accessed over RDP, not (only) Win11 Home. <code>quser</code> on the server reports <code>administrator rdp-tcp#0 ID 2 Active</code> while <code>WTSGetActiveConsoleSessionId()</code> returns the empty physical-console session ID 1. v1.1.10's <code>WTSEnumerateProcessesExW</code> cross-session enumeration handled session 1 fine but never got to session 2 — the supervisor hardcoded <code>sessionID = WTSGetActiveConsoleSessionId()</code> and never asked "is anyone else logged in elsewhere?". Result on the server: no controller ever spawned, the kiosk was unprotected after every reboot. Fix: new <code>pickActiveUserSession()</code> in <code>service_windows.go</code> walks <code>WTSEnumerateSessionsW</code> (level 1), calls <code>WTSQuerySessionInformationW(WTSUserName)</code> on every <code>WTSActive</code> session, and picks the console session if it qualifies (preserves Win11 / laptop behavior where session 1 is both the console AND the user's interactive session) or the lowest-numbered other <code>WTSActive</code> session with a logged-in user (Server 2022 / RDP). <code>supervisorLoop</code> logs <code>service: spawning controller in session N (state=Active, user logged in)</code> on every session change so admins reading <code>kiosk-exit-guard.log</code> can see which session won. Plus three smaller items: <code>restartExplorer</code> now reads <code>HKLM\...\Winlogon\Shell</code> and skips the kill/restart when the registered shell isn't <code>explorer.exe</code> (Server 2022 Core / custom-shell setups); IFEO removal and Chrome uninstall silently absorb "not installed" instead of logging confusing errors; and the <code>--update</code> flow drops the "Checking GitHub for updates…" toast and the separate "download and install?" confirm — the password modal's subtitle now mentions the new version number, combining confirm + auth into one screen. See the <a href="https://github.com/Shalom-Karr/kiosk-exit-guard/blob/main/docs/CHANGELOG.md" style="color: var(--accent);">changelog</a> for per-finding root cause + fix.
+  <strong>The kiosk now actually spawns the controller on a headless RDP'd Server 2022.</strong> Field discovery: the affected install was Windows Server 2022 accessed over RDP, not (only) Win11 Home. <code>quser</code> reports <code>administrator rdp-tcp#0 ID 2 Active</code> while <code>WTSGetActiveConsoleSessionId()</code> returns the empty physical-console session ID 1. The supervisor hardcoded <code>sessionID = WTSGetActiveConsoleSessionId()</code> and never asked "is anyone else logged in elsewhere?" — no controller ever spawned, the kiosk was unprotected after every reboot. Fix: new <code>pickActiveUserSession()</code> in <code>service_windows.go</code> walks <code>WTSEnumerateSessionsW</code>, calls <code>WTSQuerySessionInformationW(WTSUserName)</code> on every <code>WTSActive</code> session, and picks the console session if it qualifies (preserves Win11 / laptop behavior) or the lowest-numbered other <code>WTSActive</code> session with a logged-in user (Server 2022 / RDP). <code>supervisorLoop</code> logs <code>service: spawning controller in session N (state=Active, user logged in)</code> so admins reading <code>kiosk-exit-guard.log</code> can see which session won. Plus three smaller items: <code>restartExplorer</code> reads <code>HKLM\...\Winlogon\Shell</code> and skips the kill / restart when the registered shell isn't <code>explorer.exe</code> (Server Core / custom-shell setups); IFEO removal and Chrome uninstall silently absorb "not installed" instead of logging confusing errors on fresh Server 2022 boxes; and the <code>--update</code> flow drops the "Checking GitHub for updates…" toast and the standalone confirm — the password modal's subtitle mentions the new version number, combining confirm + auth into one screen. See the <a href="https://github.com/Shalom-Karr/kiosk-exit-guard/blob/main/docs/CHANGELOG.md" style="color: var(--accent);">changelog</a> for per-finding root cause + fix.
 </div>
 
-<h2 id="v1110">v1.1.10 — WTS process enumeration</h2>
+<h2 id="recent-hardening">Recent hardening (v1.1.8 – v1.1.10)</h2>
 
 <div class="callout callout-good">
-  <strong>The kiosk now actually survives a reboot on machines where v1.1.3–v1.1.9's <code>gopsutil</code>-based explorer-token fallback was returning empty.</strong> Field report: <code>spawnControllerInSession(1) failed: WTSQueryUserToken(1): An attempt was made to reference a token that does not exist.; explorer fallback: no explorer.exe found in session 1 (is a user logged in?)</code> firing every 2 seconds even though the user WAS logged in and running the kiosk. Root cause: <code>gopsutil</code>'s <code>process.Processes()</code> can return a filtered or empty list when called from the Session-0 LocalSystem service — the kernel can see across sessions just fine for LocalSystem (it has <code>SeDebugPrivilege</code>), but gopsutil's underlying snapshot API was missing them. Fix: switched the cross-session enumeration to <code>WTSEnumerateProcessesExW</code> from <code>wtsapi32.dll</code>, the Win32 API explicitly designed for service-side cross-session enumeration. Pass the target <code>sessionID</code> directly so the kernel filters for us. Broadened the candidate process list beyond <code>explorer.exe</code> to include <code>sihost.exe</code>, <code>taskhostw.exe</code>, <code>RuntimeBroker.exe</code>, and <code>StartMenuExperienceHost.exe</code> — all Windows-auto-spawned under the interactive user's token, all serving the same purpose. Priority order preserved (<code>explorer.exe</code> first, others as fallback). The v1.1.8 <code>QueryFullProcessImageName</code> image-path validation against the canonical <code>%SystemRoot%</code> path is preserved per-candidate so an attacker can't drop a <code>sihost.exe</code> in a writable directory and have its token used. Plus two log-noise cleanups: <code>tightenHKLMConfigDACL</code> no longer logs <code>SetNamedSecurityInfo … The system cannot find the file specified.</code> on fresh installs (the HKLM key only exists after the first <code>saveHashToRegistry</code>; we now silently skip <code>ERROR_FILE_NOT_FOUND</code> and let the save tighten it); and <code>parentProcessImagePath</code> no longer logs <code>OpenProcess(parent=…) failed: The parameter is incorrect.</code> on the v1.1.8 relocate-and-reexec flow (the original parent has exited by the time the re-execed child runs the parent lookup; <code>ERROR_INVALID_PARAMETER</code> / <code>ERROR_ACCESS_DENIED</code> are now silently absorbed).
-</div>
-
-<h2 id="v119">v1.1.9 — UX pass</h2>
-
-<div class="callout callout-good">
-  <strong>Eleven concrete UX fixes plus a new "password modal can't be left up forever" rule.</strong> Headline fixes: the password modal now auto-dismisses after 30s of inactivity so a user who walked away can't hold the kiosk hostage (the <code>kgSubmit</code> / <code>kgCancel</code> bindings reset the timer so an actively-typing user isn't yanked mid-attempt); the v1.1.4 co-installed Service/scheduled-task race at logon used to blink the kiosk WebView2 child as the loser's supervisor respawned — now gated by a new <code>Global\KioskExitGuardControllerRunning</code> Win32 mutex so the second mover exits cleanly without killing the first; controller panics now spawn a "SK Filter restarted after an internal error" toast before the process tears down so the user understands the brief glitch instead of seeing a black flash; first-run setup builds ONE combined status dialog from <code>(svcErr, taskErr)</code> with "Auto-start: Windows Service ✓, Scheduled task ✓" (or any combination of ✓/✗) instead of stacking a <code>zenity.Warning</code> + <code>zenity.Error</code> on dual-failure; the pause shortcut writes a <code>pause-just-applied.flag</code> marker under <code>%ProgramData%</code> before killing the kiosk so the controller's 30s watchdog can't relaunch the kiosk in the gap before the 2s sync loop sees the new pause file; <code>--update</code> now polls SCM until the service actually reaches <code>svc.Stopped</code> before renaming the exe (was returning from <code>sc stop</code> immediately, letting the supervisor respawn a fresh controller mid-rename); modal-spawn failures (AV quarantine, missing exe) now surface a "Password prompt failed. Check kiosk-exit-guard.log" toast instead of being silently swallowed; the three exit-after-failure call sites (<code>--pause</code>, <code>--update</code>, <code>--set-url</code>) now use a synchronous <code>showFailedToastSync</code> so <code>os.Exit(1)</code> doesn't kill the fire-and-forget child mid-paint; the uninstall dialog now mentions the Windows Service in the bulleted "this removes:" list and the post-uninstall verification block calls <code>serviceStillExists()</code> alongside the scheduled-task query; <code>docs/admin-runbook.md</code> updated for v1.1.4+ co-installed auto-start and v1.1.8 install paths. See the <a href="https://github.com/Shalom-Karr/kiosk-exit-guard/blob/main/docs/CHANGELOG.md" style="color: var(--accent);">changelog</a> for per-finding root cause + fix.
-</div>
-
-<h2 id="v118">v1.1.8 — security audit pass</h2>
-
-<div class="callout callout-good">
-  <strong>Nine findings from a full security audit, all closed.</strong> Headline fixes: the exe is now relocated to <code>%ProgramFiles%\KioskExitGuard\</code> at first run so the SCM-registered binary path lives in an admin-only directory (a kiosk user can no longer swap the running binary and have the supervising Service respawn attacker code as LocalSystem); <code>--update</code> stages downloads in an <code>icacls</code>-locked <code>%ProgramData%</code> subdirectory and verifies SHA-256 against a new <code>kiosk-exit-guard.exe.sha256</code> sidecar asset published alongside every release; the <code>explorer.exe</code>-token fallback (v1.1.3) now authenticates the candidate process by <code>QueryFullProcessImageName</code> against <code>%SystemRoot%\explorer.exe</code> before unwrapping the linked elevated token; all four in-process WebView2 instances share a single admin-only user-data folder under <code>%ProgramData%</code> so a kiosk user can't plant a service-worker script that intercepts the password modal's <code>kgSubmit</code> binding; the HKLM password-hash key has an explicit <code>SetNamedSecurityInfo</code> DACL granting only SYSTEM + Administrators so a local user can no longer read the bcrypt hash and crack it offline; the LL keyboard hook is installed earlier in <code>main()</code> so the gap between killing the leftover controller and installing the new hook can't leave the kiosk briefly unprotected; <code>installStartupTask</code> moved exe path + task name to env-var passing and base64-encoded the PowerShell script body to harden against any future injection vector; <code>isLaunchedByService</code> now authenticates the supervising parent via <code>CreateToolhelp32Snapshot</code> + parent-PID image-path lookup instead of trusting a forgeable env-var marker. See the <a href="https://github.com/Shalom-Karr/kiosk-exit-guard/blob/main/docs/CHANGELOG.md" style="color: var(--accent);">changelog</a> for per-finding root cause + fix.
-</div>
-
-<h2 id="v117">v1.1.7 — pause duration picker fix</h2>
-
-<div class="callout callout-good">
-  <strong>Pause-duration picker visible on the fullscreen kiosk.</strong> v1.1.6 fixed the password modal's foreground-grab; this covers the screen AFTER the password — the "1 / 5 / 10 / 20 / 30 / 45 / custom" picker. User: "after the password when I tried to set if it was 1 minute or 5 or other that I couldn't see it." Root cause: <code>askPauseDuration</code> uses <code>zenity.List</code> (native Win32 dialog, not <code>HWND_TOPMOST</code>) — renders behind the kiosk's fullscreen topmost WebView2. Fix: kill the kiosk WebView2 child immediately after password accept and BEFORE the duration picker, so zenity gets normal foreground. On cancel the watchdog respawns the kiosk (or <code>promptAndPause</code> calls <code>launchWebViewChild</code> proactively).
-</div>
-
-<h2 id="v116">v1.1.6 — password modal focus</h2>
-
-<div class="callout callout-good">
-  <strong>Password modal now actually comes to front + gets keyboard focus on the fullscreen kiosk.</strong> User report: "pressing Ctrl+Shift+Alt+K while on the kiosk full screen needs to move the modal to the front to pause the filter." Root cause: both the kiosk window and the modal child were <code>HWND_TOPMOST</code>; the modal's z-order beat the kiosk visually, but keyboard focus stayed with the kiosk because the modal never called <code>SetForegroundWindow</code> (and Windows would have rejected the call anyway — only the foreground process can grant foreground to another). Fix: <code>forceForeground</code> uses the <code>AttachThreadInput</code> idiom — temporarily merge the modal thread's input queue with the foreground thread's queue, call <code>SetForegroundWindow</code> (Windows now treats them as one process for foreground-grant), detach. Bypasses the eligibility rules without the v0.5.4 modal-hang risk that originally caused the v1.0.3 strip.
-</div>
-
-<h2 id="v115">v1.1.5 — zoom shortcuts allowed</h2>
-
-<div class="callout callout-good">
-  <strong>Browser zoom shortcuts allowed through.</strong> <code>Ctrl+0</code> (zoom reset), <code>Ctrl+-</code> (zoom out), and <code>Ctrl++</code> / <code>Ctrl+=</code> (zoom in) now pass through the LL hook to the kiosk WebView2 page instead of triggering the password modal. Numpad equivalents (<code>Ctrl+Numpad0</code>, <code>Ctrl+Subtract</code>, <code>Ctrl+Add</code>) too. All variants still require Ctrl-only — <code>Win+0</code>, <code>Alt+-</code>, etc. still hit the lockdown path. Joins the existing always-allowed list of <code>F5</code> and <code>Ctrl+R</code>.
-</div>
-
-<h2 id="v114">v1.1.4 — belt-and-suspenders auto-start</h2>
-
-<div class="callout callout-good">
-  <strong>Belt-and-suspenders auto-start: Service AND scheduled task co-installed.</strong> Field report: "right now the filter only runs when I re-click the exe file from the downloads folder." Even after v1.1.3's <code>explorer.exe</code>-token fallback shipped, the auto-start was still flaky on the affected machine. v1.1.0 had aggressively switched to Service-only and deleted any leftover scheduled task on install — which made the kiosk completely unprotected after reboot whenever the Service spawn path failed.
+  <strong>Three releases tightening the install, update, and service-spawn paths into one narrative arc.</strong>
   <ul style="margin: 0.6rem 0 0; padding-left: 1.25rem;">
-    <li><strong>Install both</strong>: <code>firstRunWithWizard</code> and every non-service-spawn launch now register the Windows Service AND the scheduled task. Whichever fires first wins; <code>killRunningController()</code> at controller startup keeps exactly one controller alive.</li>
-    <li><strong>Service no longer wipes the task</strong> on install. v1.1.0–v1.1.3 deleted the scheduled task inside <code>installService</code> to prevent the two managers fighting; v1.1.4 trusts <code>killRunningController</code> to keep things sane.</li>
-    <li><strong>Scheduled task is AtLogon-only</strong>: dropped the every-1-minute respawn watchdog that v1.0.x had. The Service is the in-session respawn supervisor now; the task is purely a logon-time "make sure it starts" fallback. Keeping the per-minute trigger alongside the Service caused kill/respawn churn (both fire, second to start <code>killRunningController</code>'s the first, loser's supervisor respawns, repeat).</li>
-    <li><strong>Loud failure surfacing</strong>: if both auto-start installs fail, surface a <code>zenity.Error</code> so the admin can't silently end up with a kiosk that doesn't survive reboot.</li>
+    <li><strong>v1.1.8 security audit, nine findings closed.</strong> The exe is relocated to <code>%ProgramFiles%\KioskExitGuard\</code> at first run so the SCM-registered binary path lives in an admin-only directory; <code>--update</code> stages downloads in an <code>icacls</code>-locked <code>%ProgramData%</code> subdirectory and verifies SHA-256 against a <code>kiosk-exit-guard.exe.sha256</code> sidecar; the explorer-token fallback authenticates the candidate process by <code>QueryFullProcessImageName</code> against <code>%SystemRoot%\explorer.exe</code>; all four in-process WebView2 instances share an admin-only user-data folder under <code>%ProgramData%</code>; the HKLM password-hash key has an explicit <code>SetNamedSecurityInfo</code> DACL (SYSTEM + Administrators only) so the bcrypt hash isn't offline-crackable from a standard user; the LL keyboard hook is installed earlier in <code>main()</code> to close the kill-old-controller-then-install-hook gap; <code>installStartupTask</code> passes exe path + task name as env vars with a base64-encoded script body; and <code>isLaunchedByService</code> authenticates the supervising parent via parent-PID image-path lookup instead of trusting a forgeable env-var marker.</li>
+    <li><strong>v1.1.9 UX audit, eleven fixes.</strong> The password modal auto-dismisses after 30 s of inactivity (resettable on keystroke); the v1.1.4 Service / scheduled-task race at logon stopped blinking the kiosk thanks to a <code>Global\KioskExitGuardControllerRunning</code> mutex; controller panics now surface a "SK Filter restarted after an internal error" toast; first-run setup builds one combined status dialog from <code>(svcErr, taskErr)</code> instead of stacking warnings; the pause shortcut writes a <code>pause-just-applied.flag</code> marker so the controller's 30 s watchdog doesn't relaunch the kiosk before the 2 s sync loop catches up; <code>--update</code> polls SCM until the service actually reaches <code>svc.Stopped</code> before renaming the exe; modal-spawn failures surface a toast instead of being silently swallowed; exit-after-failure toasts use a synchronous variant so <code>os.Exit(1)</code> doesn't kill the toast child mid-paint; uninstall mentions the Windows Service in its confirm dialog and verifies removal via <code>serviceStillExists()</code>.</li>
+    <li><strong>v1.1.10 WTS process enumeration.</strong> The v1.1.3 explorer-token fallback walked <code>gopsutil</code> to find <code>explorer.exe</code> in the active session; on some installs gopsutil's snapshot returned empty when called from the Session 0 LocalSystem service, so the supervisor logged "no explorer.exe found in session 1" every 2 seconds and the kiosk had zero protection after reboot. Switched to <code>WTSEnumerateProcessesExW</code> from <code>wtsapi32.dll</code> — the Win32 API designed for service-side cross-session enumeration. Broadened the candidate list to <code>explorer.exe</code> · <code>sihost.exe</code> · <code>taskhostw.exe</code> · <code>RuntimeBroker.exe</code> · <code>StartMenuExperienceHost.exe</code>, each validated against its canonical <code>%SystemRoot%</code> path. Also silenced two benign-but-alarming log lines (<code>tightenHKLMConfigDACL</code> ERROR_FILE_NOT_FOUND on fresh installs; <code>parentProcessImagePath</code> ERROR_INVALID_PARAMETER on the v1.1.8 relocate-and-reexec flow).</li>
   </ul>
 </div>
 
-<h2 id="v113">v1.1.3 — controller crash + service spawn fixes</h2>
+<p style="margin: 1rem 0 1.5rem;">For the full release-by-release history, including the v1.1.0 Service supervisor introduction and the v1.1.1 – v1.1.7 stabilization burst that preceded the v1.1.8 audits, see the <a href="https://github.com/Shalom-Karr/kiosk-exit-guard/blob/main/docs/CHANGELOG.md" style="color: var(--accent);">changelog</a>.</p>
 
-<div class="callout callout-good">
-  <strong>Two field-reported bugs the v1.1.0–v1.1.2 line missed.</strong>
-  <ul style="margin: 0.6rem 0 0; padding-left: 1.25rem;">
-    <li><strong>Controller crashed when the LL hook tried to open the password modal.</strong> Symptom: fresh install, press Win once, modal flickers, panic, kiosk bypassed. Same bug class as v1.1.1 / v1.1.2 — <code>go-webview2</code> panics on a process's second <code>NewWithOptions</code> call (<code>chromium.go:131</code>). The controller's first WebView2 is <code>firstRunWithWizard</code>; the next one (<code>askPasswordModal</code> via the hook callback) panics. v1.1.2 fixed <code>showTimedInfo</code> but I missed this call site, which is the bigger one because the hook callback uses it on every Win/Ctrl/Alt press. Fix: <code>askPasswordModal</code> now spawns <code>kiosk-exit-guard.exe --ask-password &lt;title&gt; &lt;subtitle&gt;</code> as a child process and reads its exit code (0=OK, 1=Wrong, 2=Cancel). The child's WebView2 is always its first; the controller's WebView2 budget stays at 1 for the life of the process.</li>
-    <li><strong>Service couldn't spawn its child controller — "the filter only runs when I re-click the exe."</strong> <code>WTSQueryUserToken</code> returned <code>ERROR_NO_TOKEN</code> every 2 seconds for the entire session on the affected machine. The supervisor never got a primary token for the console user, so <code>CreateProcessAsUserW</code> never ran. After a reboot the kiosk had zero protection until the admin manually launched the exe. Fix: <code>spawnControllerInSession</code> now falls back to stealing <code>explorer.exe</code>'s primary token in the same session when <code>WTSQueryUserToken</code> fails. To handle UAC-on admin users (where explorer runs with the limited half of a split token), the fallback unwraps to the linked elevated token via <code>GetTokenInformation(TokenLinkedToken)</code> — the controller needs admin to write HKLM, set IFEO debugger keys, and restart Explorer.</li>
-  </ul>
-</div>
-
-<h2 id="v112">v1.1.2 — pause-expiry crash fix</h2>
-
-<div class="callout callout-good">
-  <strong>Win key fell through to Explorer after a pause auto-expired — root-caused and fixed.</strong> Users hit a "SK Filter is already active" message from the Resume shortcut while the Windows key wasn't actually being blocked. Root cause: <code>showTimedInfo</code> still rendered the toast in-process via <code>go-webview2</code>. The controller had already used WebView2 once during the first-run wizard, so when <code>autoReenableFilterMode</code> fired at pause expiry, its <code>showTimedInfo("Pause ended.")</code> call was the second <code>NewWithOptions</code> in the controller's process. <code>go-webview2</code> panics on the second instance per process (<code>chromium.go:131</code>, same bug class as v1.1.1's <code>--update</code> fix). The panic ran on the <code>time.AfterFunc</code> timer goroutine with no <code>recover</code> — the entire controller crashed. The supervising Service respawned it within ~1 s, but in that window the LL keyboard hook was gone and Win / Ctrl / Alt combos leaked through to Explorer. The same path bit every flow that paired <code>askPasswordModal</code> with a follow-up <code>showFailedToast</code> on wrong password (<code>--pause</code>, <code>--update</code>, <code>--uninstall</code>, <code>--set-url</code>, <code>--reset</code>).
-  <ul style="margin: 0.6rem 0 0; padding-left: 1.25rem;">
-    <li><strong>All toasts now spawn a <code>--show-toast</code> child process.</strong> <code>showTimedInfo</code> exec's <code>kiosk-exit-guard.exe --show-toast &lt;ms&gt; &lt;text&gt;</code> as fire-and-forget; the child's WebView2 is always its first; it exits when the toast dismisses. The caller process never instantiates a second WebView2 itself, so the panic class is structurally eliminated.</li>
-    <li><strong>Cleanup of v1.1.1's per-call workaround.</strong> <code>runUpdateInvocation</code>'s manual <code>exec.Command(exe, "--show-toast", ...)</code> from v1.1.1 is reverted to a plain <code>showTimedInfo</code> call now that the universal path does the same thing.</li>
-  </ul>
-</div>
-
-<h2 id="v110">v1.1.0 — Windows Service supervisor</h2>
-
-<div class="callout callout-good">
-  <strong>Windows Service supervisor + LL-hook thread-pinning fix.</strong> v1.1.0 replaces the v1.0.x Task-Scheduler watchdog with a real Windows Service running as <code>LocalSystem</code>. The kiosk user can no longer reach <code>schtasks /Delete</code> to neutralize the auto-restart — Service control requires admin rights they don't have. The supervisor itself has no UI (Session 0 isolation since Vista); it spawns the existing controller into the active console session via <code>CreateProcessAsUserW</code> and respawns it within seconds if killed.
-  <ul style="margin: 0.6rem 0 0; padding-left: 1.25rem;">
-    <li><strong>New <code>KioskExitGuardSvc</code> service</strong> running as <code>LocalSystem</code>, <code>StartType = Automatic</code>. Finds the active console session via <code>WTSGetActiveConsoleSessionId</code>, gets the user token via <code>WTSQueryUserToken</code>, duplicates to a primary token, builds a per-user environment block, spawns the controller into <code>winsta0\default</code>. Waits for exit, respawns. On <code>sc stop</code> it terminates the controller so it can't outlive its supervisor.</li>
-    <li><strong>Two-process model</strong>: same exe, flag selects role. <code>--service-run</code> (SCM-only), <code>--service-install</code>, <code>--service-remove</code>, or no args for the controller.</li>
-    <li><strong>First-run guard</strong>: Service sets <code>KIOSK_EXIT_GUARD_VIA_SERVICE=1</code> in the spawned controller's env. If the controller boots with no password configured, it checks for that marker and exits silently — prevents the Service from respawn-looping a stack of first-run wizards on a half-installed device.</li>
-    <li><strong>LL-hook thread pinning</strong> (v1.0.7 fix folded in): <code>runtime.LockOSThread()</code> at the top of <code>main()</code>. The Win32 LL hook is bound to its install thread; without pinning, the Go runtime would migrate the main goroutine after the WebView2 message loop in <code>firstRunWithWizard()</code> and the hook would silently go dead. Symptom on first-run installs: keyboard combos fell through instead of opening the password modal.</li>
-  </ul>
-</div>
-
-<p style="margin: 1rem 0 1.5rem;">For the prior v1.0.6 security-audit fixes and the full release-by-release breakdown, see the <a href="https://github.com/Shalom-Karr/kiosk-exit-guard/blob/main/docs/CHANGELOG.md" style="color: var(--accent);">changelog</a>.</p>
-
-<h2 id="v106">v1.0.6 — what's in the box</h2>
-
-<div class="callout callout-good">
-  <strong>Production-readiness fixes from a multi-agent security audit.</strong> v1.0.6 closes six concrete escape paths in the 1.0.x line — five new bypasses an attacker with code-execution on the kiosk user could have used, plus two TOCTOU races in the hook itself:
-  <ul style="margin: 0.6rem 0 0; padding-left: 1.25rem;">
-    <li><strong>Random per-process re-injection nonce</strong> replaces the fixed <code>0xC0DE</code> marker — another process can no longer call <code>SendInput</code> with a known ExtraInfo value to slip past the LL hook.</li>
-    <li><strong>Taskbar hidden</strong> via <code>NoTaskbar=1</code> while active, closing the Start-button left-click → click kiosk taskbar entry → close escape.</li>
-    <li><strong>WebView2 hardening</strong>: context menus, dev tools, status bar, zoom, and <code>NewWindowRequested</code> all disabled / rejected.</li>
-    <li><strong>Accessibility helpers IFEO-blocked</strong>: <code>sethc</code>, <code>osk</code>, <code>narrator</code>, <code>utilman</code>, <code>magnify</code> — closes Sticky-Keys-5x-Shift and the Ease-of-Access escape.</li>
-    <li><strong>Atomic CAS on the in-flight prompt flag</strong> inside <code>hookCallback</code> — a rapid second blocked combo can no longer race past the first and re-inject the wrong keystroke after auth.</li>
-    <li><strong>Modifier snapshot taken synchronously</strong> inside the hook — re-injection always uses the modifier state at press time, even if the user lets go before the WebView2 modal opens.</li>
-  </ul>
-</div>
-
-<p style="margin: 1rem 0 1.5rem;">For the full release-by-release breakdown, see the <a href="https://github.com/Shalom-Karr/kiosk-exit-guard/blob/main/docs/CHANGELOG.md" style="color: var(--accent);">changelog</a>.</p>
+<h2 id="features">Features</h2>
 
 <div class="feature-grid">
-  <div class="feature"><h4><span class="dot new"></span>Server 2022 RDP support<span class="badge">v1.1.11</span></h4><p>The supervisor used to hardcode <code>WTSGetActiveConsoleSessionId()</code> as the target session — fine on a Win11 laptop where the console session is the user, broken on a headless RDP'd Server 2022 where the console session is empty and the user is in session 2. New <code>pickActiveUserSession()</code> walks <code>WTSEnumerateSessionsW</code> and picks the lowest-numbered <code>WTSActive</code> session with a logged-in user (verified via <code>WTSQuerySessionInformationW(WTSUserName)</code>), preferring the console session when it qualifies. Win11 / laptop behavior is unchanged; Server 2022 / RDP now works.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Update UI simplified<span class="badge">v1.1.11</span></h4><p>User request: "scratch the checking for updates UI just show the box do you want to update and password to approve it". The "Checking GitHub for updates…" toast and the separate "A new version is available, download and install?" <code>zenity.Question</code> are gone. The password modal's subtitle now mentions the new version number, combining confirm + auth into one screen. The "you're on v%s. No update available." branch is kept so clicking Update SK Filter is never silent.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>restartExplorer respects the registered shell<span class="badge">v1.1.11</span></h4><p>On Server 2022 Core (no Desktop Experience) or any custom-shell setup, <code>taskkill /F /IM explorer.exe</code> could lose the user's actual shell mid-session. v1.1.11 reads <code>HKLM\...\Winlogon\Shell</code> and skips the restart when the registered shell isn't <code>explorer.exe</code>. The <code>NoTaskbar</code> policy still gets written; it just won't take effect until next logon — acceptable since a non-Explorer shell is the user's deliberate choice.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>IFEO / Chrome cleanup absorbs "not installed"<span class="badge">v1.1.11</span></h4><p>Fresh Server 2022 installs without Chrome no longer log <code>ERROR_FILE_NOT_FOUND</code> (2) when <code>removeIFEOBlock("chrome.exe")</code> fires during uninstall / resume / reset; <code>uninstallChrome</code> now logs <code>Chrome not installed, skipping uninstall</code> at info level instead of being silently lumped into the success path.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>WTSEnumerateProcessesExW cross-session fallback<span class="badge">v1.1.10</span></h4><p>v1.1.3's <code>WTSQueryUserToken</code>-NO_TOKEN fallback enumerated processes via <code>gopsutil</code> to find <code>explorer.exe</code> in the active console session. On affected machines the snapshot returned empty when called from Session 0 / LocalSystem, so the supervisor logged <em>"no explorer.exe found in session 1 (is a user logged in?)"</em> every 2s and the kiosk never got a controller after reboot. Switched to <code>WTSEnumerateProcessesExW</code> from <code>wtsapi32.dll</code> — the Win32 API explicitly designed for service-side cross-session enumeration. Buffer freed via <code>WTSFreeMemoryExW</code> every call. <code>unsafe.Sizeof</code> sanity check before slicing so a layout mismatch fails clean instead of dereferencing garbage.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Broadened user-session candidate list<span class="badge">v1.1.10</span></h4><p>The fallback no longer requires <code>explorer.exe</code>. Custom kiosk shells and v1.1.x's Explorer-restart-that-didn't-respawn paths used to leave session 1 with no <code>explorer.exe</code> at all. Now matches any of <code>explorer.exe</code> · <code>sihost.exe</code> · <code>taskhostw.exe</code> · <code>RuntimeBroker.exe</code> · <code>StartMenuExperienceHost.exe</code> — all Windows-auto-spawned under the interactive user's token. Priority order preserved (<code>explorer.exe</code> first if present). Each candidate validates against its canonical <code>%SystemRoot%</code> image path via <code>QueryFullProcessImageName</code> so an attacker can't drop a <code>sihost.exe</code> in a writable directory and have its token used.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>30s password-modal auto-dismiss<span class="badge">v1.1.9</span></h4><p>A user who pressed <code>Ctrl+Shift+Alt+K</code>, saw the modal, then walked away used to leave the fullscreen password screen up forever — kiosk WebView2 was dead, the next person at the device saw a frozen modal with no way to dismiss. <code>askPasswordModalInProcess</code> now arms <code>time.AfterFunc(30*time.Second, ...)</code> that calls <code>w.Dispatch(func(){ w.Terminate() })</code>. The child exits with <code>pwCancel</code> (no failed-password toast); the <code>kgSubmit</code> / <code>kgCancel</code> bindings reset the timer so an actively-typing user isn't yanked mid-attempt.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Controller mutex stops logon-time kiosk blink<span class="badge">v1.1.9</span></h4><p>v1.1.4 co-installed both Service and AtLogon task; at logon both fire within ~1s and the loser was being killed by the winner's <code>killRunningController</code>. The loser's supervisor respawned it, oscillation continued, kiosk WebView2 blinked / reopened 1 – 2s after logon. New <code>Global\KioskExitGuardControllerRunning</code> named Win32 mutex acquired before <code>killRunningController</code> — second mover logs "controller mutex already held; exiting" and <code>os.Exit(0)</code>s cleanly. First controller keeps running, no respawn loop.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Panic recovery toast<span class="badge">v1.1.9</span></h4><p>Pre-v1.1.9 a panic in the controller logged silently to <code>kiosk-exit-guard.log</code> and the user saw the desktop briefly while the Service / scheduled task respawned the controller. <code>recoverAndLog</code> now spawns a fire-and-forget <code>--show-toast 5000 "SK Filter restarted after an internal error. Auto-recovery in progress."</code> child before returning, so the user understands the brief glitch instead of being confused by an unexplained kiosk flash.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Exe relocated to %ProgramFiles%<span class="badge">v1.1.8</span></h4><p>First-run now copies the exe to <code>%ProgramFiles%\KioskExitGuard\</code> and re-execs from there before registering the Service binary path, scheduled task, or desktop shortcuts. Previously the SCM-registered path was wherever the admin double-clicked from (usually <code>Downloads</code>, kiosk-user-writable) — a kiosk user could swap the binary and have the supervising Service respawn attacker code as LocalSystem. Falls back to in-place install on copy failure.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>--update SHA-256 verified + admin-only staging<span class="badge">v1.1.8</span></h4><p>Downloaded exe is now staged under <code>%ProgramData%\KioskExitGuard\staging\</code> (admin-only DACL via <code>icacls /inheritance:r</code>) instead of <code>%TEMP%</code>, AND the SHA-256 is verified against a <code>kiosk-exit-guard.exe.sha256</code> sidecar asset published by the release workflow alongside every release. Mismatch aborts with a <code>zenity.Error</code> and a pointer at the issue tracker.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>HKLM hash DACL admin-only<span class="badge">v1.1.8</span></h4><p>The default <code>HKLM\Software</code> ACL inherits <code>BUILTIN\Users:KEY_READ</code> — any local user could read <code>HKLM\Software\KioskExitGuard\PasswordHash</code> and run an offline bcrypt-dictionary attack. <code>SetNamedSecurityInfo(SE_REGISTRY_KEY, SDDL=D:PAI(A;CI;KA;;;SY)(A;CI;KA;;;BA))</code> on every controller startup grants only SYSTEM + Administrators; protected (no inherit) so the BUILTIN\Users ACE doesn't leak in.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>explorer.exe-token fallback authenticated<span class="badge">v1.1.8</span></h4><p>The v1.1.3 explorer.exe-token fallback for <code>WTSQueryUserToken</code>-NO_TOKEN previously trusted any process named <code>explorer.exe</code>. Now calls <code>QueryFullProcessImageName</code> on the kernel handle we just opened — rejects any candidate whose image path isn't <code>%SystemRoot%\explorer.exe</code>. Closes the renamed-binary impersonation AND the PID-recycle race in one stroke.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>WebView2 profile under %ProgramData%<span class="badge">v1.1.8</span></h4><p>All four <code>webview2.NewWithOptions</code> call sites (password modal, toast, first-run wizard, kiosk page) now share <code>%ProgramData%\KioskExitGuard\WebView2\</code> with the same locked-down DACL. The default <code>%LOCALAPPDATA%</code> profile was user-writable — a poisoned service worker could have intercepted the password modal's <code>kgSubmit</code> host-object call before bcrypt comparison.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Zoom shortcuts allowed<span class="badge">v1.1.5</span></h4><p><code>Ctrl+0</code>, <code>Ctrl+-</code>, <code>Ctrl++</code> / <code>Ctrl+=</code> (plus numpad variants) now pass through to the kiosk WebView2 page so admins / kiosk visitors can adjust zoom without entering the password. Ctrl-only — modifier combos like <code>Win+0</code> / <code>Alt+-</code> still hit the lockdown.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Service + scheduled task co-installed<span class="badge">v1.1.4</span></h4><p>Both auto-start mechanisms registered on install. Service is the in-session respawn supervisor (LocalSystem in Session 0, kiosk user can't disable). Scheduled task is the AtLogon fallback that fires even on installs where <code>WTSQueryUserToken</code> + the v1.1.3 explorer-token fallback both somehow fail. Closes the "filter only runs when I re-click the exe" failure mode.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Task watchdog dropped, AtLogon-only<span class="badge">v1.1.4</span></h4><p>v1.0.x's every-1-minute respawn watchdog removed from the scheduled task. The Service handles in-session respawn now; keeping both watchdogs alongside each other caused kill/respawn churn. Task is now a single AtLogon trigger — boot-time fallback only.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Password modal via child process<span class="badge">v1.1.3</span></h4><p><code>askPasswordModal</code> now exec's <code>kiosk-exit-guard.exe --ask-password &lt;title&gt; &lt;subtitle&gt;</code> as a child and reads its exit code (0 / 1 / 2 = OK / Wrong / Cancel). The child's WebView2 is always its first instance, so the controller (which already used WebView2 for <code>firstRunWithWizard</code>) never crashes on the LL-hook-triggered password modal. Closes the "fresh install, press Win once, kiosk bypassed" failure path.</p></div>
-  <div class="feature"><h4><span class="dot new"></span><code>explorer.exe</code> token fallback<span class="badge">v1.1.3</span></h4><p>When <code>WTSQueryUserToken</code> returns <code>ERROR_NO_TOKEN</code> (observed in production on Win11 Home), the supervisor falls back to finding <code>explorer.exe</code> in the active console session via <code>ProcessIdToSessionId</code>, calling <code>OpenProcessToken</code>, and (if UAC is on) unwrapping the limited half of the split token to the elevated linked token via <code>GetTokenInformation(TokenLinkedToken)</code>. Closes the "filter only runs when I re-click the exe" failure path.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Toasts via child process<span class="badge">v1.1.2</span></h4><p><code>showTimedInfo</code> always spawns <code>kiosk-exit-guard.exe --show-toast</code> as a fire-and-forget child. The caller's process is never the one to instantiate a second WebView2, structurally eliminating the <code>go-webview2</code> double-instance panic that crashed the controller every time a pause auto-expired (and dropped the LL keyboard hook for ~1 s while the Service respawned).</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Pause-expiry crash fix<span class="badge">v1.1.2</span></h4><p>Symptom users hit: Resume shortcut said "SK Filter is already active" but the Win key wasn't blocked. Root cause: <code>autoReenableFilterMode</code>'s "Pause ended." toast was the controller's second in-process WebView2, panic'd on the <code>time.AfterFunc</code> goroutine (no <code>recover</code>), killed the controller. Same path bit every flow pairing <code>askPasswordModal</code> with <code>showFailedToast</code>. Fix in v1.1.2 routes all toasts through a separate process.</p></div>
-  <div class="feature"><h4><span class="dot new"></span><code>--update</code> panic fix<span class="badge">v1.1.1</span></h4><p><code>runUpdateInvocation</code> called <code>showTimedInfo("Checking GitHub for updates…")</code> then <code>askPasswordModal</code> in the same process — two WebView2 instances, panic at <code>chromium.go:131</code>. v1.1.1 spawned the toast as a separate process; v1.1.2 generalizes this to every toast call site.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Windows Service supervisor<span class="badge">v1.1.0</span></h4><p>New <code>KioskExitGuardSvc</code> running as <code>LocalSystem</code> in Session 0 replaces the v1.0.x Task Scheduler watchdog. Spawns the user-session controller via <code>CreateProcessAsUserW</code> and respawns within seconds if killed. The kiosk user can't reach SCM, so they can't stop the supervisor the way they could <code>schtasks /Delete</code> the old task.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Two-process model<span class="badge">v1.1.0</span></h4><p>Same <code>kiosk-exit-guard.exe</code> binary; flag selects role. <code>--service-run</code> (SCM-only), <code>--service-install</code>, <code>--service-remove</code>, no args = controller. Service uses <code>WTSQueryUserToken</code> + <code>DuplicateTokenEx</code> to get a primary token, <code>CreateEnvironmentBlock</code> to build per-user env, <code>lpDesktop = "winsta0\\default"</code> so the controller can still show its modals.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Service-spawn first-run guard<span class="badge">v1.1.0</span></h4><p>Service sets <code>KIOSK_EXIT_GUARD_VIA_SERVICE=1</code> in the spawned controller's env. If the controller boots with no password configured (half-installed device), the marker tells it to exit silently — Service does not respawn-loop a stack of first-run wizards every few seconds.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>LL-hook thread pinning<span class="badge">v1.0.7</span></h4><p><code>runtime.LockOSThread()</code> at the top of <code>main()</code>. The Win32 LL hook is bound to its install thread — without pinning, the Go runtime would migrate the main goroutine after <code>firstRunWithWizard()</code>'s WebView2 message loop and the hook went silently dead. Fixes the "first-run install ignores keyboard combos" bug.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Random re-injection nonce<span class="badge">v1.0.6</span></h4><p>The fixed <code>0xC0DE</code> ExtraInfo marker is replaced with a <code>uintptr</code> drawn from <code>crypto/rand</code> at controller startup. Another process can no longer forge a <code>SendInput</code> call that bypasses the LL hook. Never written to the log.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Taskbar hidden while active<span class="badge">v1.0.6</span></h4><p><code>NoTaskbar=1</code> under HKCU Explorer policies; Explorer is restarted so the change takes effect immediately. Closes the Start-button left-click escape (click Start → click the kiosk's taskbar entry → close).</p></div>
-  <div class="feature"><h4><span class="dot new"></span>WebView2 kiosk hardening<span class="badge">v1.0.6</span></h4><p>Default context menus, dev tools (F12 / Ctrl+Shift+I), status bar, and zoom controls disabled via WebView2 <code>Settings</code>. <code>NewWindowRequested</code> rejected so popups, <code>target=_blank</code>, and <code>window.open</code> can't spawn a second window outside the kiosk.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Accessibility helpers IFEO-blocked<span class="badge">v1.0.6</span></h4><p><code>sethc.exe</code>, <code>osk.exe</code>, <code>narrator.exe</code>, <code>utilman.exe</code>, <code>magnify.exe</code> redirect to <code>--silent-exit</code> alongside <code>chrome.exe</code> / <code>msedge.exe</code>. Closes Sticky-Keys-5x-Shift, Narrator, and Ease-of-Access escapes.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Atomic CAS on prompt flag<span class="badge">v1.0.6</span></h4><p><code>hookCallback</code> now does a <code>CompareAndSwap</code> on <code>promptOpen</code> before queuing the prompt. A rapid second blocked combo can no longer race past the first and overwrite <code>pendingComboV</code> — only one in-flight prompt exists at a time.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Synchronous modifier snapshot<span class="badge">v1.0.6</span></h4><p><code>capturedModifiers()</code> runs inside <code>hookCallback</code> at the moment the blocked event fires, not 200+ ms later after the WebView2 spawn delay. Releasing modifiers before the modal opens no longer causes a bare key to be re-injected after auth.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Log file + panic recovery<span class="badge">v1.0.4</span></h4><p><code>kiosk-exit-guard.log</code> next to the exe captures controller startup, hook installation, pauses, auto-resumes, errors, and panic stack traces. 5 MB rotation (renames to <code>.log.old</code>).</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Modal hang fix<span class="badge">v1.0.3</span></h4><p>Stripped <code>SetForegroundWindow</code> and <code>BringWindowToTop</code> from the topmost path — they have eligibility rules that caused the modal to render blank white and go "Not Responding" on Server SKUs.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Per-monitor DPI awareness<span class="badge">v1.0.3</span></h4><p>Manifest now declares <code>PerMonitorV2</code> awareness. <code>GetSystemMetrics(SM_CXSCREEN)</code> returns physical pixels on 4K — kiosk window covers the full native resolution instead of scaled logical area.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Multi-trigger Task Scheduler<span class="badge">v1.0.3</span></h4><p>LogonTrigger + every-1-min watchdog + <code>RestartOnFailure</code>. If the controller dies mid-session, it comes back within 1 minute instead of waiting for re-logon. Auto-upgrades existing installs on next launch.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>"Launch Kiosk" shortcut<span class="badge">v1.0.3</span></h4><p>Re-spawn the WebView2 child manually. Refuses during pause so it can't silently defeat pause semantics.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>"Change Kiosk URL" shortcut<span class="badge">v1.0.3</span></h4><p>Password-gated. After saving, the kiosk child is killed so the watchdog respawns at the new URL within seconds.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Taskbar right-click disabled<span class="badge">v1.0.0</span></h4><p><code>NoTrayContextMenu=1</code> + <code>NoViewContextMenu=1</code> under HKCU when the filter is active. Closes the "Win → right-click taskbar → Close Window" bypass that worked even with our Windows-key gate.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Clean-slate install<span class="badge">v1.0.0</span></h4><p>First-run now purges anything a prior install might have left behind — zombie controller processes, stale IFEO blocks, dangling Task Scheduler entries, half-deleted shortcuts, orphan state files — before the wizard. Reinstall always starts from zero.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Anti-zombie controller kill<span class="badge">v1.0.0</span></h4><p>Controller startup now kills any other kiosk-exit-guard.exe instance found running. Prevents the "previous controller still enforcing with a stale in-memory password hash" issue that bit v0.5.4 uninstalls.</p></div>
-</div>
-
-<div class="feature-grid">
-  <div class="feature"><h4><span class="dot new"></span>"Update SK Filter" shortcut<span class="badge">v0.5.5</span></h4><p>Talks to <code>api.github.com/repos/Shalom-Karr/kiosk-exit-guard/releases/latest</code>. Shows current vs latest. If newer, password-prompts, downloads to TEMP, atomic-renames the running exe to <code>.old</code> and the new exe into place, then restarts the scheduled task.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Windows key alone → modal<span class="badge">v0.5.5</span></h4><p>Single Win tap used to open Start menu and let the user reach the kiosk's taskbar entry. Now: Win down is swallowed; on Win up (if no other key was pressed in between), the password modal opens. Win+R / Win+E / etc. still flow through the combo block as before.</p></div>
-</div>
-
-<div class="feature-grid">
-  <div class="feature"><h4><span class="dot new"></span>Frameless password modal<span class="badge">v0.5.4</span></h4><p>No title bar, no X button, no taskbar entry, no Alt+Tab. The only way to dismiss is the in-page Cancel button or the correct password. Closes the "kill the modal to bypass the SK Filter" hole.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>"Resume SK Filter" shortcut<span class="badge">v0.5.4</span></h4><p>Ends the current pause immediately and brings the kiosk back. <strong>No password required</strong> — resuming makes the system more locked-down, not less, so any user can trigger it.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>"Uninstall SK Filter" shortcut<span class="badge">v0.5.4</span></h4><p>Password + confirm dialog gate it. Removes IFEO blocks, HKCU lockdown, HKLM config, scheduled task, all shortcuts. The exe binary itself remains — delete manually.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Cancel in first-run wizard<span class="badge">v0.5.4</span></h4><p>First-run modal also gets a Cancel button matching the password modal's style. Esc key dismisses too.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Modal-hang fix<span class="badge">v0.5.4</span></h4><p>The 12-iteration topmost retry loop hammered Win32 calls from a competing goroutine and froze the modal. Replaced with one shot after a 220 ms settle.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>"Pause SK Filter" desktop button<span class="badge">v0.5.3</span></h4><p>Drops a shortcut on the desktop. Double-click → UAC consent → password modal → duration picker. Same flow as the Ctrl+Shift+Alt+K hotkey, just one click away.</p></div>
-  <div class="feature"><h4><span class="dot new"></span><code>--pause</code> flag + sync loop<span class="badge">v0.5.3</span></h4><p>The shortcut runs <code>kiosk-exit-guard.exe --pause</code> as a fresh elevated process. A new 2-second polling goroutine in the controller reconciles in-memory state with the pause file written by the <code>--pause</code> process — kiosk closes, hook stops blocking, all within a couple seconds.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Hotkey modal topmost fix<span class="badge">v0.5.2</span></h4><p>Password modal was being created behind the fullscreen kiosk window. Now forces HWND_TOPMOST + SetForegroundWindow with a brief retry loop so the modal always wins z-order.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Ctrl+R / F5 allowlist<span class="badge">v0.5.2</span></h4><p>Reload shortcuts now pass through to the kiosk WebView2 without prompting for the password. Admin can refresh the display freely; everything else still gates.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Default-ON, pause-only model<span class="badge">v0.5.1</span></h4><p>Filter active at install, after every reboot, after every pause expires. Hotkey is now a pause trigger, not a toggle.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Pause re-enables Edge<span class="badge">v0.5.1</span></h4><p>When a pause starts, the Chrome/Edge IFEO blocks are <strong>removed</strong>. When the timer expires they're re-applied automatically.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>1–100 min durations + custom<span class="badge">v0.5.1</span></h4><p>Quick picks 1 / 5 / 10 / 20 / 30 / 45 min plus a Custom option that takes any whole number from 1 to 100.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Branded SK Filter password modal<span class="badge">v0.5.0</span></h4><p>WebView2 dialog with autofocused input. <em>"This command has been locked by the SK Filter — Please enter your password to continue."</em></p></div>
-  <div class="feature"><h4><span class="dot new"></span>Re-injection of blocked combos<span class="badge">v0.5.0</span></h4><p>Every blocked Ctrl/Win/Alt combo opens the password modal. Correct password re-sends the original combo via <code>SendInput</code>.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>WebView2 Runtime auto-install<span class="badge">v0.5.0</span></h4><p>If the runtime is missing (Server SKUs, stripped images), the exe downloads the evergreen bootstrapper and runs it silently.</p></div>
-  <div class="feature"><h4><span class="dot new"></span>Branded first-run wizard<span class="badge">v0.5.0</span></h4><p>One WebView2 page collects password + URL with form validation, replacing the chain of small zenity prompts.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>Server 2022 RDP support<span class="badge">v1.1.11</span></h4><p>Supervisor walks <code>WTSEnumerateSessionsW</code> and picks the lowest-numbered <code>WTSActive</code> session with a logged-in user (verified via <code>WTSQuerySessionInformationW(WTSUserName)</code>), preferring the console session when it qualifies. Win11 / laptop behavior unchanged; Server 2022 / RDP newly supported.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>Update UI: confirm + auth in one screen<span class="badge">v1.1.11</span></h4><p>"Checking GitHub for updates…" toast and the separate "download and install?" <code>zenity.Question</code> are gone. Password modal's subtitle mentions the new version number, combining confirm + auth into one screen. The "you're on v%s. No update available." branch is kept so clicking Update is never silent.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>restartExplorer respects the registered shell<span class="badge">v1.1.11</span></h4><p>Reads <code>HKLM\...\Winlogon\Shell</code> and skips the <code>taskkill /F /IM explorer.exe</code> when the registered shell isn't <code>explorer.exe</code> (Server Core, custom shells). <code>NoTaskbar</code> policy still gets written; it just won't take effect until next logon.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>WTS process enumeration<span class="badge">v1.1.10</span></h4><p>Cross-session process enumeration uses <code>WTSEnumerateProcessesExW</code> from <code>wtsapi32.dll</code> (Win32's service-designed API) instead of <code>gopsutil</code>'s userland snapshot, which was returning empty on some installs when called from Session 0. Candidate list broadened to <code>explorer.exe</code> · <code>sihost.exe</code> · <code>taskhostw.exe</code> · <code>RuntimeBroker.exe</code> · <code>StartMenuExperienceHost.exe</code>, each validated against its canonical <code>%SystemRoot%</code> path via <code>QueryFullProcessImageName</code>.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>30 s password-modal auto-dismiss<span class="badge">v1.1.9</span></h4><p>A user who pressed <code>Ctrl+Shift+Alt+K</code>, saw the modal, then walked away used to leave the fullscreen password screen up forever. <code>askPasswordModalInProcess</code> arms <code>time.AfterFunc(30*time.Second, ...)</code>; <code>kgSubmit</code> / <code>kgCancel</code> reset the timer so an actively-typing user isn't yanked mid-attempt.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>Controller mutex stops logon kiosk blink<span class="badge">v1.1.9</span></h4><p>v1.1.4 co-installed both Service and AtLogon task; at logon both fired within ~1 s and the loser was killed by the winner's <code>killRunningController</code>. New <code>Global\KioskExitGuardControllerRunning</code> named mutex: second mover logs and <code>os.Exit(0)</code>s cleanly. No respawn loop, no kiosk blink.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>Exe relocated to %ProgramFiles%<span class="badge">v1.1.8</span></h4><p>First-run copies the exe to <code>%ProgramFiles%\KioskExitGuard\</code> and re-execs from there before registering the Service binary path, scheduled task, or desktop shortcuts. SCM-registered path now lives in an admin-only directory — a kiosk user can no longer swap the binary and have the supervising Service respawn attacker code as LocalSystem.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>--update SHA-256 verified + admin-only staging<span class="badge">v1.1.8</span></h4><p>Downloaded exe stages under <code>%ProgramData%\KioskExitGuard\staging\</code> (DACL via <code>icacls /inheritance:r</code>) instead of <code>%TEMP%</code>; SHA-256 verified against a <code>kiosk-exit-guard.exe.sha256</code> sidecar asset published by the release workflow. Mismatch aborts with a <code>zenity.Error</code>.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>HKLM hash DACL admin-only<span class="badge">v1.1.8</span></h4><p>Default <code>HKLM\Software</code> inherits <code>BUILTIN\Users:KEY_READ</code> — any local user could read the bcrypt hash and crack it offline. <code>SetNamedSecurityInfo(SE_REGISTRY_KEY, SDDL=D:PAI(A;CI;KA;;;SY)(A;CI;KA;;;BA))</code> on every controller startup grants only SYSTEM + Administrators; existing installs heal on first launch of v1.1.8.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>WebView2 profile under %ProgramData%<span class="badge">v1.1.8</span></h4><p>All four <code>webview2.NewWithOptions</code> call sites (password modal, toast, first-run wizard, kiosk page) share <code>%ProgramData%\KioskExitGuard\WebView2\</code> with the same locked-down DACL. The default <code>%LOCALAPPDATA%</code> profile was kiosk-user-writable — a poisoned service worker could have intercepted the password modal's <code>kgSubmit</code> host-object call.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>Service + scheduled task co-installed<span class="badge">v1.1.4</span></h4><p>Both auto-start mechanisms registered on install. Service is the in-session respawn supervisor (LocalSystem in Session 0). Scheduled task is the AtLogon fallback when <code>WTSQueryUserToken</code> + the v1.1.3 user-session-process fallback both fail. Closes the "filter only runs when I re-click the exe" failure mode.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>Zoom shortcuts allowed<span class="badge">v1.1.5</span></h4><p><code>Ctrl+0</code>, <code>Ctrl+-</code>, <code>Ctrl++</code> / <code>Ctrl+=</code> (plus numpad variants) pass through to the kiosk WebView2 page so admins / kiosk visitors can adjust zoom without entering the password. Ctrl-only — <code>Win+0</code> / <code>Alt+-</code> still hit the lockdown.</p></div>
+  <div class="feature"><h4><span class="dot"></span>WebView2 kiosk window</h4><p>The kiosk page lives in this exe, not a Chrome subprocess. Fullscreen, topmost, frameless, JS-locked to refuse navigation away from the kiosk URL. Context menus, dev tools, status bar, zoom, and <code>NewWindowRequested</code> all disabled / rejected.</p></div>
+  <div class="feature"><h4><span class="dot"></span>Windows Service supervisor</h4><p><code>KioskExitGuardSvc</code> runs as <code>LocalSystem</code> in Session 0 and respawns the user-session controller via <code>CreateProcessAsUserW</code>. Kiosk user can't reach SCM, so they can't stop the supervisor.</p></div>
+  <div class="feature"><h4><span class="dot"></span>Password-gated keyboard hook</h4><p>LL keyboard hook captures every Ctrl/Win/Alt combo plus Win-alone, opens the SK Filter password modal. Correct password re-injects the original combo via <code>SendInput</code> with a per-process random <code>ExtraInfo</code> nonce. Wrong password / cancel = swallowed. <code>Ctrl+R</code>, <code>F5</code>, and Ctrl-zoom combos pass through.</p></div>
+  <div class="feature"><h4><span class="dot"></span>Chrome uninstalled on first run</h4><p>Reads Chrome's <code>UninstallString</code> from the registry and runs the official uninstaller with <code>--force-uninstall</code>. Clean removal, idempotent if Chrome isn't installed.</p></div>
+  <div class="feature"><h4><span class="dot"></span>Edge + accessibility helpers IFEO-blocked</h4><p><code>HKLM\…\Image File Execution Options\msedge.exe\Debugger</code> redirects launches to <code>kiosk-exit-guard --silent-exit</code>. Same for <code>chrome.exe</code> and the accessibility helpers (<code>sethc</code>, <code>osk</code>, <code>narrator</code>, <code>utilman</code>, <code>magnify</code>) that close the Sticky-Keys-5x-Shift and Ease-of-Access escapes. Re-applied on every controller launch so a Windows Update can't strip them.</p></div>
+  <div class="feature"><h4><span class="dot"></span>UAC elevation</h4><p>Embedded manifest. Every manual launch requests admin consent. The Service spawns the controller via <code>CreateProcessAsUserW</code> with the user's linked-elevated token so logon launches are silent.</p></div>
+  <div class="feature"><h4><span class="dot"></span>HKLM password storage</h4><p>Bcrypt hash in <code>HKLM\Software\KioskExitGuard\PasswordHash</code>. Admin-write only — a standard kiosk user can't bypass by deleting a file. DACL is tightened to SYSTEM + Administrators on every controller startup (v1.1.8+).</p></div>
+  <div class="feature"><h4><span class="dot"></span>Pause hotkey + desktop shortcut</h4><p><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Alt</kbd>+<kbd>K</kbd> or the "Pause SK Filter" desktop shortcut. Password → duration picker (1 / 5 / 10 / 20 / 30 / 45 min or Custom 1–100). Edge becomes launchable, HKCU lockdown lifts, kiosk window closes. Auto-resume when the timer expires.</p></div>
+  <div class="feature"><h4><span class="dot"></span>Registry policy lockdown</h4><p>Filter active: <code>DisableTaskMgr</code>, <code>NoRun</code>, <code>NoTrayContextMenu</code>, <code>NoViewContextMenu</code>, <code>NoTaskbar</code> all set to 1 under HKCU. Cleared during pause or by <code>--reset</code>.</p></div>
+  <div class="feature"><h4><span class="dot"></span>Self-update with integrity check</h4><p>"Update SK Filter" shortcut hits GitHub's <code>releases/latest</code>, SHA-256-verifies the downloaded exe against the sidecar asset, atomic-renames the running exe (<code>.old</code> rollback target), restarts the Service.</p></div>
 </div>
 
 <h3>What the password modal looks like</h3>
@@ -377,27 +251,14 @@
   </div>
 </div>
 
-<h2 id="features">All features</h2>
-
-<div class="feature-grid">
-  <div class="feature"><h4><span class="dot"></span>WebView2 kiosk window</h4><p>The kiosk page lives in this exe, not a Chrome subprocess. Fullscreen, topmost, frameless, JS-locked to refuse navigation away from the kiosk URL.</p></div>
-  <div class="feature"><h4><span class="dot"></span>Chrome uninstalled on first run</h4><p>Reads Chrome's <code>UninstallString</code> from the registry and runs the official uninstaller with <code>--force-uninstall</code>. Clean removal, idempotent if Chrome isn't installed.</p></div>
-  <div class="feature"><h4><span class="dot"></span>Edge launches blocked at the OS</h4><p>Sets <code>HKLM\…\Image File Execution Options\msedge.exe\Debugger</code> to redirect launches to <code>kiosk-exit-guard --silent-exit</code>. Same for <code>chrome.exe</code>. Re-applied every launch.</p></div>
-  <div class="feature"><h4><span class="dot"></span>UAC elevation</h4><p>Embedded manifest. Every launch requests admin consent cleanly. The Task Scheduler entry uses HIGHEST run level so logon launches are silent.</p></div>
-  <div class="feature"><h4><span class="dot"></span>HKLM password storage</h4><p>Bcrypt hash in <code>HKLM\Software\KioskExitGuard\PasswordHash</code>. Admin-write only — a standard kiosk user can't bypass by deleting a file.</p></div>
-  <div class="feature"><h4><span class="dot"></span>Filter mode hotkey</h4><p><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Alt</kbd>+<kbd>K</kbd> → password → flips ON/OFF. State persists across reboots.</p></div>
-  <div class="feature"><h4><span class="dot"></span>Pause duration prompt</h4><p>Toggling OFF asks "5m / 15m / 30m / 1h / Indefinite". Anything but Indefinite auto-re-enables.</p></div>
-  <div class="feature"><h4><span class="dot"></span>Registry policy lockdown</h4><p>Filter mode ON: <code>DisableTaskMgr=1</code> and <code>NoRun=1</code> under HKCU. Cleared when flipped OFF or via <code>--reset</code>.</p></div>
-</div>
-
 <h2 id="how">How it works</h2>
 
-<p>One binary; the first command-line argument selects the role. v1.1.0 introduces the Windows Service supervisor on top of the existing controller architecture.</p>
+<p>One binary; the first command-line argument selects the role. Since v1.1.0 there are two long-lived processes per device: a Windows Service supervisor running as <code>LocalSystem</code> in Session 0, and a user-session controller it spawns via <code>CreateProcessAsUserW</code>.</p>
 
 <div class="arch">
   <div class="arch-row">
     <span class="arch-box bad">--service-run</span>
-    <span class="arch-arrow">— SCM only. Runs as <code>LocalSystem</code> in Session 0. Finds the active console session, gets the user token, spawns the controller into the user session, watches it, respawns on death. No UI.</span>
+    <span class="arch-arrow">— SCM only. Runs as <code>LocalSystem</code> in Session 0. <code>pickActiveUserSession()</code> walks <code>WTSEnumerateSessionsW</code> to find the user's session (v1.1.11), gets the user token, spawns the controller into the user session, watches it, respawns on death. No UI.</span>
   </div>
   <div class="arch-row">
     <span class="arch-box accent">Controller (no args)</span>
@@ -405,11 +266,15 @@
   </div>
   <div class="arch-row">
     <span class="arch-box">--webview</span>
-    <span class="arch-arrow">— spawned by the controller when filter mode flips ON. Renders the fullscreen WebView2 kiosk window. Dies when filter mode flips OFF.</span>
+    <span class="arch-arrow">— spawned by the controller when filter mode is active. Renders the fullscreen WebView2 kiosk window. Dies when the controller pauses or restarts.</span>
+  </div>
+  <div class="arch-row">
+    <span class="arch-box">--ask-password / --show-toast</span>
+    <span class="arch-arrow">— short-lived child processes for the branded password modal and toast renders. Spawned by whatever caller needs them; isolates WebView2 instantiation to a fresh process to dodge the <code>go-webview2</code> second-instance panic.</span>
   </div>
   <div class="arch-row">
     <span class="arch-box bad">--silent-exit</span>
-    <span class="arch-arrow">— how IFEO-blocked launches reach us. Windows passes the target exe's path as an extra arg. We exit immediately so the Chrome/Edge/accessibility-helper launch fails invisibly.</span>
+    <span class="arch-arrow">— how IFEO-blocked launches reach us. Windows passes the target exe's path as an extra arg; we exit immediately so the Chrome / Edge / accessibility-helper launch fails invisibly.</span>
   </div>
 </div>
 
@@ -419,31 +284,33 @@
   <div class="arch-row">
     <span class="arch-box">1. UAC consent</span>
     <span class="arch-arrow">→</span>
-    <span class="arch-box">2. WebView2 auto-install (if missing)</span>
+    <span class="arch-box">2. relocate to %ProgramFiles%\KioskExitGuard\ + re-exec</span>
   </div>
   <div class="arch-row">
     <span class="arch-arrow">↓</span>
   </div>
   <div class="arch-row">
-    <span class="arch-box accent">3. branded wizard: password + kiosk URL</span>
+    <span class="arch-box">3. WebView2 auto-install (if missing)</span>
+    <span class="arch-arrow">→</span>
+    <span class="arch-box accent">4. branded wizard: password + kiosk URL</span>
   </div>
   <div class="arch-row">
     <span class="arch-arrow">↓</span>
   </div>
   <div class="arch-row">
-    <span class="arch-box bad">4. uninstall Chrome silently</span>
+    <span class="arch-box bad">5. uninstall Chrome silently</span>
     <span class="arch-arrow">→</span>
-    <span class="arch-box bad">5. IFEO redirects on chrome.exe + msedge.exe + accessibility helpers</span>
+    <span class="arch-box bad">6. IFEO redirects (chrome.exe + msedge.exe + 5 a11y helpers)</span>
   </div>
   <div class="arch-row">
     <span class="arch-arrow">↓</span>
   </div>
   <div class="arch-row">
-    <span class="arch-box good">6. desktop shortcuts (4)</span>
+    <span class="arch-box good">7. four desktop shortcuts</span>
     <span class="arch-arrow">→</span>
-    <span class="arch-box good">7. <code>sc create KioskExitGuardSvc</code> + start</span>
+    <span class="arch-box good">8. install KioskExitGuardSvc + AtLogon task</span>
     <span class="arch-arrow">→</span>
-    <span class="arch-box good">8. delete legacy v1.0.x task</span>
+    <span class="arch-box good">9. tighten %ProgramData% DACL</span>
   </div>
 </div>
 
@@ -457,14 +324,14 @@
     <span class="arch-arrow">(Session 0, LocalSystem)</span>
   </div>
   <div class="arch-row">
-    <span class="arch-arrow">↓ user logs on</span>
+    <span class="arch-arrow">↓ user logs on (locally or via RDP)</span>
   </div>
   <div class="arch-row">
-    <span class="arch-box bad">Service detects console session</span>
-    <span class="arch-arrow">via <code>WTSGetActiveConsoleSessionId</code> + <code>WTSQueryUserToken</code></span>
+    <span class="arch-box bad">pickActiveUserSession() finds the right session</span>
+    <span class="arch-arrow">walks <code>WTSEnumerateSessionsW</code>, picks console if it has a user, else lowest-numbered other Active session with a user</span>
   </div>
   <div class="arch-row">
-    <span class="arch-arrow">↓ <code>CreateProcessAsUserW</code></span>
+    <span class="arch-arrow">↓ <code>WTSQueryUserToken</code> (or user-session-process fallback) + <code>CreateProcessAsUserW</code></span>
   </div>
   <div class="arch-row">
     <span class="arch-box accent">Controller (user session)</span>
@@ -478,7 +345,7 @@
   </div>
 </div>
 
-<p>If the controller dies (crash, manual kill, etc.), the Service waits a beat then spawns a fresh one. The kiosk user can't stop the Service — SCM rejects non-admin commands.</p>
+<p>If the controller dies (crash, manual kill, etc.), the Service spawns a fresh one within ~1 s. The kiosk user can't stop the Service — SCM rejects non-admin commands. The co-installed AtLogon scheduled task acts as a fallback for installs where the Service spawn path fails outright; <code>Global\KioskExitGuardControllerRunning</code> keeps exactly one controller alive when both fire.</p>
 
 <h3>Pressing a blocked combo (filter active)</h3>
 
@@ -493,18 +360,18 @@
     <span class="arch-arrow">↓</span>
   </div>
   <div class="arch-row">
-    <span class="arch-box accent">branded SK Filter password modal opens (autofocused input)</span>
+    <span class="arch-box accent">--ask-password child process opens (frameless, topmost, autofocused)</span>
   </div>
   <div class="arch-row">
     <span class="arch-arrow">↓ correct password</span>
   </div>
   <div class="arch-row">
-    <span class="arch-box good">SendInput re-injects Win+R</span>
+    <span class="arch-box good">SendInput re-injects Win+R with kioskMarker in ExtraInfo</span>
     <span class="arch-arrow">→ Run dialog opens for real</span>
   </div>
 </div>
 
-<p>The re-injected events carry a marker in <code>ExtraInfo</code> so the LL hook recognizes them as our own and lets them through. Wrong password → keystroke stays swallowed, "Wrong password" toast appears.</p>
+<p>The re-injected events carry a random per-process nonce in <code>ExtraInfo</code> so the LL hook recognizes them as our own and lets them through. Wrong password → keystroke stays swallowed, "Wrong password" toast appears.</p>
 
 <h3>Pausing the SK Filter</h3>
 
@@ -523,20 +390,18 @@
     <span class="arch-arrow">↓</span>
   </div>
   <div class="arch-row">
-    <span class="arch-box accent">SK Filter password modal (autofocused)</span>
+    <span class="arch-box accent">SK Filter password modal (autofocused, 30 s inactivity timeout)</span>
   </div>
   <div class="arch-row">
     <span class="arch-arrow">↓ correct password</span>
   </div>
   <div class="arch-row">
-    <span class="arch-box accent">duration picker (1 / 5 / 10 / 20 / 30 / 45 / Custom 1–100)</span>
+    <span class="arch-box accent">kiosk killed; pause-just-applied.flag written; duration picker (1 / 5 / 10 / 20 / 30 / 45 / Custom 1–100)</span>
   </div>
   <div class="arch-row">
     <span class="arch-arrow">↓</span>
   </div>
   <div class="arch-row">
-    <span class="arch-box good">WebView2 kiosk closed</span>
-    <span class="arch-arrow">·</span>
     <span class="arch-box good">Edge IFEO block lifted</span>
     <span class="arch-arrow">·</span>
     <span class="arch-box good">HKCU lockdown removed</span>
@@ -549,9 +414,7 @@
   </div>
 </div>
 
-<p>When the desktop button is used, a 2-second polling goroutine in the running controller picks up the state change from the pause file and mirrors it into the controller's in-memory flags — keystroke hook stops blocking within ~2 seconds.</p>
-
-<p>If the user triggers a pause while one is already in flight, they get a read-only status toast with the remaining time. There is no "end pause early" path — every pause runs its course.</p>
+<p>When the desktop button is used, a 2-second polling goroutine in the running controller picks up the state change from the pause file and mirrors it into in-memory flags. The v1.1.9 <code>pause-just-applied.flag</code> marker suppresses the controller's 30 s watchdog for the first 5 s after pause so it can't relaunch the kiosk before the sync loop catches up.</p>
 
 <h2 id="flow">States</h2>
 
@@ -562,7 +425,7 @@
   <tbody>
     <tr>
       <td><span class="state-on">Active</span> <em>(default)</em></td>
-      <td>Any Ctrl/Win/Alt combo → SK Filter password modal → re-injected if correct</td>
+      <td>Any Ctrl/Win/Alt combo → SK Filter password modal → re-injected if correct. <code>Ctrl+R</code> / <code>F5</code> / Ctrl-zoom pass through.</td>
       <td class="state-blocked">Disabled by policy</td>
       <td class="state-blocked">Disabled by policy</td>
       <td>Fullscreen, topmost, frameless</td>
@@ -586,11 +449,11 @@
 <h2 id="setup">Setup</h2>
 
 <ol>
-  <li><strong>Download</strong> the exe (button above) and place it in <code>C:\Program&nbsp;Files\KioskExitGuard\</code>.</li>
-  <li><strong>Double-click</strong>. Approve the UAC prompt.</li>
+  <li><strong>Download</strong> the exe (button above).</li>
+  <li><strong>Double-click</strong>. Approve the UAC prompt. The first-run wizard relocates the exe to <code>C:\Program&nbsp;Files\KioskExitGuard\</code> if it's launched from anywhere else.</li>
   <li><strong>WebView2 Runtime</strong> auto-installs if missing (~30 seconds, silent).</li>
   <li><strong>First-run wizard</strong> opens — enter password (twice), confirm or change the kiosk URL.</li>
-  <li>Setup then <strong>uninstalls Chrome</strong>, <strong>blocks Chrome+Edge launches</strong>, drops a <strong>desktop shortcut</strong>, and registers the <strong>logon task</strong>.</li>
+  <li>Setup then <strong>uninstalls Chrome</strong>, <strong>blocks Chrome+Edge+a11y helper launches</strong>, drops the <strong>four desktop shortcuts</strong>, and registers the <strong>Service + AtLogon task</strong>.</li>
   <li>The SK Filter is <strong>ON immediately</strong> after setup. Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Alt</kbd>+<kbd>K</kbd> to pause it when needed.</li>
 </ol>
 
@@ -599,28 +462,31 @@
 </div>
 
 <div class="callout callout-good">
-  <strong>Server 2022 / stripped images.</strong> WebView2 Runtime isn't pre-installed on Server SKUs. v0.5.x auto-detects and installs it before opening the wizard — no manual step needed.
+  <strong>Server 2022 / stripped images.</strong> WebView2 Runtime isn't pre-installed on Server SKUs. First-run auto-detects and installs it before opening the wizard — no manual step needed. On a headless RDP'd Server 2022 the v1.1.11 <code>pickActiveUserSession()</code> automatically targets the RDP session instead of the empty physical-console session.
 </div>
 
 <h2 id="flags">CLI flags</h2>
 
-<pre>kiosk-exit-guard.exe                  # controller mode — LL hook + watchdog (spawned by Service)
-kiosk-exit-guard.exe --service-run    # SCM-only — supervising Service (Session 0, LocalSystem)
-kiosk-exit-guard.exe --service-install # register & start KioskExitGuardSvc (first-run setup)
-kiosk-exit-guard.exe --service-remove # stop & unregister the Service (uninstall)
-kiosk-exit-guard.exe --pause          # password + duration picker, pause the filter (desktop button)
-kiosk-exit-guard.exe --resume         # end the pause early (no password — desktop button)
-kiosk-exit-guard.exe --update         # check GitHub for new version, download + replace (desktop button)
-kiosk-exit-guard.exe --uninstall      # password + confirm dialog, full teardown (desktop button)
-kiosk-exit-guard.exe --webview        # internal: renders the kiosk window
-kiosk-exit-guard.exe --silent-exit    # internal: IFEO Debugger redirect handler
-kiosk-exit-guard.exe --set-password   # change the password (UAC-elevated)
-kiosk-exit-guard.exe --set-url        # change the kiosk URL (UAC-elevated)
-kiosk-exit-guard.exe --reset          # password-gated — clears registry policies, IFEO, filter mode</pre>
+<pre>kiosk-exit-guard.exe                    # controller mode — LL hook + watchdog (spawned by Service)
+kiosk-exit-guard.exe --service-run      # SCM-only — supervising Service (Session 0, LocalSystem)
+kiosk-exit-guard.exe --service-install  # admin: register & start KioskExitGuardSvc
+kiosk-exit-guard.exe --service-remove   # admin: stop & unregister the Service
+kiosk-exit-guard.exe --pause            # password + duration picker (desktop button)
+kiosk-exit-guard.exe --resume           # end pause early, no password (desktop button)
+kiosk-exit-guard.exe --update           # GitHub releases/latest + SHA-256 + atomic replace (desktop button)
+kiosk-exit-guard.exe --uninstall        # password + confirm, full teardown (desktop button)
+kiosk-exit-guard.exe --launch-kiosk     # manually respawn the WebView2 kiosk child
+kiosk-exit-guard.exe --set-password     # change the password (UAC-elevated)
+kiosk-exit-guard.exe --set-url          # change the kiosk URL (UAC-elevated)
+kiosk-exit-guard.exe --reset            # password-gated, clears registry policies, IFEO, filter mode
+kiosk-exit-guard.exe --webview          # internal: renders the kiosk window
+kiosk-exit-guard.exe --silent-exit      # internal: IFEO Debugger redirect handler
+kiosk-exit-guard.exe --ask-password     # internal: child-process password modal
+kiosk-exit-guard.exe --show-toast       # internal: child-process toast renderer</pre>
 
-<p><strong>v1.1.0 onwards</strong>: the controller is spawned by the Service into the active user session via <code>CreateProcessAsUserW</code>, not by the user directly. Manually running the bare exe on a configured system is allowed but uncommon — first-run setup registers the Service and starts it automatically. Verify the Service is up with <code>Get-Service KioskExitGuardSvc</code> or <code>sc query KioskExitGuardSvc</code>.</p>
+<p>The controller is normally spawned by the Service into the active user session via <code>CreateProcessAsUserW</code>, not by the user directly. First-run setup registers the Service and starts it automatically. Verify with <code>Get-Service KioskExitGuardSvc</code> or <code>sc query KioskExitGuardSvc</code>.</p>
 
-<p><code>--reset</code> requires the configured password. If lost entirely, an admin can wipe <code>HKLM\Software\KioskExitGuard</code> via <code>regedit</code> to fully reset.</p>
+<p><code>--reset</code> requires the configured password. If lost entirely, an admin can wipe <code>HKLM\Software\KioskExitGuard</code> via <code>regedit</code> to fully reset — see the admin runbook for the full recovery script.</p>
 
 <h2 id="limits">What it doesn't block</h2>
 
@@ -629,13 +495,14 @@ kiosk-exit-guard.exe --reset          # password-gated — clears registry polic
   <li>Booting from USB / safe mode bypasses everything. Set a BIOS password.</li>
   <li>Another admin with an elevated terminal can still kill the exe. The Task Manager disable + IFEO blocks raise the bar for a standard kiosk user.</li>
   <li>Third-party browser installed by an admin would not be IFEO-blocked unless you add it.</li>
+  <li>Windows 11 Home doesn't support Assigned Access; on Pro / Enterprise the built-in kiosk mode is the simpler answer. This tool is for the SKUs where that isn't available.</li>
 </ul>
 
 <h2 id="build">Build from source</h2>
 
-<p>CI at <code>.github/workflows/release.yml</code> rebuilds + releases on every <code>v*</code> tag push.</p>
+<p>CI at <code>.github/workflows/release.yml</code> rebuilds and releases on every <code>v*</code> tag push, attaching both <code>kiosk-exit-guard.exe</code> and a <code>kiosk-exit-guard.exe.sha256</code> sidecar that the in-app <code>--update</code> flow verifies against.</p>
 
-<pre>git tag v0.5.1 && git push origin v0.5.1</pre>
+<pre>git tag v1.1.11 && git push origin v1.1.11</pre>
 
 <p>Local build:</p>
 
@@ -646,7 +513,6 @@ go build -ldflags="-H windowsgui -s -w" -o kiosk-exit-guard.exe</pre>
 <p class="links">
   Source · <a href="https://github.com/Shalom-Karr/kiosk-exit-guard">github.com/Shalom-Karr/kiosk-exit-guard</a> · MIT
 </p>
-
 </div>
 </body>
 </html>
