@@ -155,7 +155,7 @@
 <div class="wrap">
 
 <header>
-  <h1>kiosk-exit-guard <span class="version-pill">v1.1.4</span></h1>
+  <h1>kiosk-exit-guard <span class="version-pill">v1.1.5</span></h1>
   <p class="tagline">Single-binary kiosk lockdown for Windows 11 Home. Embedded WebView2 kiosk, password-gated keyboard, Chrome uninstalled, Edge launches blocked at the OS level, self-installing, self-updating, all from one ~7&nbsp;MB exe.</p>
 </header>
 
@@ -186,7 +186,13 @@
   <a href="#build">Build</a>
 </nav>
 
-<h2 id="whats-new">v1.1.4 — what's in the box</h2>
+<h2 id="whats-new">v1.1.5 — what's in the box</h2>
+
+<div class="callout callout-good">
+  <strong>Browser zoom shortcuts allowed through.</strong> <code>Ctrl+0</code> (zoom reset), <code>Ctrl+-</code> (zoom out), and <code>Ctrl++</code> / <code>Ctrl+=</code> (zoom in) now pass through the LL hook to the kiosk WebView2 page instead of triggering the password modal. Numpad equivalents (<code>Ctrl+Numpad0</code>, <code>Ctrl+Subtract</code>, <code>Ctrl+Add</code>) too. All variants still require Ctrl-only — <code>Win+0</code>, <code>Alt+-</code>, etc. still hit the lockdown path. Joins the existing always-allowed list of <code>F5</code> and <code>Ctrl+R</code>.
+</div>
+
+<h2 id="v114">v1.1.4 — belt-and-suspenders auto-start</h2>
 
 <div class="callout callout-good">
   <strong>Belt-and-suspenders auto-start: Service AND scheduled task co-installed.</strong> Field report: "right now the filter only runs when I re-click the exe file from the downloads folder." Even after v1.1.3's <code>explorer.exe</code>-token fallback shipped, the auto-start was still flaky on the affected machine. v1.1.0 had aggressively switched to Service-only and deleted any leftover scheduled task on install — which made the kiosk completely unprotected after reboot whenever the Service spawn path failed.
@@ -249,6 +255,7 @@
 <p style="margin: 1rem 0 1.5rem;">For the full release-by-release breakdown, see the <a href="https://github.com/Shalom-Karr/kiosk-exit-guard/blob/main/docs/CHANGELOG.md" style="color: var(--accent);">changelog</a>.</p>
 
 <div class="feature-grid">
+  <div class="feature"><h4><span class="dot new"></span>Zoom shortcuts allowed<span class="badge">v1.1.5</span></h4><p><code>Ctrl+0</code>, <code>Ctrl+-</code>, <code>Ctrl++</code> / <code>Ctrl+=</code> (plus numpad variants) now pass through to the kiosk WebView2 page so admins / kiosk visitors can adjust zoom without entering the password. Ctrl-only — modifier combos like <code>Win+0</code> / <code>Alt+-</code> still hit the lockdown.</p></div>
   <div class="feature"><h4><span class="dot new"></span>Service + scheduled task co-installed<span class="badge">v1.1.4</span></h4><p>Both auto-start mechanisms registered on install. Service is the in-session respawn supervisor (LocalSystem in Session 0, kiosk user can't disable). Scheduled task is the AtLogon fallback that fires even on installs where <code>WTSQueryUserToken</code> + the v1.1.3 explorer-token fallback both somehow fail. Closes the "filter only runs when I re-click the exe" failure mode.</p></div>
   <div class="feature"><h4><span class="dot new"></span>Task watchdog dropped, AtLogon-only<span class="badge">v1.1.4</span></h4><p>v1.0.x's every-1-minute respawn watchdog removed from the scheduled task. The Service handles in-session respawn now; keeping both watchdogs alongside each other caused kill/respawn churn. Task is now a single AtLogon trigger — boot-time fallback only.</p></div>
   <div class="feature"><h4><span class="dot new"></span>Password modal via child process<span class="badge">v1.1.3</span></h4><p><code>askPasswordModal</code> now exec's <code>kiosk-exit-guard.exe --ask-password &lt;title&gt; &lt;subtitle&gt;</code> as a child and reads its exit code (0 / 1 / 2 = OK / Wrong / Cancel). The child's WebView2 is always its first instance, so the controller (which already used WebView2 for <code>firstRunWithWizard</code>) never crashes on the LL-hook-triggered password modal. Closes the "fresh install, press Win once, kiosk bypassed" failure path.</p></div>

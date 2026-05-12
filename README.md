@@ -2,6 +2,10 @@
 
 Single-binary kiosk lockdown utility for **Windows 11 Home** (no Assigned Access). One ~7 MB exe contains an embedded WebView2 kiosk window, a low-level keyboard hook with re-injection, an HKLM-backed password store, Chrome / Edge launch blocks at the OS level, a Chrome uninstaller, a self-installer, a self-updater, and four desktop shortcuts for the admin.
 
+## What's in v1.1.5
+
+`Ctrl+0` (zoom reset), `Ctrl+-` (zoom out), and `Ctrl++` / `Ctrl+=` (zoom in) — plus numpad equivalents — now pass through the LL hook to the kiosk WebView2 page instead of triggering the password modal. Joins the existing always-allowed list of `F5` and `Ctrl+R`. Still Ctrl-only: `Win+0` / `Alt+-` etc. continue to hit the lockdown path.
+
 ## What's in v1.1.4
 
 Field report: "right now the filter only runs when I re-click the exe file from the downloads folder." Even after v1.1.3's explorer-token fallback shipped, the auto-start was still flaky on the affected machine. v1.1.0 had aggressively switched to Service-only and deleted any leftover scheduled task on install — which made the kiosk unprotected after reboot whenever the Service spawn path failed.

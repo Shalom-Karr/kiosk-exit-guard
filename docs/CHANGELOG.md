@@ -4,6 +4,12 @@ All notable changes to kiosk-exit-guard, newest first. Versions follow [Semantic
 
 For the current state of the project, see the [landing page](https://shalom-karr.github.io/kiosk-exit-guard/), the [architecture doc](architecture.md), and the [admin runbook](admin-runbook.md).
 
+## v1.1.5 — 2026-05-12
+
+**Browser zoom shortcuts allowed through.** `Ctrl+0` (zoom reset), `Ctrl+-` (zoom out), and `Ctrl++` / `Ctrl+=` (zoom in) now pass through the LL hook to the kiosk WebView2 page instead of triggering the password modal. Numpad equivalents (`Ctrl+Numpad0`, `Ctrl+Subtract`, `Ctrl+Add`) are also allowed. All variants still require Ctrl-only — `Win+0`, `Alt+-`, etc. still hit the lockdown path.
+
+Joins the existing always-allowed list: `F5` and `Ctrl+R` (page reload). `isAlwaysAllowedCombo` (`main.go`) restructured to share the Ctrl-without-Alt-or-Win precondition across all zoom + reload combos.
+
 ## v1.1.4 — 2026-05-12
 
 **Belt-and-suspenders auto-start: Service AND scheduled task co-installed.**

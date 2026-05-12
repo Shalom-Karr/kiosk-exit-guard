@@ -58,7 +58,7 @@ import (
 
 // currentVersion must be kept in sync with versioninfo.json. Used by the
 // --update flow to compare against the latest GitHub release tag.
-const currentVersion = "1.1.4"
+const currentVersion = "1.1.5"
 
 // ---------- logging ----------
 
@@ -168,6 +168,14 @@ const (
 	vkF5     = 0x74
 	vkR      = 0x52
 	vkK      = 0x4B
+	vk0      = 0x30 // browser zoom reset
+	vkNum0   = 0x60 // numpad 0
+	// VK_OEM_MINUS / VK_OEM_PLUS are the top-row -/= keys; numpad has
+	// dedicated subtract/add VKs. All four pass through for zoom.
+	vkOemMinus  = 0xBD
+	vkOemPlus   = 0xBB
+	vkSubtract  = 0x6D
+	vkAdd       = 0x6B
 	vkLMenu  = 0xA4
 	vkRMenu  = 0xA5
 	vkLWin   = 0x5B
@@ -809,14 +817,28 @@ func isModifierVK(vk uint32) bool {
 }
 
 // isAlwaysAllowedCombo lets specific keystrokes through even when the
-// filter is active. Today: Ctrl+R and F5 are reload shortcuts the kiosk
-// page should respect (admin can refresh the display without entering
-// the password). Add more here as legitimate kiosk use cases emerge.
+// filter is active. Allowlist:
+//   - F5 alone: page reload
+//   - Ctrl+R: page reload
+//   - Ctrl+0 / Ctrl+numpad-0: browser zoom reset
+//   - Ctrl+- / Ctrl+numpad-minus: browser zoom out
+//   - Ctrl++ / Ctrl+= / Ctrl+numpad-plus: browser zoom in
+//
+// All require Ctrl-only (no Alt / no Win) so Win+0 / Alt+- etc. still
+// hit the lockdown path. Add more here as legitimate kiosk use cases
+// emerge.
 func isAlwaysAllowedCombo(vk uint32) bool {
 	if vk == vkF5 && !ctrlDown() && !altDown() && !winDown() {
 		return true
 	}
-	if vk == vkR && ctrlDown() && !altDown() && !winDown() {
+	if !ctrlDown() || altDown() || winDown() {
+		return false
+	}
+	switch vk {
+	case vkR, // Ctrl+R reload
+		vk0, vkNum0, // Ctrl+0 zoom reset
+		vkOemMinus, vkSubtract, // Ctrl+- zoom out
+		vkOemPlus, vkAdd: // Ctrl++ / Ctrl+= zoom in (US layout: Plus shares the = key)
 		return true
 	}
 	return false
