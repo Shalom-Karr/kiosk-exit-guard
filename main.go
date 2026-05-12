@@ -62,7 +62,26 @@ import (
 
 // currentVersion must be kept in sync with versioninfo.json. Used by the
 // --update flow to compare against the latest GitHub release tag.
-const currentVersion = "1.2.0"
+const currentVersion = "1.2.1"
+
+// Auto-update background-check timing. v1.2.1: the controller polls
+// GitHub's /releases/latest on startup (after autoUpdateInitialDelay so
+// the kiosk has time to settle) and every autoUpdateCheckInterval after
+// that. On finding a newer release the controller spawns an
+// `--auto-update-notify <newver>` child that renders the interactive
+// "Update now? / Remind me later" WebView2 modal; the modal self-
+// dismisses after autoUpdateDismissTimeout if nobody clicks.
+const (
+	autoUpdateInitialDelay   = 60 * time.Second
+	autoUpdateCheckInterval  = 24 * time.Hour
+	autoUpdateDismissTimeout = 60 * time.Second
+)
+
+// globalAutoUpdateNotifyMutexName guards runAutoUpdateChecker against
+// stacking two notify children on top of each other (one from a normal
+// 24h tick that races a freshly-spawned controller restart, for
+// example). Admin-only DACL via acquireAdminOnlyNamedMutex.
+const globalAutoUpdateNotifyMutexName = `Global\KioskExitGuardAutoUpdateNotify`
 
 // ---------- logging ----------
 
@@ -3848,6 +3867,331 @@ foreach ($n in @('Kiosk Exit Guard.lnk','Pause SK Filter.lnk','Resume SK Filter.
 	_ = cmd.Run()
 }
 
+// runAutoUpdateChecker is a long-lived goroutine started from the
+// controller's main() once after the LL keyboard hook is up. Waits
+// autoUpdateInitialDelay so the kiosk has time to paint, then polls
+// GitHub's /releases/latest every autoUpdateCheckInterval. When a newer
+// version is published it fire-and-forget spawns an
+// `--auto-update-notify <newver>` child which renders the interactive
+// WebView2 "Update now? / Remind me later" modal. Errors are logged at
+// info level and otherwise ignored — a transient network blip just
+// means we try again at the next tick.
+//
+// The auto-checker is intentionally only started from the long-lived
+// controller process. All the short-lived flag invocations (--pause,
+// --update, --silent-exit, --auto-update-notify, etc.) exit too quickly
+// to be useful and would spam GitHub if they each spun one up.
+func runAutoUpdateChecker(ctx context.Context) {
+	defer recoverAndLog("runAutoUpdateChecker")
+	logf("auto-update checker: started; initial delay=%s interval=%s",
+		autoUpdateInitialDelay, autoUpdateCheckInterval)
+
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(autoUpdateInitialDelay):
+	}
+
+	autoUpdateCheckOnce()
+	ticker := time.NewTicker(autoUpdateCheckInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			autoUpdateCheckOnce()
+		}
+	}
+}
+
+// autoUpdateCheckOnce performs a single GitHub /releases/latest check
+// and, on finding a newer version, spawns the --auto-update-notify
+// child. The child itself acquires globalAutoUpdateNotifyMutexName
+// for its lifetime so we don't stack two notify modals if a previous
+// one is still open.
+func autoUpdateCheckOnce() {
+	defer recoverAndLog("autoUpdateCheckOnce")
+	logf("auto-update check: triggered")
+
+	latest, _, _, err := fetchLatestRelease()
+	if err != nil {
+		logf("auto-update check: fetchLatestRelease error (silently ignored): %v", err)
+		return
+	}
+	if latest == currentVersion {
+		logf("auto-update check: on latest (v%s)", currentVersion)
+		return
+	}
+	logf("auto-update check: new version v%s available; spawning notify child (current v%s)", latest, currentVersion)
+
+	exe, err := os.Executable()
+	if err != nil {
+		logf("auto-update check: os.Executable failed: %v", err)
+		return
+	}
+	cmd := exec.Command(exe, "--auto-update-notify", latest)
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+	if err := cmd.Start(); err != nil {
+		logf("auto-update check: failed to spawn notify child: %v", err)
+		return
+	}
+	// Fire-and-forget — release the OS process handle so this exiting
+	// goroutine doesn't leak it. The child's exit gets logged from
+	// within the child itself (see runAutoUpdateNotifyInvocation).
+	_ = cmd.Process.Release()
+}
+
+// autoUpdateNotifyHTML is the branded WebView2 dialog rendered by the
+// --auto-update-notify child. Structurally a copy of passwordPromptHTML
+// (same dark gradient, lock-icon header, brand pill, sans-serif font
+// stack, --accent color) but with no password input — two buttons.
+// kgUpdateNow exits 0 (parent reads "admin clicked Update Now"),
+// kgLater exits 1 (parent reads "Remind Me Later / timeout / close").
+const autoUpdateNotifyHTML = `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<style>
+  *,*::before,*::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0;
+    background: radial-gradient(ellipse at top left, #1e293b, #0b1220 70%);
+    color: #f1f5f9; font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
+    height: 100vh; -webkit-font-smoothing: antialiased; overflow: hidden; }
+  .wrap { height: 100vh; display: flex; align-items: center; justify-content: center; padding: 1.25rem; }
+  .card { background: linear-gradient(180deg, rgba(35, 47, 72, 0.95), rgba(26, 36, 56, 0.95));
+    border: 1px solid rgba(148, 163, 184, 0.22); border-radius: 16px;
+    padding: 2rem 2.25rem; width: 100%;
+    box-shadow: 0 30px 70px rgba(0,0,0,0.6); backdrop-filter: blur(8px); }
+  .header { display: flex; align-items: center; gap: 0.9rem; margin: 0 0 1.5rem; }
+  .lock-icon { width: 48px; height: 48px; border-radius: 12px;
+    background: linear-gradient(135deg, rgba(56, 189, 248, 0.18), rgba(56, 189, 248, 0.06));
+    border: 1px solid rgba(56, 189, 248, 0.32); display: flex; align-items: center;
+    justify-content: center; flex-shrink: 0; }
+  .lock-icon svg { width: 22px; height: 22px; color: #38bdf8; }
+  .brand { color: #38bdf8; font-size: 0.7rem; font-weight: 700;
+    letter-spacing: 0.12em; text-transform: uppercase; margin: 0; }
+  h1 { font-size: 1.25rem; margin: 0.15rem 0 0; letter-spacing: -0.015em;
+    line-height: 1.25; font-weight: 700; }
+  .subtitle { color: #cbd5e1; font-size: 0.92rem; margin: 0 0 1.25rem;
+    line-height: 1.5; }
+  .actions { display: flex; gap: 0.6rem; justify-content: flex-end; margin-top: 1.4rem; }
+  button { padding: 0.7rem 1.5rem; border-radius: 8px; border: 0; cursor: pointer;
+    font-weight: 700; font-size: 0.92rem; font-family: inherit;
+    transition: background 0.15s, transform 0.05s; }
+  button:active { transform: translateY(1px); }
+  .btn-primary { background: #38bdf8; color: #0b1220; }
+  .btn-primary:hover { background: #7dd3fc; }
+  .btn-secondary { background: transparent; color: #94a3b8;
+    border: 1px solid rgba(148, 163, 184, 0.3); }
+  .btn-secondary:hover { color: #f1f5f9; border-color: rgba(148, 163, 184, 0.55); }
+</style></head>
+<body>
+<div class="wrap"><div class="card">
+  <div class="header">
+    <div class="lock-icon" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3" y="11" width="18" height="11" rx="2"/>
+        <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+      </svg>
+    </div>
+    <div>
+      <p class="brand">SK Filter</p>
+      <h1 id="title">An update was pushed</h1>
+    </div>
+  </div>
+  <p class="subtitle" id="subtitle">A new version is available. Install now?</p>
+  <div class="actions">
+    <button class="btn-secondary" onclick="later()">Remind Me Later</button>
+    <button class="btn-primary" onclick="updateNow()">Update Now</button>
+  </div>
+</div>
+<script>
+  if (window.__title)    document.getElementById('title').textContent    = window.__title;
+  if (window.__subtitle) document.getElementById('subtitle').textContent = window.__subtitle;
+  // v1.2.1: signal Go that the page is interactive so the 60s auto-
+  // dismiss timer starts when the admin can actually click, not when
+  // the WebView2 host begins cold-starting. Same pattern as the v1.2.0
+  // password-modal kgReady fix.
+  document.addEventListener('DOMContentLoaded', function() {
+    if (window.kgReady) { window.kgReady(); }
+  });
+  window.addEventListener('load', function() {
+    if (window.kgReady) { window.kgReady(); }
+  });
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter')  { e.preventDefault(); updateNow(); }
+    if (e.key === 'Escape') { e.preventDefault(); later(); }
+    if (e.key === 'F4' && e.altKey) { e.preventDefault(); later(); }
+  }, true);
+  function updateNow() { window.kgUpdateNow && window.kgUpdateNow(); }
+  function later()     { window.kgLater     && window.kgLater();     }
+</script>
+</body></html>`
+
+// runAutoUpdateNotifyInvocation is the entry point for
+// `kiosk-exit-guard.exe --auto-update-notify <newver>`, a short-lived
+// child process spawned by autoUpdateCheckOnce. Renders the branded
+// "Update now? / Remind me later" WebView2 modal and:
+//   - On Update Now: exec's `kiosk-exit-guard.exe --update` (which
+//     pops the existing password modal, downloads, SHA-256 verifies,
+//     atomic-swaps, restarts the Service) and exits 0.
+//   - On Remind Me Later / window close / autoUpdateDismissTimeout
+//     timeout: exits 1.
+//
+// Runs in its own process so the controller's in-process WebView2
+// instances don't trigger go-webview2's second-NewWithOptions panic.
+func runAutoUpdateNotifyInvocation() {
+	if len(os.Args) < 3 {
+		logf("--auto-update-notify: missing <newver> arg")
+		os.Exit(1)
+	}
+	newver := os.Args[2]
+
+	// Cross-process "only one notify modal alive" gate. If a previous
+	// notify child is still up (admin walked away from it, or two
+	// auto-checker ticks raced), exit silently. Intentionally leak the
+	// handle: the kernel releases it on process exit, which is exactly
+	// the lifetime we want.
+	if mh, alreadyHeld := acquireAdminOnlyNamedMutex(globalAutoUpdateNotifyMutexName); alreadyHeld {
+		logf("--auto-update-notify: another notify child is already open; exiting")
+		os.Exit(1)
+	} else {
+		_ = mh
+	}
+
+	w := webview2.NewWithOptions(webview2.WebViewOptions{
+		Debug:     false,
+		AutoFocus: true,
+		DataPath:  ensureWebView2DataDir(),
+		WindowOptions: webview2.WindowOptions{
+			Title:  "SK Filter — update available",
+			Width:  640, // overridden by makeModalFullscreenTopmost
+			Height: 360,
+			Center: true,
+		},
+	})
+	if w == nil {
+		// WebView2 unavailable — fall back to zenity so the admin can
+		// still make a choice on stripped-down machines.
+		ok := zenity.Question(
+			fmt.Sprintf("An SK Filter update was pushed.\nUpdate to v%s now? (You're on v%s.)", newver, currentVersion),
+			zenity.Title("SK Filter — update available"),
+			zenity.OKLabel("Update Now"), zenity.CancelLabel("Remind Me Later"),
+		)
+		if ok == nil {
+			logf("auto-update notify: zenity fallback — admin chose Update Now")
+			spawnUpdateInvocation()
+			os.Exit(0)
+		}
+		logf("auto-update notify: zenity fallback — admin chose Remind Me Later")
+		os.Exit(1)
+	}
+	defer w.Destroy()
+
+	var (
+		chose       atomic.Int32 // 0 = none yet, 1 = update, 2 = later
+		dismissArmed atomic.Bool
+	)
+
+	w.Bind("kgReady", func() {
+		if !dismissArmed.CompareAndSwap(false, true) {
+			return
+		}
+		time.AfterFunc(autoUpdateDismissTimeout, func() {
+			if chose.Load() != 0 {
+				return // user already clicked something
+			}
+			logf("auto-update notify: timeout / window closed")
+			chose.CompareAndSwap(0, 2)
+			w.Dispatch(func() { w.Terminate() })
+		})
+	})
+
+	w.Bind("kgUpdateNow", func() {
+		chose.CompareAndSwap(0, 1)
+		w.Terminate()
+	})
+	w.Bind("kgLater", func() {
+		chose.CompareAndSwap(0, 2)
+		w.Terminate()
+	})
+
+	title := "An update was pushed"
+	subtitle := fmt.Sprintf("Version %s is available. The current version is %s. Install now?", newver, currentVersion)
+	w.Init(fmt.Sprintf(`window.__title = %q; window.__subtitle = %q;`, title, subtitle))
+	w.SetHtml(autoUpdateNotifyHTML)
+
+	// Fullscreen the modal so DPI scaling doesn't matter and the
+	// admin can't miss it. Same idiom as askPasswordModalInProcess.
+	go func() {
+		defer recoverAndLog("autoUpdateNotifyFS")
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			h := uintptr(w.Window())
+			if h != 0 {
+				makeModalFullscreenTopmost(h)
+				return
+			}
+			time.Sleep(15 * time.Millisecond)
+		}
+	}()
+
+	// Fallback timer in case kgReady never fires (catastrophic
+	// WebView2 paint failure). Longer budget than the post-paint
+	// timer so the post-paint one wins the race in the normal case.
+	fallback := time.AfterFunc(autoUpdateDismissTimeout+30*time.Second, func() {
+		if !dismissArmed.CompareAndSwap(false, true) {
+			return
+		}
+		if chose.Load() != 0 {
+			return
+		}
+		logf("auto-update notify: fallback timeout (kgReady never fired)")
+		chose.CompareAndSwap(0, 2)
+		w.Dispatch(func() { w.Terminate() })
+	})
+	defer fallback.Stop()
+
+	w.Run()
+
+	switch chose.Load() {
+	case 1:
+		logf("auto-update notify: admin chose Update Now — spawning --update")
+		spawnUpdateInvocation()
+		os.Exit(0)
+	case 2:
+		logf("auto-update notify: admin chose Remind Me Later")
+		os.Exit(1)
+	default:
+		// Window closed without a binding firing (extremely rare —
+		// the only dismissal paths are kgUpdateNow / kgLater / Esc /
+		// Alt+F4 / the timer). Treat as Later.
+		logf("auto-update notify: window closed without selection — treating as Remind Me Later")
+		os.Exit(1)
+	}
+}
+
+// spawnUpdateInvocation fire-and-forget launches
+// `kiosk-exit-guard.exe --update` as a detached child. Used by the
+// --auto-update-notify path on Update Now: the existing --update flow
+// handles password modal, download, SHA-256 verify, atomic swap, and
+// Service restart. We don't wait for it because this notify child is
+// about to exit.
+func spawnUpdateInvocation() {
+	exe, err := os.Executable()
+	if err != nil {
+		logf("spawnUpdateInvocation: os.Executable failed: %v", err)
+		return
+	}
+	cmd := exec.Command(exe, "--update")
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+	if err := cmd.Start(); err != nil {
+		logf("spawnUpdateInvocation: failed to spawn --update: %v", err)
+		return
+	}
+	// Release the OS process handle so we don't leak it; the child
+	// runs to completion independent of this exiting process.
+	_ = cmd.Process.Release()
+}
+
 // runPauseInvocation is the entry point for `kiosk-exit-guard.exe --pause`,
 // which is wired to the "Pause SK Filter" desktop shortcut. It performs
 // the same flow as the Ctrl+Shift+Alt+K hotkey would inside the running
@@ -4062,6 +4406,17 @@ func main() {
 		default:
 			os.Exit(2)
 		}
+	}
+
+	// --auto-update-notify <newver>: short-lived child process spawned
+	// by the controller's auto-update checker. Renders the branded
+	// "Update now? / Remind me later" WebView2 modal and exec's the
+	// existing `--update` flow on Yes. Runs in its own process so the
+	// controller's existing in-process WebView2 instances don't trip
+	// go-webview2's second-NewWithOptions panic. v1.2.1.
+	if len(os.Args) > 1 && os.Args[1] == "--auto-update-notify" {
+		runAutoUpdateNotifyInvocation()
+		return
 	}
 
 	// --service-run: SCM-only entry point for the Windows Service. Runs
@@ -4412,6 +4767,16 @@ func main() {
 
 	go func() { defer recoverAndLog("watchdog"); runWatchdog() }()
 	go func() { defer recoverAndLog("syncLoop"); syncFilterStateLoop() }()
+
+	// v1.2.1: auto-update background checker. Polls GitHub on startup
+	// (after a 60s settle delay) and every 24h thereafter; spawns the
+	// branded WebView2 "Update now? / Remind me later" notify child
+	// when a newer release is published. Only started from the long-
+	// lived controller path — every short-lived flag invocation
+	// returned earlier in main() without reaching here.
+	autoUpdateCtx, cancelAutoUpdate := context.WithCancel(context.Background())
+	defer cancelAutoUpdate()
+	go runAutoUpdateChecker(autoUpdateCtx)
 
 	// LL keyboard hook was installed early (v1.1.8 MEDIUM#7 fix) — the
 	// GetMessageW pump below still has to live on the same thread as

@@ -155,7 +155,7 @@
 <div class="wrap">
 
 <header>
-  <h1>kiosk-exit-guard <span class="version-pill">v1.2.0</span></h1>
+  <h1>kiosk-exit-guard <span class="version-pill">v1.2.1</span></h1>
   <p class="tagline">Single-binary kiosk lockdown for <strong>Windows 11 Home</strong> and <strong>Windows Server 2022 (RDP / physical console)</strong>. Embedded WebView2 kiosk, password-gated keyboard, Chrome uninstalled, Edge launches blocked at the OS level, self-installing, self-updating, all from one ~7.9&nbsp;MB exe.</p>
 </header>
 
@@ -195,7 +195,20 @@
   <a href="#build">Build</a>
 </nav>
 
-<h2 id="whats-new">v1.2.0 — consolidation + audit fixes</h2>
+<h2 id="whats-new">v1.2.1 — automatic update check + interactive prompt</h2>
+
+<div class="callout callout-good">
+  <strong>The controller now tells you when a new version is out.</strong> Background <code>runAutoUpdateChecker</code> goroutine polls GitHub's <code>/releases/latest</code> on startup (after a 60&nbsp;s settle delay) and every 24&nbsp;h thereafter. When a newer version is published it spawns a branded WebView2 modal — <em>"An SK Filter update was pushed. Update to v{newver} now?"</em> — with [Update Now] / [Remind Me Later] buttons. Update Now hands off to the existing <code>--update</code> flow (password modal, SHA-256 verify, atomic swap, Service restart); Remind Me Later defers to the next 24&nbsp;h tick. The notification is purely additive — admins who prefer to drive the update themselves via the desktop shortcut don't lose anything.
+  <ul style="margin: 0.6rem 0 0; padding-left: 1.25rem;">
+    <li><strong>Auto-update never installs silently.</strong> Update Now exec's <code>--update</code>, which pops the existing password modal so the admin still confirms intent. The point of the password is to confirm <em>intent</em>, not just <em>identity</em>.</li>
+    <li><strong>Long-lived controller only.</strong> All the short-lived flag invocations (<code>--silent-exit</code>, <code>--show-toast</code>, <code>--ask-password</code>, <code>--webview</code>, <code>--pause</code>, <code>--resume</code>, <code>--launch-kiosk</code>, <code>--update</code>, <code>--uninstall</code>, <code>--set-url</code>, <code>--reset</code>, <code>--service-install</code>, <code>--service-remove</code>, <code>--auto-update-notify</code> itself) return earlier in <code>main()</code> without reaching the goroutine launch. A desktop-shortcut click won't accidentally hammer GitHub.</li>
+    <li><strong>New <code>Global\KioskExitGuardAutoUpdateNotify</code> mutex.</strong> Admin-only DACL via the existing <code>acquireAdminOnlyNamedMutex</code> helper. The notify child holds it for its lifetime; a second 24&nbsp;h tick that fires while a previous modal is still on-screen exits silently. Closes the "two stacked notify modals after a 24&nbsp;h walk-away" hole.</li>
+    <li><strong>60&nbsp;s auto-dismiss.</strong> Armed inside a <code>kgReady</code> binding fired from <code>DOMContentLoaded</code> so the budget starts when the admin can actually click, not when WebView2 begins cold-starting. Same idiom as v1.2.0's password-modal timer fix. A 90&nbsp;s pre-paint fallback covers catastrophic WebView2 failure.</li>
+    <li><strong>Audit log.</strong> Every check writes to <code>kiosk-exit-guard.log</code> — <code>auto-update check: triggered</code>, <code>auto-update check: on latest (v%s)</code>, <code>auto-update check: new version v%s available; spawning notify child</code>, <code>auto-update notify: admin chose Update Now</code> / <code>Remind Me Later</code> / <code>timeout / window closed</code>. Admins can audit when updates were available and what was chosen.</li>
+  </ul>
+</div>
+
+<h2 id="v120">v1.2.0 — consolidation + audit fixes</h2>
 
 <div class="callout callout-good">
   <strong>One CRITICAL struct-layout bug + three HIGH install/update issues + medium UX gaps closed.</strong> v1.2.0 is the consolidation tag for the v1.1.5–v1.1.11 burst plus the audit pass that ran on top of it.
@@ -235,6 +248,8 @@
 <h2 id="features">Features</h2>
 
 <div class="feature-grid">
+  <div class="feature"><h4><span class="dot new"></span>Automatic update check<span class="badge">v1.2.1</span></h4><p>Background <code>runAutoUpdateChecker</code> goroutine polls GitHub's <code>/releases/latest</code> on startup (after a 60&nbsp;s settle delay) and every 24&nbsp;h thereafter. Network errors silently logged; admins reading <code>kiosk-exit-guard.log</code> see every check outcome (<code>on latest (v%s)</code> or <code>new version v%s available</code>). Only runs in the long-lived controller — every short-lived flag invocation returns before the goroutine launches.</p></div>
+  <div class="feature"><h4><span class="dot new"></span>Interactive update prompt<span class="badge">v1.2.1</span></h4><p>When a newer release is published, the controller spawns a branded WebView2 modal — <em>"An SK Filter update was pushed. Update to v{newver} now?"</em> — with [Update Now] / [Remind Me Later]. Update Now hands off to the existing <code>--update</code> flow (password modal, SHA-256 verify, atomic swap, Service restart). 60&nbsp;s auto-dismiss, <code>Global\KioskExitGuardAutoUpdateNotify</code> mutex prevents stacking, fullscreen topmost via the same <code>makeModalFullscreenTopmost</code>+<code>forceForeground</code> idiom as the password modal.</p></div>
   <div class="feature"><h4><span class="dot new"></span>Server 2022 RDP support<span class="badge">v1.1.11</span></h4><p>Supervisor walks <code>WTSEnumerateSessionsW</code> and picks the lowest-numbered <code>WTSActive</code> session with a logged-in user (verified via <code>WTSQuerySessionInformationW(WTSUserName)</code>), preferring the console session when it qualifies. Win11 / laptop behavior unchanged; Server 2022 / RDP newly supported.</p></div>
   <div class="feature"><h4><span class="dot new"></span>Update UI: confirm + auth in one screen<span class="badge">v1.1.11</span></h4><p>"Checking GitHub for updates…" toast and the separate "download and install?" <code>zenity.Question</code> are gone. Password modal's subtitle mentions the new version number, combining confirm + auth into one screen. The "you're on v%s. No update available." branch is kept so clicking Update is never silent.</p></div>
   <div class="feature"><h4><span class="dot new"></span>restartExplorer respects the registered shell<span class="badge">v1.1.11</span></h4><p>Reads <code>HKLM\...\Winlogon\Shell</code> and skips the <code>taskkill /F /IM explorer.exe</code> when the registered shell isn't <code>explorer.exe</code> (Server Core, custom shells). <code>NoTaskbar</code> policy still gets written; it just won't take effect until next logon.</p></div>

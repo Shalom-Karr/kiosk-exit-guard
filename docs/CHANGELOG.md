@@ -5,6 +5,105 @@ All notable changes to kiosk-exit-guard, newest first. Versions follow [Semantic
 For the current state of the project, see the [landing page](https://shalom-karr.github.io/kiosk-exit-guard/), the [architecture doc](architecture.md), and the [admin runbook](admin-runbook.md).
 
 
+## v1.2.1 — 2026-05-12
+
+Background auto-update check + interactive admin notification. The
+controller now polls GitHub's `/releases/latest` on startup (after a
+60 s settle delay so the kiosk has time to paint) and every 24 h
+thereafter; when a newer version is published it spawns a branded
+WebView2 modal asking the admin whether to install now. The existing
+`--update` shortcut still works exactly as before — this is purely an
+additive notification path so an admin doesn't have to remember to
+click "Update SK Filter" themselves to find out a new version exists.
+
+### Feature — auto-update background checker
+
+New `runAutoUpdateChecker` goroutine started from the controller's
+`main()` right after the LL keyboard hook is installed, alongside the
+existing `runWatchdog` and `syncFilterStateLoop` goroutines. Waits
+`autoUpdateInitialDelay = 60 * time.Second` for the kiosk WebView2
+child to paint and the controller to settle into steady state, then
+runs `autoUpdateCheckOnce`. After that, ticks on
+`autoUpdateCheckInterval = 24 * time.Hour`. Every check logs one of:
+
+- `auto-update check: triggered`
+- `auto-update check: on latest (v%s)`
+- `auto-update check: new version v%s available; spawning notify child (current v%s)`
+- `auto-update check: fetchLatestRelease error (silently ignored): %v`
+
+so admins reading `kiosk-exit-guard.log` can audit when updates were
+detected and what the admin chose. Network errors are silently logged
+— no toast, no user-visible noise.
+
+The checker is started **only** from the long-lived controller path.
+Every short-lived flag invocation (`--silent-exit`, `--show-toast`,
+`--ask-password`, `--webview`, `--pause`, `--resume`,
+`--launch-kiosk`, `--update`, `--uninstall`, `--set-url`, `--reset`,
+`--service-install`, `--service-remove`, and the new
+`--auto-update-notify` itself) returns earlier in `main()` without
+ever reaching the goroutine launch. Otherwise every desktop-shortcut
+click would spawn a checker that immediately exits, hammering GitHub.
+
+### Feature — `--auto-update-notify <newver>` modal child process
+
+New short-lived child process spawned by the controller when a newer
+release is found. Renders a branded WebView2 modal (same dark
+gradient, `--accent`, lock-icon header, brand pill, and sans-serif
+stack as the v1.2.0 password modal) with two buttons:
+
+- **Update Now** — fire-and-forget spawns
+  `kiosk-exit-guard.exe --update`, which then pops the existing
+  password modal, downloads the new exe, SHA-256 verifies it against
+  the release's sidecar, atomic-swaps the running exe, and restarts
+  the Service. The point of routing through `--update` (rather than
+  doing the install directly from the notify child) is that the admin
+  password is the confirmation of intent — auto-update **never**
+  installs silently.
+- **Remind Me Later** — exits the notify child with code 1. The 24 h
+  ticker catches them on the next cycle.
+
+Both `kgUpdateNow` and `kgLater` host bindings are exposed to the
+modal JS. Escape and Alt+F4 also trigger `kgLater`. A 60 s auto-
+dismiss timer (`autoUpdateDismissTimeout`) is armed inside a `kgReady`
+binding fired from `DOMContentLoaded` so the budget starts when the
+admin can actually click, not when WebView2 begins cold-starting —
+same idiom as v1.2.0's password-modal timer fix. A 90 s pre-paint
+fallback timer guards against a catastrophic WebView2 paint failure
+where `kgReady` never fires.
+
+The modal uses `makeModalFullscreenTopmost` + `forceForeground` so it
+grabs keyboard focus and sits above the kiosk's fullscreen topmost
+window, and `ensureWebView2DataDir()` so the user-data folder is the
+admin-only `%ProgramData%\KioskExitGuard\WebView2\` path instead of
+the user-writable default.
+
+Running as a separate process avoids go-webview2's
+second-`NewWithOptions`-in-the-same-process panic — same child-
+process WebView2 pattern as v1.1.3's `--ask-password` and v1.1.9's
+`--show-toast`. The branded modal HTML is a separate const
+(`autoUpdateNotifyHTML`) from `passwordPromptHTML` so any future edit
+to one can't accidentally leak input handlers into the other.
+
+### Feature — `Global\KioskExitGuardAutoUpdateNotify` mutex
+
+Admin-only DACL via `acquireAdminOnlyNamedMutex` (same SDDL helper
+introduced in v1.2.0 for the controller / first-run / update
+mutexes). Acquired by the notify child at startup and held for its
+lifetime. If a second auto-update tick fires while a previous notify
+modal is still on screen (admin walked away from it), the second
+child exits silently and the first stays up. Closes the
+"two stacked notify modals after a 24 h walk-away" hole.
+
+### Misc
+
+- Self-update happy-path `--update` is unchanged. SHA-256 sidecar
+  verification, atomic install swap, default-No prompt on missing
+  sidecar — all the v1.2.0 plumbing carries forward.
+- WebView2 fallback: if `webview2.NewWithOptions` returns nil on the
+  notify child (stripped-down machine without the Runtime), we fall
+  back to a `zenity.Question` so the admin still gets a choice.
+
+
 ## v1.2.0 — 2026-05-12
 
 Consolidation release combining the v1.1.5–v1.1.11 work into a single
