@@ -296,12 +296,16 @@
 
 <h2 id="how">How it works</h2>
 
-<p>One binary, three internal modes selected by the first command-line argument:</p>
+<p>One binary; the first command-line argument selects the role. v1.1.0 introduces the Windows Service supervisor on top of the existing controller architecture.</p>
 
 <div class="arch">
   <div class="arch-row">
-    <span class="arch-box accent">Controller</span>
-    <span class="arch-arrow">— launched by Task Scheduler at user logon. Owns the LL keyboard hook, filter-mode state, registry lockdown, and supervises the WebView2 kiosk child.</span>
+    <span class="arch-box bad">--service-run</span>
+    <span class="arch-arrow">— SCM only. Runs as <code>LocalSystem</code> in Session 0. Finds the active console session, gets the user token, spawns the controller into the user session, watches it, respawns on death. No UI.</span>
+  </div>
+  <div class="arch-row">
+    <span class="arch-box accent">Controller (no args)</span>
+    <span class="arch-arrow">— spawned by the Service via <code>CreateProcessAsUserW</code> into the user session. Owns the LL keyboard hook, filter-mode state, registry lockdown, and supervises the WebView2 kiosk child.</span>
   </div>
   <div class="arch-row">
     <span class="arch-box">--webview</span>
@@ -309,7 +313,7 @@
   </div>
   <div class="arch-row">
     <span class="arch-box bad">--silent-exit</span>
-    <span class="arch-arrow">— how IFEO-blocked launches reach us. Windows passes the target exe's path as an extra arg. We exit immediately so the Chrome/Edge launch fails invisibly.</span>
+    <span class="arch-arrow">— how IFEO-blocked launches reach us. Windows passes the target exe's path as an extra arg. We exit immediately so the Chrome/Edge/accessibility-helper launch fails invisibly.</span>
   </div>
 </div>
 
@@ -333,17 +337,52 @@
   <div class="arch-row">
     <span class="arch-box bad">4. uninstall Chrome silently</span>
     <span class="arch-arrow">→</span>
-    <span class="arch-box bad">5. IFEO redirects on chrome.exe + msedge.exe</span>
+    <span class="arch-box bad">5. IFEO redirects on chrome.exe + msedge.exe + accessibility helpers</span>
   </div>
   <div class="arch-row">
     <span class="arch-arrow">↓</span>
   </div>
   <div class="arch-row">
-    <span class="arch-box good">6. desktop shortcut</span>
+    <span class="arch-box good">6. desktop shortcuts (4)</span>
     <span class="arch-arrow">→</span>
-    <span class="arch-box good">7. logon task</span>
+    <span class="arch-box good">7. <code>sc create KioskExitGuardSvc</code> + start</span>
+    <span class="arch-arrow">→</span>
+    <span class="arch-box good">8. delete legacy v1.0.x task</span>
   </div>
 </div>
+
+<h3>Boot sequence (steady state)</h3>
+
+<div class="arch">
+  <div class="arch-row">
+    <span class="arch-box">Windows boot</span>
+    <span class="arch-arrow">→</span>
+    <span class="arch-box bad">SCM auto-starts KioskExitGuardSvc</span>
+    <span class="arch-arrow">(Session 0, LocalSystem)</span>
+  </div>
+  <div class="arch-row">
+    <span class="arch-arrow">↓ user logs on</span>
+  </div>
+  <div class="arch-row">
+    <span class="arch-box bad">Service detects console session</span>
+    <span class="arch-arrow">via <code>WTSGetActiveConsoleSessionId</code> + <code>WTSQueryUserToken</code></span>
+  </div>
+  <div class="arch-row">
+    <span class="arch-arrow">↓ <code>CreateProcessAsUserW</code></span>
+  </div>
+  <div class="arch-row">
+    <span class="arch-box accent">Controller (user session)</span>
+    <span class="arch-arrow">applies lockdown, installs LL hook, runs message loop</span>
+  </div>
+  <div class="arch-row">
+    <span class="arch-arrow">↓ filter mode = ON</span>
+  </div>
+  <div class="arch-row">
+    <span class="arch-box">--webview kiosk window opens (fullscreen, topmost)</span>
+  </div>
+</div>
+
+<p>If the controller dies (crash, manual kill, etc.), the Service waits a beat then spawns a fresh one. The kiosk user can't stop the Service — SCM rejects non-admin commands.</p>
 
 <h3>Pressing a blocked combo (filter active)</h3>
 

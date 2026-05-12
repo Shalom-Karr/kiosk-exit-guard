@@ -57,7 +57,7 @@ import (
 
 // currentVersion must be kept in sync with versioninfo.json. Used by the
 // --update flow to compare against the latest GitHub release tag.
-const currentVersion = "1.1.0"
+const currentVersion = "1.1.1"
 
 // ---------- logging ----------
 
@@ -2562,7 +2562,17 @@ func runUpdateInvocation() {
 	}
 	storedHash = hash
 
-	showTimedInfo("Checking GitHub for updates…")
+	// CRITICAL: must NOT call showTimedInfo here (which instantiates a
+	// WebView2 in this process). The askPasswordModal call later in this
+	// function would then be the second WebView2 in the same process, and
+	// go-webview2 panics on the second NewWithOptions. Spawn a separate
+	// child process for the toast so this process has zero WebView2
+	// instances active until the password modal opens.
+	if exe, err := os.Executable(); err == nil {
+		cmd := exec.Command(exe, "--show-toast", "2000", "Checking GitHub for updates…")
+		cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+		_ = cmd.Start() // fire-and-forget; the child auto-dismisses at 2s
+	}
 
 	latest, downloadURL, err := fetchLatestRelease()
 	if err != nil {
@@ -2847,6 +2857,26 @@ func main() {
 	// fails with no error window. Logging not initialized in this path
 	// to keep the IFEO redirect fast.
 	if len(os.Args) > 1 && os.Args[1] == "--silent-exit" {
+		return
+	}
+
+	// --show-toast <ms> <message…>: child-process toast renderer. Used by
+	// flows that need a branded toast in a process which will also create
+	// another WebView2 instance shortly after — go-webview2 panics on the
+	// second NewWithOptions call in the same process, so toast + modal in
+	// the same flow MUST run in separate processes. Spawned via
+	// `exec.Command(exe, "--show-toast", ...)` and detached.
+	if len(os.Args) > 1 && os.Args[1] == "--show-toast" {
+		if len(os.Args) < 4 {
+			return
+		}
+		var durMs int
+		_, _ = fmt.Sscanf(os.Args[2], "%d", &durMs)
+		if durMs <= 0 {
+			durMs = 2000
+		}
+		text := strings.Join(os.Args[3:], " ")
+		showFrontmostToast(text, time.Duration(durMs)*time.Millisecond)
 		return
 	}
 
