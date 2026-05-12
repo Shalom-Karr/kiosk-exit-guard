@@ -155,7 +155,7 @@
 <div class="wrap">
 
 <header>
-  <h1>kiosk-exit-guard <span class="version-pill">v1.1.11</span></h1>
+  <h1>kiosk-exit-guard <span class="version-pill">v1.2.0</span></h1>
   <p class="tagline">Single-binary kiosk lockdown for <strong>Windows 11 Home</strong> and <strong>Windows Server 2022 (RDP / physical console)</strong>. Embedded WebView2 kiosk, password-gated keyboard, Chrome uninstalled, Edge launches blocked at the OS level, self-installing, self-updating, all from one ~7.9&nbsp;MB exe.</p>
 </header>
 
@@ -172,6 +172,15 @@
   </div>
 </div>
 
+<div class="callout callout-info">
+  <strong>Download integrity — <code>kiosk-exit-guard.exe.sha256</code> sidecar.</strong> Every release publishes a tiny companion file alongside the exe (e.g. <a href="https://github.com/Shalom-Karr/kiosk-exit-guard/releases/latest/download/kiosk-exit-guard.exe.sha256" style="color:var(--accent);"><code>kiosk-exit-guard.exe.sha256</code></a>) containing the SHA-256 hash of that release's binary as 64 hex characters on one line.
+  <ul style="margin: 0.55rem 0 0; padding-left: 1.25rem;">
+    <li><strong>Self-updater uses it automatically.</strong> The <code>--update</code> shortcut downloads the sidecar from the same release, recomputes the SHA-256 of the freshly-downloaded exe, and refuses to install if they don't match. v1.2.0 makes a <em>missing</em> sidecar prompt with a default-No <code>zenity.Question</code> — the admin has to explicitly acknowledge that integrity verification is unavailable before the update proceeds.</li>
+    <li><strong>Manual verification.</strong> If you want to check a download yourself: <code>Get-FileHash -Algorithm SHA256 kiosk-exit-guard.exe</code> should produce the same hex string the sidecar contains.</li>
+    <li><strong>What it doesn't do.</strong> It's not Authenticode and it doesn't make this a signed binary. SmartScreen and Defender will still warn on first run. The protection is "the bytes you downloaded are the bytes the maintainer published" + "the bytes the auto-updater installs are the bytes pinned to that release tag" — not "this came from a vetted publisher."</li>
+  </ul>
+</div>
+
 <nav class="toc">
   <a href="#whats-new">What's new</a>
   <a href="#features">Features</a>
@@ -186,7 +195,25 @@
   <a href="#build">Build</a>
 </nav>
 
-<h2 id="whats-new">v1.1.11 — Server 2022 RDP session-id fix</h2>
+<h2 id="whats-new">v1.2.0 — consolidation + audit fixes</h2>
+
+<div class="callout callout-good">
+  <strong>One CRITICAL struct-layout bug + three HIGH install/update issues + medium UX gaps closed.</strong> v1.2.0 is the consolidation tag for the v1.1.5–v1.1.11 burst plus the audit pass that ran on top of it.
+  <ul style="margin: 0.6rem 0 0; padding-left: 1.25rem;">
+    <li><strong>CRITICAL</strong> — <code>wtsProcessInfoW</code> was declared with explicit 4-byte padding fields that made the Go struct 32 bytes; Windows's <code>WTS_PROCESS_INFOW</code> on x64 packs the two DWORDs into a single 8-byte slot for a 24-byte total. The Go side walked the WTS-allocated array with the wrong stride and dereferenced garbage pointers for <code>ProcessName</code>. Worked by accident on the v1.1.10 / v1.1.11 test boxes because <code>WTSQueryUserToken</code> succeeded and the fallback was never invoked. Fix: drop the padding, add compile-time size assertions for both WTS structs — the build now fails if either ever drifts off 24 bytes.</li>
+    <li><strong>HIGH</strong> — missing SHA-256 sidecar on an <code>--update</code> release prompts default-No instead of silently installing unverified. Closes the downgrade-attack vector where a release-edit-capable adversary deletes just the sidecar to defeat integrity verification.</li>
+    <li><strong>HIGH</strong> — new <code>Global\KioskExitGuardFirstRunRelocate</code> mutex prevents two simultaneous admin double-clicks from racing each other through the relocate-to-<code>%ProgramFiles%</code> path and corrupting the install.</li>
+    <li><strong>HIGH</strong> — the relocate re-exec now explicitly strips <code>KIOSK_EXIT_GUARD_VIA_SERVICE</code> from the child's env so a future bug can't smuggle Service-spawned-mode flags across the re-exec.</li>
+    <li><strong>MEDIUM</strong> — the 30 s password-modal timer is now armed inside a JS-callable <code>kgReady</code> binding fired from <code>DOMContentLoaded</code> instead of before <code>w.Run()</code>, so cold-start WebView2 paint latency doesn't eat the budget. A 60 s pre-paint fallback covers catastrophic WebView2 failure.</li>
+    <li><strong>MEDIUM</strong> — <code>pickActiveUserSession</code> logs the chosen user (<code>service: spawning controller in session 2 (state=Active, user=KIOSK\Administrator)</code>) and every candidate session considered, so multi-RDP-user Server 2022 boxes are debuggable from <code>kiosk-exit-guard.log</code>.</li>
+    <li><strong>MEDIUM</strong> — new <code>Global\KioskExitGuardUpdating</code> mutex prevents double-clicked <code>--update</code> shortcuts from stacking and racing each other's exe rename.</li>
+    <li><strong>LOW</strong> — install swap is now atomic via <code>MoveFileEx(MOVEFILE_REPLACE_EXISTING)</code> — the old canonical exe survives if the swap fails.</li>
+    <li><strong>LOW</strong> — <code>cleanupInstallDir</code> uses an allowlist (<code>kiosk-exit-guard.exe</code>, <code>.exe.old</code>, <code>.exe.staging</code>, <code>.log</code>, <code>.log.old</code>, <code>resource.syso</code>, <code>staging\</code>) so uninstall can't nuke an admin-placed file.</li>
+    <li><strong>INFO</strong> — all three named mutexes (controller, first-run, update) share an <code>acquireAdminOnlyNamedMutex</code> helper using SDDL <code>D:(A;;0x1F0001;;;BA)(A;;0x1F0001;;;SY)</code> so a kiosk-user logon script can't pre-create the mutex and DoS the legitimate controller.</li>
+  </ul>
+</div>
+
+<h2 id="v1111">v1.1.11 — Server 2022 RDP session-id fix</h2>
 
 <div class="callout callout-good">
   <strong>The kiosk now actually spawns the controller on a headless RDP'd Server 2022.</strong> Field discovery: the affected install was Windows Server 2022 accessed over RDP, not (only) Win11 Home. <code>quser</code> reports <code>administrator rdp-tcp#0 ID 2 Active</code> while <code>WTSGetActiveConsoleSessionId()</code> returns the empty physical-console session ID 1. The supervisor hardcoded <code>sessionID = WTSGetActiveConsoleSessionId()</code> and never asked "is anyone else logged in elsewhere?" — no controller ever spawned, the kiosk was unprotected after every reboot. Fix: new <code>pickActiveUserSession()</code> in <code>service_windows.go</code> walks <code>WTSEnumerateSessionsW</code>, calls <code>WTSQuerySessionInformationW(WTSUserName)</code> on every <code>WTSActive</code> session, and picks the console session if it qualifies (preserves Win11 / laptop behavior) or the lowest-numbered other <code>WTSActive</code> session with a logged-in user (Server 2022 / RDP). <code>supervisorLoop</code> logs <code>service: spawning controller in session N (state=Active, user logged in)</code> so admins reading <code>kiosk-exit-guard.log</code> can see which session won. Plus three smaller items: <code>restartExplorer</code> reads <code>HKLM\...\Winlogon\Shell</code> and skips the kill / restart when the registered shell isn't <code>explorer.exe</code> (Server Core / custom-shell setups); IFEO removal and Chrome uninstall silently absorb "not installed" instead of logging confusing errors on fresh Server 2022 boxes; and the <code>--update</code> flow drops the "Checking GitHub for updates…" toast and the standalone confirm — the password modal's subtitle mentions the new version number, combining confirm + auth into one screen. See the <a href="https://github.com/Shalom-Karr/kiosk-exit-guard/blob/main/docs/CHANGELOG.md" style="color: var(--accent);">changelog</a> for per-finding root cause + fix.
@@ -229,7 +256,7 @@
   <div class="feature"><h4><span class="dot"></span>HKLM password storage</h4><p>Bcrypt hash in <code>HKLM\Software\KioskExitGuard\PasswordHash</code>. Admin-write only — a standard kiosk user can't bypass by deleting a file. DACL is tightened to SYSTEM + Administrators on every controller startup (v1.1.8+).</p></div>
   <div class="feature"><h4><span class="dot"></span>Pause hotkey + desktop shortcut</h4><p><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Alt</kbd>+<kbd>K</kbd> or the "Pause SK Filter" desktop shortcut. Password → duration picker (1 / 5 / 10 / 20 / 30 / 45 min or Custom 1–100). Edge becomes launchable, HKCU lockdown lifts, kiosk window closes. Auto-resume when the timer expires.</p></div>
   <div class="feature"><h4><span class="dot"></span>Registry policy lockdown</h4><p>Filter active: <code>DisableTaskMgr</code>, <code>NoRun</code>, <code>NoTrayContextMenu</code>, <code>NoViewContextMenu</code>, <code>NoTaskbar</code> all set to 1 under HKCU. Cleared during pause or by <code>--reset</code>.</p></div>
-  <div class="feature"><h4><span class="dot"></span>Self-update with integrity check</h4><p>"Update SK Filter" shortcut hits GitHub's <code>releases/latest</code>, SHA-256-verifies the downloaded exe against the sidecar asset, atomic-renames the running exe (<code>.old</code> rollback target), restarts the Service.</p></div>
+  <div class="feature"><h4><span class="dot"></span>Self-update with SHA-256 integrity check</h4><p>"Update SK Filter" shortcut hits GitHub's <code>releases/latest</code>, downloads the matching <code>kiosk-exit-guard.exe.sha256</code> sidecar asset (64-hex digest), recomputes the SHA-256 of the freshly-downloaded exe and aborts on mismatch, then atomic-renames the running exe (<code>.old</code> rollback target) and restarts the Service. v1.2.0 makes a <em>missing</em> sidecar prompt default-No instead of silently proceeding.</p></div>
 </div>
 
 <h3>What the password modal looks like</h3>
