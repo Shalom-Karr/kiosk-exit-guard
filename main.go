@@ -62,7 +62,7 @@ import (
 
 // currentVersion must be kept in sync with versioninfo.json. Used by the
 // --update flow to compare against the latest GitHub release tag.
-const currentVersion = "1.2.4"
+const currentVersion = "1.2.5"
 
 // Auto-update background-check timing. v1.2.1: the controller polls
 // GitHub's /releases/latest on startup (after autoUpdateInitialDelay so
@@ -1840,6 +1840,36 @@ func runShortcutHandler(flag string) {
 	}
 }
 
+// removeStalePerUserShortcuts is the v1.2.5 upgrade-cleanup pass: pre-
+// v1.2.4 installs wrote the .lnk files to the *per-user* desktop with
+// TargetPath = kiosk-exit-guard.exe (direct, UAC-triggering). v1.2.4
+// moved them to the Public/All-Users desktop with TargetPath =
+// schtasks.exe. When upgrading from <v1.2.4 those old per-user .lnks
+// are stranded — the new schtasks-routed shortcuts get written to a
+// different folder, so the user sees BOTH and the old direct-to-exe
+// .lnks still fire UAC. This helper deletes the old .lnks from every
+// loaded user's desktop (the only one we can reach as the currently-
+// running controller is the active user's) so an admin upgrade leaves
+// a clean desktop. Run BEFORE createDesktopShortcut so the freshly-
+// written public-desktop .lnks aren't accidentally caught.
+//
+// Idempotent. Missing .lnks (fresh install, already-cleaned) are
+// absorbed by Remove-Item -ErrorAction SilentlyContinue.
+func removeStalePerUserShortcuts() {
+	ps := `
+$lnks = @('Kiosk Exit Guard.lnk','Pause SK Filter.lnk','Resume SK Filter.lnk','Launch Kiosk.lnk','Change Kiosk URL.lnk','Update SK Filter.lnk','Uninstall SK Filter.lnk')
+$d = [Environment]::GetFolderPath('Desktop')
+if ($d) {
+    foreach ($n in $lnks) {
+        Remove-Item -Path (Join-Path $d $n) -Force -ErrorAction SilentlyContinue
+    }
+}
+`
+	cmd := exec.Command("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps)
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+	_ = cmd.Run()
+}
+
 // createDesktopShortcut (re)writes one .lnk per shortcutSpec on the
 // current user's desktop. v1.2.4: each .lnk's TargetPath is
 // schtasks.exe and the argument is `/Run /TN KioskExitGuard_<Action>`,
@@ -1853,8 +1883,13 @@ func runShortcutHandler(flag string) {
 // flash that would otherwise pop on click; the actual UI surfaces from
 // the spawned user-session child a moment later.
 //
+// v1.2.5: calls removeStalePerUserShortcuts first so an upgrade from
+// <v1.2.4 doesn't leave the old direct-to-exe .lnks visible alongside
+// the new schtasks-routed ones on the public desktop.
+//
 // Idempotent: re-creating overwrites the existing .lnk.
 func createDesktopShortcut() error {
+	removeStalePerUserShortcuts()
 	icon := canonicalInstallPath()
 	iconQ := strings.ReplaceAll(icon, `'`, `''`)
 	stPath := schtasksPath()
@@ -1901,12 +1936,19 @@ const firstRunHTML = `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"
   *,*::before,*::after { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; background: radial-gradient(ellipse at top, #131c30, #0b1220 65%);
     color: #f1f5f9; font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
-    line-height: 1.55; height: 100vh; overflow: hidden; -webkit-font-smoothing: antialiased; }
-  .wrap { height: 100vh; display: flex; align-items: center; justify-content: center; padding: 1.5rem; }
+    line-height: 1.55; min-height: 100vh; -webkit-font-smoothing: antialiased; }
+  /* v1.2.5 UI audit: min-height + overflow-y means the wizard's 7-field
+     form (pw1, pw2, url, zoom, error, actions, plus header) scrolls into
+     view on short viewports — previous height: 100vh + overflow: hidden
+     clipped the top on portrait 1280×1760 + 300% scaling and on tiny
+     landscape windows. */
+  .wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 1.5rem; overflow-y: auto; }
   .card { background: linear-gradient(180deg, #232f48, #1a2438);
     border: 1px solid rgba(148, 163, 184, 0.22); border-radius: 16px;
-    padding: 2.25rem 2.5rem; width: 520px; max-width: 100%;
+    padding: 2.25rem 2.5rem; width: 100%; max-width: 560px;
     box-shadow: 0 20px 60px rgba(0,0,0,0.45); }
+  /* v1.2.5 UI audit: bumped from 520px → 560px so the new zoom field
+     (added in v1.2.4) doesn't squeeze the help text. */
   h1 { font-size: 1.65rem; margin: 0 0 0.5rem; letter-spacing: -0.02em; font-weight: 700; }
   .pill { display: inline-block; background: rgba(56, 189, 248, 0.15); color: #38bdf8;
     padding: 0.15rem 0.6rem; border-radius: 999px; font-size: 0.7rem; font-weight: 700;
@@ -2429,19 +2471,25 @@ func runWebViewKiosk(url string) {
 				}
 			}, true);
 
-			// v1.2.4 kiosk zoom: apply persisted page-zoom percent via the
-			// CSS zoom property on <html>, which is the closest you can
-			// get to "Ctrl +/-" without going through WebView2's
-			// ZoomFactor COM property. Pages get laid out at the scaled
-			// size and scrollbars adjust naturally. Apply both at
-			// DOMContentLoaded (covers the initial paint) and again at
-			// load (covers framework-driven re-renders that overwrite
-			// inline styles on <html>).
+			// v1.2.5 kiosk zoom: apply persisted page-zoom percent via the
+			// CSS zoom property on <body>. v1.2.4 originally targeted
+			// <html> (document.documentElement), which compounded with
+			// any kiosk page that ran its own document.body.style.zoom
+			// fallback — net rendered scale became (admin × page) e.g.
+			// 0.9 × 0.9 = 0.81. Targeting <body> means a page-side
+			// `body.style.zoom = '0.9'` and our `body.style.zoom = '0.9'`
+			// land on the same property, so the zoom level doesn't
+			// compound and a page-side idempotence check sees our value
+			// correctly on SPA re-renders.
+			//
+			// Admin config still wins: we apply at DOMContentLoaded AND
+			// window.load, so even a page that sets its own body.zoom
+			// inline during parse gets overridden by the admin's
+			// configured value at DOMContentLoaded.
 			var kioskZoomPct = %d;
 			function applyZoom() {
 				try {
-					var root = document.documentElement;
-					if (root) { root.style.zoom = (kioskZoomPct / 100); }
+					if (document.body) { document.body.style.zoom = (kioskZoomPct / 100); }
 				} catch (e) { /* swallow — kiosk URL might sandbox style */ }
 			}
 			if (document.readyState === 'loading') {
@@ -2812,12 +2860,20 @@ const passwordPromptHTML = `<!DOCTYPE html><html lang="en"><head><meta charset="
   html, body { margin: 0; padding: 0;
     background: radial-gradient(ellipse at top left, #1e293b, #0b1220 70%);
     color: #f1f5f9; font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
-    height: 100vh; -webkit-font-smoothing: antialiased; overflow: hidden; }
-  .wrap { height: 100vh; display: flex; align-items: center; justify-content: center; padding: 1.25rem; }
+    min-height: 100vh; -webkit-font-smoothing: antialiased; }
+  /* v1.2.5 UI audit: min-height + overflow-y allows the card to scroll
+     into view on tiny viewports (short landscape, accessibility scaling)
+     instead of being clipped by the previous fixed 100vh + overflow:hidden.
+     align-items: center keeps the card vertically centered when it does
+     fit. */
+  .wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 1.25rem; overflow-y: auto; }
   .card { background: linear-gradient(180deg, rgba(35, 47, 72, 0.95), rgba(26, 36, 56, 0.95));
     border: 1px solid rgba(148, 163, 184, 0.22); border-radius: 16px;
-    padding: 2rem 2.25rem; width: 100%;
+    padding: 2rem 2.25rem; width: 100%; max-width: 540px;
     box-shadow: 0 30px 70px rgba(0,0,0,0.6); backdrop-filter: blur(8px); }
+  /* v1.2.5 UI audit: cap card at 540px so on a low-DPI 1080p landscape
+     the input doesn't stretch into a tubular 1800px-wide field. Modals
+     stay focused at ~540px regardless of monitor width or orientation. */
   .header { display: flex; align-items: center; gap: 0.9rem; margin: 0 0 1.5rem; }
   .lock-icon { width: 48px; height: 48px; border-radius: 12px;
     background: linear-gradient(135deg, rgba(56, 189, 248, 0.18), rgba(56, 189, 248, 0.06));
@@ -4269,11 +4325,11 @@ const autoUpdateNotifyHTML = `<!DOCTYPE html><html lang="en"><head><meta charset
   html, body { margin: 0; padding: 0;
     background: radial-gradient(ellipse at top left, #1e293b, #0b1220 70%);
     color: #f1f5f9; font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
-    height: 100vh; -webkit-font-smoothing: antialiased; overflow: hidden; }
-  .wrap { height: 100vh; display: flex; align-items: center; justify-content: center; padding: 1.25rem; }
+    min-height: 100vh; -webkit-font-smoothing: antialiased; }
+  .wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 1.25rem; overflow-y: auto; }
   .card { background: linear-gradient(180deg, rgba(35, 47, 72, 0.95), rgba(26, 36, 56, 0.95));
     border: 1px solid rgba(148, 163, 184, 0.22); border-radius: 16px;
-    padding: 2rem 2.25rem; width: 100%;
+    padding: 2rem 2.25rem; width: 100%; max-width: 540px;
     box-shadow: 0 30px 70px rgba(0,0,0,0.6); backdrop-filter: blur(8px); }
   .header { display: flex; align-items: center; gap: 0.9rem; margin: 0 0 1.5rem; }
   .lock-icon { width: 48px; height: 48px; border-radius: 12px;

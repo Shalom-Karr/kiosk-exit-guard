@@ -5,6 +5,76 @@ All notable changes to kiosk-exit-guard, newest first. Versions follow [Semantic
 For the current state of the project, see the [landing page](https://shalom-karr.github.io/kiosk-exit-guard/), the [architecture doc](architecture.md), and the [admin runbook](admin-runbook.md).
 
 
+## v1.2.5 — 2026-05-13
+
+UI/UX audit pass for unusual viewports (sideways 4K TVs at 300% display
+scaling, low-DPI 1080p landscape, etc.), plus a zoom-target fix that
+prevents kiosk pages from accidentally double-zooming themselves on top
+of the v1.2.4 admin-configured zoom, plus stale-shortcut cleanup so an
+upgrade from <v1.2.4 doesn't leave the old direct-to-exe .lnks
+alongside the new schtasks-routed ones.
+
+### Fix — modal cards no longer stretch on wide monitors
+
+v1.2.4's `passwordPromptHTML` and `autoUpdateNotifyHTML` both declared
+`.card { width: 100% }` with no max. On a 1920×1080 landscape kiosk
+the password input stretched into a tubular 1800px-wide field with the
+lock icon floating at the far left and action buttons at the far
+right. v1.2.5 caps both at `max-width: 540px`. The first-run wizard
+card grew from 520px → 560px to fit the new zoom field added in v1.2.4
+without crowding the help text.
+
+### Fix — modal forms now scroll into view on short viewports
+
+All three modal `<wrap>` containers switched from `height: 100vh` +
+`overflow: hidden` (which clipped the top of the card when content
+exceeded viewport height) to `min-height: 100vh` + `overflow-y: auto`.
+The first-run wizard's 7-field form (pw1, pw2, url, zoom, error,
+actions, plus header) is the biggest beneficiary — on a tight portrait
+viewport or with accessibility text scaling, the card now scrolls
+naturally instead of vanishing off the top edge.
+
+### Fix — kiosk zoom no longer compounds with page-side zoom scripts
+
+v1.2.4 injected `document.documentElement.style.zoom = pct / 100` —
+i.e. zoom on `<html>`. A kiosk page that also runs its own
+`document.body.style.zoom = '0.9'` fallback (so the page renders at
+90% in regular browsers without kiosk-exit-guard installed) would land
+on `<body>` while we landed on `<html>`. CSS `zoom` compounds across
+nested elements, so the rendered scale became `<html> × <body>` —
+e.g. 0.9 × 0.9 = 0.81 instead of the intended 0.9.
+
+v1.2.5 targets `document.body.style.zoom` instead. Both code paths now
+write to the same element, so the values don't multiply. Admin config
+still wins: the injection fires at DOMContentLoaded AND `window.load`,
+both of which run after any inline `<script>` in the page body, so an
+admin-configured 80% overrides a page-side 90% to 80%. A page-side
+idempotence check (`parseFloat(document.body.style.zoom)`) now
+correctly observes our value on SPA re-renders.
+
+### Fix — upgrade from <v1.2.4 cleans up stale per-user-desktop .lnks
+
+v1.2.4 moved the shortcut .lnks from the running user's desktop to
+`CommonDesktopDirectory` (so every logged-in user sees them). But
+pre-v1.2.4 installs wrote to the per-user desktop with TargetPath =
+`kiosk-exit-guard.exe` (direct, UAC-triggering); upgrading to v1.2.4
+left those orphans next to the new public-desktop ones, so the user
+saw double shortcuts and the old direct-to-exe set still fired UAC.
+
+v1.2.5's `removeStalePerUserShortcuts()` runs at the top of
+`createDesktopShortcut` (which is called on every controller startup
+that isn't a Service spawn) and deletes the seven legacy .lnk
+filenames from `[Environment]::GetFolderPath('Desktop')`. Then the
+new schtasks-routed .lnks get written to `CommonDesktopDirectory` as
+in v1.2.4. Idempotent — missing files are absorbed by
+`Remove-Item -ErrorAction SilentlyContinue`.
+
+Limitation: only the currently-running user's per-user desktop is
+cleaned. A multi-user kiosk where a different admin originally ran
+the wizard still has stale .lnks on that other admin's desktop until
+they log in once with v1.2.5+.
+
+
 ## v1.2.4 — 2026-05-12
 
 Two related fixes that both target "make the kiosk's admin surface

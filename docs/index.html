@@ -155,7 +155,7 @@
 <div class="wrap">
 
 <header>
-  <h1>kiosk-exit-guard <span class="version-pill">v1.2.4</span></h1>
+  <h1>kiosk-exit-guard <span class="version-pill">v1.2.5</span></h1>
   <p class="tagline">Single-binary kiosk lockdown for <strong>Windows 11 Home</strong> and <strong>Windows Server 2022 (RDP / physical console)</strong>. Embedded WebView2 kiosk, password-gated keyboard, Chrome uninstalled, Edge launches blocked at the OS level, self-installing, self-updating, all from one ~7.9&nbsp;MB exe.</p>
 </header>
 
@@ -195,7 +195,19 @@
   <a href="#build">Build</a>
 </nav>
 
-<h2 id="whats-new">v1.2.4 — usable admin surface (shortcuts, scheduled tasks, AnyDesk hotkey)</h2>
+<h2 id="whats-new">v1.2.5 — UI audit, zoom-target fix, stale-shortcut cleanup</h2>
+
+<div class="callout callout-good">
+  <strong>UI/UX audit pass for unusual viewports (sideways 4K TVs at 300% display scaling, low-DPI 1080p landscape, etc.), plus a zoom-target fix so kiosk pages can't double-zoom on top of the v1.2.4 admin-configured zoom, plus stale-shortcut cleanup for upgrades from &lt;v1.2.4.</strong>
+  <ul style="margin: 0.6rem 0 0; padding-left: 1.25rem;">
+    <li><strong>Modal cards no longer stretch on wide monitors.</strong> v1.2.4's <code>passwordPromptHTML</code> and <code>autoUpdateNotifyHTML</code> both had <code>.card { width: 100% }</code> with no cap, so on a 1920×1080 landscape the input stretched into a tubular 1800px-wide field. v1.2.5 caps both at <code>max-width: 540px</code>. The first-run wizard card grew 520px → 560px to fit the v1.2.4 zoom field without crowding the help text.</li>
+    <li><strong>Modal forms scroll into view on short viewports.</strong> All three modal <code>&lt;wrap&gt;</code>s switched from <code>height: 100vh</code> + <code>overflow: hidden</code> (which clipped the top) to <code>min-height: 100vh</code> + <code>overflow-y: auto</code>. The first-run wizard's 7-field form (pw1, pw2, url, zoom, error, actions, header) is the biggest beneficiary on tight portrait viewports or with accessibility text scaling.</li>
+    <li><strong>Kiosk zoom no longer compounds with page-side zoom scripts.</strong> v1.2.4 injected <code>document.documentElement.style.zoom = pct / 100</code> — i.e. zoom on <code>&lt;html&gt;</code>. A kiosk page that also runs its own <code>document.body.style.zoom = '0.9'</code> fallback (so the page renders at 90% in regular browsers without kiosk-exit-guard installed) would land on <code>&lt;body&gt;</code> while we landed on <code>&lt;html&gt;</code>. CSS <code>zoom</code> compounds across nested elements, so the rendered scale became <code>&lt;html&gt; × &lt;body&gt;</code> — e.g. 0.9 × 0.9 = 0.81 instead of the intended 0.9. v1.2.5 targets <code>document.body.style.zoom</code>; both code paths now write the same element. Admin config still wins because the injection fires at DOMContentLoaded AND <code>window.load</code>, both of which run after any inline parse-time script in the page body.</li>
+    <li><strong>Upgrade from &lt;v1.2.4 cleans up stale per-user-desktop .lnks.</strong> v1.2.4 moved shortcuts to <code>CommonDesktopDirectory</code> so every logged-in user sees them, but pre-v1.2.4 installs wrote to the per-user desktop with TargetPath = <code>kiosk-exit-guard.exe</code> (direct, UAC-triggering). Upgrading to v1.2.4 left those orphans next to the new public-desktop ones. v1.2.5's <code>removeStalePerUserShortcuts()</code> runs at the top of <code>createDesktopShortcut</code> and deletes the seven legacy .lnk filenames from the running user's desktop before writing the new public-desktop set. Idempotent — missing files are absorbed by <code>Remove-Item -ErrorAction SilentlyContinue</code>. Limitation: only the currently-running user's per-user desktop is cleaned.</li>
+  </ul>
+</div>
+
+<h2 id="v124">v1.2.4 — usable admin surface (shortcuts, scheduled tasks, AnyDesk hotkey)</h2>
 
 <div class="callout callout-good">
   <strong>Desktop shortcuts no longer fire UAC and no longer fail with "Access is denied" for non-admin kiosk users.</strong> v1.2.4 introduces a <em>shortcut &rarr; scheduled task &rarr; spawn-into-session</em> indirection: each .lnk now points at <code>schtasks.exe /Run /TN KioskExitGuard_&lt;Action&gt;</code>, the task runs as <code>NT AUTHORITY\SYSTEM</code> with HighestAvailable, and the task body invokes a new <code>--shortcut-handler &lt;flag&gt;</code> entry that spawns the action's UI into the active user's session via the same elevated-token logic the Service uses. Shortcuts also moved from the per-user desktop to <code>CommonDesktopDirectory</code> so every logged-in user sees them.
