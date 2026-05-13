@@ -155,7 +155,7 @@
 <div class="wrap">
 
 <header>
-  <h1>kiosk-exit-guard <span class="version-pill">v1.2.1</span></h1>
+  <h1>kiosk-exit-guard <span class="version-pill">v1.2.2</span></h1>
   <p class="tagline">Single-binary kiosk lockdown for <strong>Windows 11 Home</strong> and <strong>Windows Server 2022 (RDP / physical console)</strong>. Embedded WebView2 kiosk, password-gated keyboard, Chrome uninstalled, Edge launches blocked at the OS level, self-installing, self-updating, all from one ~7.9&nbsp;MB exe.</p>
 </header>
 
@@ -195,7 +195,19 @@
   <a href="#build">Build</a>
 </nav>
 
-<h2 id="whats-new">v1.2.1 — automatic update check + interactive prompt</h2>
+<h2 id="whats-new">v1.2.2 — WebView2 data-directory hotfix</h2>
+
+<div class="callout callout-good">
+  <strong>Fixes a v1.1.8 regression that broke every fresh install on Windows 11 where the kiosk account wasn't an Administrator.</strong> On launch — first-run wizard, kiosk page, password modal, toast, or the v1.2.1 auto-update notify — WebView2 popped <em>"Microsoft Edge can't read and write to its data directory: C:\ProgramData\KioskExitGuard\WebView2\EBWebView — We couldn't create the data directory."</em> v1.2.2 restores access in one line of ACL.
+  <ul style="margin: 0.6rem 0 0; padding-left: 1.25rem;">
+    <li><strong>Root cause.</strong> v1.1.8 security fix HIGH#4 moved the WebView2 user-data folder from <code>%LOCALAPPDATA%</code> to <code>%ProgramData%\KioskExitGuard\WebView2</code> and set its DACL via <code>icacls /inheritance:r /grant:r SYSTEM:(OI)(CI)F /grant:r Administrators:(OI)(CI)F</code> — SYSTEM and BUILTIN\Administrators only. But the controller runs as the <strong>kiosk user</strong> (a standard, non-admin account, spawned by the Windows Service in the user session), so <code>msedgewebview2.exe</code> in that token couldn't create <code>EBWebView</code> under the admin-only path. The DACL locked out the very process WebView2 was running as.</li>
+    <li><strong>Fix.</strong> <code>ensureWebView2DataDir</code> no longer calls <code>ensureAdminOnlyDir</code>. It does a plain <code>os.MkdirAll</code> and then <code>icacls &lt;path&gt; /grant BUILTIN\Users:(OI)(CI)M</code>, so the running user can read+write the profile. <code>ensureAdminOnlyDir</code> itself is unchanged — it still applies the hardened DACL to the update-staging directory under <code>%ProgramData%\KioskExitGuard\staging\</code> (v1.1.8 CRITICAL#2), which correctly needs the kiosk user locked out.</li>
+    <li><strong>Repairing an existing broken install.</strong> Upgrading from v1.1.8 – v1.2.1 to v1.2.2 alone is <em>not</em> enough — the new <code>/grant</code> call site runs in the kiosk user's context and lacks <code>WRITE_DAC</code> on the existing admin-only dir, so the grant fails silently. From an elevated admin shell, either <code>rmdir /S /Q C:\ProgramData\KioskExitGuard\WebView2</code> (simpler — next launch recreates with the correct DACL) or <code>icacls "C:\ProgramData\KioskExitGuard\WebView2" /grant "Users:(OI)(CI)M" /T</code> (preserves the profile, applies the ACE recursively).</li>
+    <li><strong>Security trade-off, documented.</strong> <code>Users:Modify</code> on the profile dir means the kiosk user can still plant a service-worker script via direct file-write, just at a less-obvious path. In practice the v1.1.8 fix already failed at this — all five WebView2 purposes (kiosk page, password modal, toast, wizard, update notify) share one <code>DataPath</code>, so a service worker installed by the kiosk page itself would have been inherited by the password modal regardless of DACL. The per-purpose-<code>DataPath</code> isolation that actually closes this hole is tracked as future work; v1.2.2 ships only the minimum change needed to restore functionality on Win 11.</li>
+  </ul>
+</div>
+
+<h2 id="v121">v1.2.1 — automatic update check + interactive prompt</h2>
 
 <div class="callout callout-good">
   <strong>The controller now tells you when a new version is out.</strong> Background <code>runAutoUpdateChecker</code> goroutine polls GitHub's <code>/releases/latest</code> on startup (after a 60&nbsp;s settle delay) and every 24&nbsp;h thereafter. When a newer version is published it spawns a branded WebView2 modal — <em>"An SK Filter update was pushed. Update to v{newver} now?"</em> — with [Update Now] / [Remind Me Later] buttons. Update Now hands off to the existing <code>--update</code> flow (password modal, SHA-256 verify, atomic swap, Service restart); Remind Me Later defers to the next 24&nbsp;h tick. The notification is purely additive — admins who prefer to drive the update themselves via the desktop shortcut don't lose anything.

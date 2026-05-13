@@ -5,6 +5,101 @@ All notable changes to kiosk-exit-guard, newest first. Versions follow [Semantic
 For the current state of the project, see the [landing page](https://shalom-karr.github.io/kiosk-exit-guard/), the [architecture doc](architecture.md), and the [admin runbook](admin-runbook.md).
 
 
+## v1.2.2 — 2026-05-12
+
+Hotfix for a v1.1.8 regression: on Windows 11, the controller's WebView2
+instances (kiosk page, first-run wizard, password modal, toast, and the
+v1.2.1 auto-update notify) refused to launch with **"Microsoft Edge
+can't read and write to its data directory:
+C:\ProgramData\KioskExitGuard\WebView2\EBWebView — We couldn't create
+the data directory."**
+
+### Cause
+
+`ensureWebView2DataDir` (added in v1.1.8 to address security finding
+HIGH#4 — kiosk user planting a service worker in `%LOCALAPPDATA%`)
+called `ensureAdminOnlyDir`, which ran:
+
+```
+icacls <path> /inheritance:r
+              /grant:r SYSTEM:(OI)(CI)F
+              /grant:r Administrators:(OI)(CI)F
+```
+
+stripping inheritance and granting only SYSTEM + BUILTIN\Administrators.
+But per the comment at `acquireAdminOnlyNamedMutex` (and the actual
+LocalSystem→user-session spawn path), the controller runs **as the
+kiosk user** — a standard, non-admin account. So `msedgewebview2.exe`,
+spawned in that user's token, could not create the `EBWebView`
+subdirectory under the admin-only path. The very process the HIGH#4
+DACL was meant to protect couldn't access the folder it was supposed
+to use.
+
+The regression manifested on every fresh v1.1.8+ install where the
+kiosk account was not a member of `Administrators` — i.e. every
+correctly-locked-down kiosk.
+
+### Fix
+
+`ensureWebView2DataDir` no longer calls `ensureAdminOnlyDir`. It does
+a plain `os.MkdirAll` and then runs:
+
+```
+icacls <path> /grant BUILTIN\Users:(OI)(CI)M
+```
+
+so the running user can read+write the profile. The grant is
+idempotent and additive — re-running on a fresh install is a no-op
+beyond the ACE refresh, and on a v1.1.8–v1.2.1 install whose DACL was
+previously stripped, the new ACE is added on top (the stripped
+inheritance flag is irrelevant once an explicit Users ACE exists).
+
+`ensureAdminOnlyDir` itself is **unchanged** — it still applies the
+hardened DACL to the update-staging directory under
+`%ProgramData%\KioskExitGuard\staging\` (v1.1.8 CRITICAL#2), which
+correctly needs the kiosk user locked out so they can't poison the
+downloaded exe between SHA-256 verification and atomic swap.
+
+### Repairing an existing broken install
+
+If a machine is already running v1.1.8 – v1.2.1 and the WebView2 dir
+was created with the broken DACL, upgrading to v1.2.2 alone is not
+enough — the new `/grant` runs but the call site is in the kiosk
+user's context and lacks WRITE_DAC on the existing admin-only dir, so
+the grant fails silently. Either of the following from an elevated
+admin shell fixes it:
+
+```
+rmdir /S /Q C:\ProgramData\KioskExitGuard\WebView2
+```
+
+(simpler — next launch recreates with the correct DACL) or
+
+```
+icacls "C:\ProgramData\KioskExitGuard\WebView2" /grant "Users:(OI)(CI)M" /T
+```
+
+(preserves the existing profile, applies the new ACE recursively).
+
+### Security trade-off
+
+The original HIGH#4 finding observed that a kiosk user with normal
+filesystem access to `%LOCALAPPDATA%` could plant a service-worker
+script that intercepts the password modal's `kgSubmit` JS binding.
+v1.2.2 mitigates this less than v1.1.8 claimed to: `Users:Modify` on
+the profile directory means the kiosk user can still plant such a
+script via direct file-write, just at a less-obvious path
+(`%ProgramData%`).
+
+In practice the v1.1.8 fix already failed at this — all five
+WebView2 purposes (kiosk page, password modal, toast, wizard, update
+notify) shared the same `DataPath`, so a service worker installed by
+the kiosk page itself would have been inherited by the password modal
+regardless of DACL. The per-purpose-DataPath isolation that actually
+closes this hole is tracked as future work; v1.2.2 ships only the
+minimum change needed to restore functionality on Win 11.
+
+
 ## v1.2.1 — 2026-05-12
 
 Background auto-update check + interactive admin notification. The

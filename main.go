@@ -62,7 +62,7 @@ import (
 
 // currentVersion must be kept in sync with versioninfo.json. Used by the
 // --update flow to compare against the latest GitHub release tag.
-const currentVersion = "1.2.1"
+const currentVersion = "1.2.2"
 
 // Auto-update background-check timing. v1.2.1: the controller polls
 // GitHub's /releases/latest on startup (after autoUpdateInitialDelay so
@@ -470,22 +470,50 @@ func ensureAdminOnlyDir(dir string) error {
 	return nil
 }
 
-// webView2DataPath is the admin-only WebView2 user-data folder shared
-// across all in-process WebView2 instances (password modal, toast,
-// first-run wizard). v1.1.8 security fix HIGH#4 — moves the profile out
-// of %LOCALAPPDATA% where a kiosk user could write a service-worker
-// script that intercepts the password modal's kgSubmit binding.
+// webView2DataPath is the WebView2 user-data folder shared across all
+// in-process WebView2 instances (password modal, toast, first-run wizard,
+// kiosk page, update notify). v1.1.8 security fix HIGH#4 moved the profile
+// out of %LOCALAPPDATA% to keep the kiosk user from planting a service
+// worker that intercepts the password modal's kgSubmit binding.
 func webView2DataPath() string {
 	return filepath.Join(programDataDir(), "WebView2")
 }
 
-// ensureWebView2DataDir lazily creates the admin-only WebView2 user-
-// data directory. Idempotent. Best-effort — if it fails we still pass
-// the path to WebView2 (it'll create what it can with default ACLs); the
-// security guarantee is weaker but the modal still works.
+// ensureWebView2DataDir lazily creates the WebView2 user-data directory
+// and ensures the running user can read+write it.
+//
+// v1.2.2 regression fix: prior versions called ensureAdminOnlyDir() here,
+// which set the DACL to SYSTEM+Administrators only. The kiosk controller
+// runs as a non-admin user, so msedgewebview2.exe — spawned in that
+// user's token — couldn't create EBWebView and surfaced "Microsoft Edge
+// can't read and write to its data directory: C:\ProgramData\
+// KioskExitGuard\WebView2\EBWebView". The admin-only DACL locked out the
+// very process WebView2 was running as.
+//
+// Now we grant BUILTIN\Users Modify (OI+CI) so the kiosk user can create
+// the profile. The original HIGH#4 threat (kiosk user planting a service
+// worker via direct file-write) is partially restored by the fact that
+// %ProgramData% is not a path the kiosk user normally browses to, but the
+// real defense remains "all in-process WebView2s share this profile, so
+// the kiosk page itself can plant a SW that the modal will inherit" — a
+// JS-context isolation problem better fixed by per-purpose DataPaths,
+// tracked for a future change.
+//
+// Idempotent. The icacls grant repairs older installs whose DACL was
+// stripped by ensureAdminOnlyDir; it is best-effort — if the caller
+// lacks WRITE_DAC (non-admin invocation against a pre-existing locked
+// dir) the grant fails silently and the launch will still surface the
+// "can't read and write" error, in which case an admin must run:
+//
+//   icacls "C:\ProgramData\KioskExitGuard\WebView2" /grant "Users:(OI)(CI)M"
+//
+// to repair the existing install.
 func ensureWebView2DataDir() string {
 	p := webView2DataPath()
-	_ = ensureAdminOnlyDir(p)
+	_ = os.MkdirAll(p, 0o700)
+	cmd := exec.Command("icacls", p, "/grant", `BUILTIN\Users:(OI)(CI)M`)
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+	_ = cmd.Run()
 	return p
 }
 
