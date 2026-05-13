@@ -5,6 +5,172 @@ All notable changes to kiosk-exit-guard, newest first. Versions follow [Semantic
 For the current state of the project, see the [landing page](https://shalom-karr.github.io/kiosk-exit-guard/), the [architecture doc](architecture.md), and the [admin runbook](admin-runbook.md).
 
 
+## v1.2.4 — 2026-05-12
+
+Two related fixes that both target "make the kiosk's admin surface
+actually usable post-install": a shortcut + scheduled-task overhaul so
+non-admin users can trigger Pause / Resume / Launch Kiosk / Update /
+Change URL / Uninstall without UAC, and a small carve-out to let the
+Ctrl+Shift+Alt+K pause hotkey fire from injected keyboard input
+(AnyDesk, AutoHotkey, remote shells).
+
+### Fix — desktop shortcuts now route through SYSTEM scheduled tasks
+
+**Before v1.2.4** each .lnk pointed straight at
+`kiosk-exit-guard.exe --pause` (etc.). The exe carries a
+`requireAdministrator` manifest, so every click fired a UAC consent
+prompt; for non-admin kiosk users the operation simply failed with
+"Access is denied" because they couldn't pass the prompt and didn't
+have HKLM write rights anyway. Shortcuts also landed on the wizard
+runner's desktop (typically admin) — a separate non-admin kiosk user
+never saw them.
+
+**v1.2.4 introduces a shortcut → scheduled-task → spawn-into-session
+indirection:**
+
+1. **`installShortcutTasks()`** registers one Task Scheduler entry per
+   action under the names `KioskExitGuard_Pause`,
+   `KioskExitGuard_Resume`, `KioskExitGuard_LaunchKiosk`,
+   `KioskExitGuard_Update`, `KioskExitGuard_SetURL`,
+   `KioskExitGuard_Uninstall`. Each task runs as
+   `NT AUTHORITY\SYSTEM` with `HighestAvailable` run level and on-
+   demand only (no trigger). The action invokes
+   `<canonical-exe> --shortcut-handler <flag>`. Default DACL on a
+   SYSTEM/HIGHEST task already grants `BUILTIN\Users`
+   Read + Execute — which is exactly the "any logged-in user can /Run
+   this" permission the shortcuts need.
+
+2. **`createDesktopShortcut()`** rewrites each .lnk to point at
+   `%SystemRoot%\System32\schtasks.exe` with arguments
+   `/Run /TN KioskExitGuard_<Action>`. The IconLocation still points
+   at `canonicalInstallPath()` so the brand icon survives. WindowStyle
+   = 7 (Minimized) hides the brief schtasks console flash on click.
+   Shortcuts are now placed in `CommonDesktopDirectory` (the
+   public/all-users desktop) instead of the per-user desktop, so every
+   logged-in user sees them — fixes the "admin ran the wizard and the
+   non-admin kiosk user has a blank desktop" case.
+
+3. **`runShortcutHandler(flag)`** is the new `--shortcut-handler`
+   entry point. The scheduled task fires it as SYSTEM in session 0;
+   it calls `pickActiveUserSession()` (the same picker the Service
+   uses) and `spawnFlagAsUserInSession(sessionID, flag)` to spawn
+   `<canonical-exe> <flag>` in the active user's session with that
+   user's primary token. `spawnFlagAsUserInSession` is the v1.2.4
+   sibling of `spawnControllerInSession` in `service_windows.go`:
+   same `WTSQueryUserToken` / `tokenFromUserSessionProcess` / v1.2.3
+   `elevatedLinkedToken` swap, but spawns `<exe> <flag>` and does NOT
+   set the `KIOSK_EXIT_GUARD_VIA_SERVICE` marker — the spawned child
+   should behave exactly like an admin double-clicking the flag
+   directly, not like a service-spawned controller.
+
+4. The spawned child renders the password modal / duration picker /
+   kiosk window / etc. on the user's desktop, then exits.
+
+**Net effect for the user:** clicking a desktop shortcut no longer
+shows UAC for split-token admin kiosks; the .lnks live on the public
+desktop and show the canonical exe's icon; the shortcuts still
+trigger exactly the same operation (with exactly the same password
+modal) they always did, just routed through a SYSTEM context that has
+the privileges to actually finish the work.
+
+**Known limitation, true non-admin kiosk users:** when
+`spawnFlagAsUserInSession` runs against a user whose primary token has
+no elevated linked counterpart (a real Standard User account, not a
+split-token admin), `CreateProcessAsUser` against the
+`requireAdministrator` exe still returns `ERROR_ELEVATION_REQUIRED` —
+exactly the same failure mode the v1.2.3 `spawnControllerInSession`
+path has for that case. Fully supporting non-admin kiosk users
+requires a follow-up: either flip the manifest to `asInvoker` and
+move the privileged operations into a SYSTEM-side dispatcher, or run
+the action body directly inside the SYSTEM task instead of spawning
+into the user session. Tracked as future work.
+
+### Feature — kiosk page zoom (50–200%, persisted in HKLM)
+
+The "Change Kiosk URL" shortcut now also prompts for a default page-
+zoom percent, and the first-run wizard grew a matching `Default page
+zoom (%)` field next to the URL input. Values are clamped to 50–200,
+default is 100, persisted as `KioskZoom` (DWORD) under
+`HKLM\Software\KioskExitGuard` next to `KioskURL`.
+
+`runWebViewKiosk` reads the persisted percent at startup and injects
+an IIFE inside the existing `w.Init` block (the same one that already
+hosts the link-prefix click guard). The IIFE sets
+`document.documentElement.style.zoom = pct / 100` on both
+`DOMContentLoaded` and `load` — covering the initial paint AND any
+SPA-framework re-render that overwrites inline styles on `<html>`.
+This is the CSS `zoom` property, the same mechanism Ctrl +/− triggers
+in a browser; pages lay out at the scaled size and scrollbars adjust.
+
+Existing installs without the registry key default to 100% — no
+behavior change. Setting 90 once via the shortcut persists across
+kiosk respawns, pause/resume cycles, and auto-updates.
+
+### Fix — Ctrl+Shift+Alt+K pause hotkey now fires from injected input
+
+Pause hotkey (Ctrl+Shift+Alt+K) now fires from injected keyboard input —
+specifically AnyDesk, AutoHotkey, and any other tool that forwards
+keystrokes via `SendInput`. Before v1.2.4 the LL keyboard hook ignored
+all injected events wholesale, which meant an admin remoting into a
+fullscreen kiosk via AnyDesk had no way to trigger the password modal
+without physical access to the keyboard. v1.2.4 carves out exactly one
+combo from the ignore-injected rule: Ctrl+Shift+Alt+K (key-down, with
+all three modifiers held). Every other injected event still falls
+straight through to `procCallNextHookEx` unmodified, so AnyDesk typing,
+paste, mouse macros, etc. keep working exactly as before.
+
+### Cause
+
+`hookCallback` (main.go:2436) early-rejects every event where
+`(kb.Flags & llkhfInject) != 0` is true and `DwExtraInfo != kioskMarker`
+— i.e. anything injected by another process. The rationale is sound
+for the broad case: the kiosk user can't physically inject, and we
+don't want the kiosk's enforcement applied to legitimate remote-admin
+keystrokes. But the pause-hotkey detection lived inside the same
+`if !injected && !ourInjection { ... }` block, so the only way to
+trigger the password modal was the local physical keyboard.
+
+### Fix
+
+A narrow new branch at the top of `hookCallback`, *before* the
+existing `!injected && !ourInjection` gate:
+
+```go
+isKeyDownAny := wParam == wmKeyDown || wParam == wmSysKeyDown
+if injected && !ourInjection && isKeyDownAny &&
+    kb.VkCode == vkK && ctrlDown() && shiftDown() && altDown() {
+    if !promptOpen.Load() {
+        go promptAndPause()
+    }
+    return 1
+}
+```
+
+- **Scope is one combo.** Only `vkK` with Ctrl + Shift + Alt held
+  matches. Everything else (injected Win, injected Win+R, injected
+  Ctrl+Esc, injected typing into the kiosk page) hits the existing
+  fall-through path and behaves exactly as in v1.2.3.
+- **`ctrlDown` / `shiftDown` / `altDown` see injected modifier state.**
+  They wrap `GetAsyncKeyState`, which Windows updates regardless of
+  whether the modifier-down event was injected. So AnyDesk's
+  `SendInput(Ctrl-down, Shift-down, Alt-down, K-down)` chain leaves
+  the async state reflecting all three modifiers by the time the K
+  event arrives at the hook.
+- **`ourInjection` is excluded.** A re-inject path that ever carried
+  the exact same combo can't loop through this branch.
+- **`promptOpen.Load()` gate** matches the existing physical-keyboard
+  path so an AnyDesk admin who mashes the hotkey while the modal is
+  already open doesn't spawn a second one.
+
+### Reverse-direction note
+
+Keystrokes the kiosk user types on the **local physical keyboard** are
+unchanged — they were never injected, so the existing
+`!injected && !ourInjection` branch already handles them. v1.2.4 is
+purely additive: a remote admin path that didn't exist before, with no
+behavioral change for any other input source.
+
+
 ## v1.2.3 — 2026-05-12
 
 Companion hotfix to v1.2.2. With the WebView2 data-directory ACL fixed,

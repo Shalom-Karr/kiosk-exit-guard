@@ -1075,6 +1075,107 @@ func isLegitimateCandidateHandle(hProc windows.Handle, expectedPath string) bool
 	return actual == expected
 }
 
+// spawnFlagAsUserInSession is the v1.2.4 shortcut-task variant of
+// spawnControllerInSession: same WTSQueryUserToken / elevatedLinkedToken /
+// CreateProcessAsUser sequence, but spawns `<exe> <flag>` (e.g. --pause,
+// --resume, --update) and does NOT set the KIOSK_EXIT_GUARD_VIA_SERVICE
+// marker — the spawned child should behave exactly like an admin double-
+// clicking the flag invocation directly, not like a Service-spawned
+// controller.
+//
+// Used by --shortcut-handler when a scheduled task (running as SYSTEM in
+// session 0) fires from a desktop shortcut click and needs the action's
+// UI surfaced in the active user's session. The scheduled-task indirection
+// is what lets a non-elevated user click a shortcut and reach a privileged
+// operation without seeing a UAC consent prompt.
+//
+// Returns nil on success (the child is detached and runs independently;
+// the caller does not wait). Errors flow back to the --shortcut-handler
+// entry point in main.go which logs them.
+func spawnFlagAsUserInSession(sessionID uint32, flag string) error {
+	exe := canonicalInstallPath()
+
+	var userToken windows.Token
+	wtsErr := windows.WTSQueryUserToken(sessionID, &userToken)
+	if wtsErr != nil {
+		fallback, candidateName, fbErr := tokenFromUserSessionProcess(sessionID)
+		if fbErr != nil {
+			return fmt.Errorf("WTSQueryUserToken(%d): %w; user-session-process fallback: %v", sessionID, wtsErr, fbErr)
+		}
+		userToken = fallback
+		logf("shortcut-handler: WTSQueryUserToken failed (%v); fell back to <%s> in session %d", wtsErr, candidateName, sessionID)
+	} else {
+		// Same v1.2.3 swap as the Service path — without this, a split-
+		// token admin gets the filtered token and CreateProcessAsUser
+		// would fail with ERROR_ELEVATION_REQUIRED against the
+		// requireAdministrator manifest. For non-admin users
+		// elevatedLinkedToken returns (0, nil) and we keep the original
+		// token; on those installs the spawn will still fail-elevation,
+		// but the same is true for the existing Service path and the
+		// non-admin-kiosk case is being tracked as known limitation.
+		if elevated, eErr := elevatedLinkedToken(userToken); eErr == nil && elevated != 0 {
+			_ = userToken.Close()
+			userToken = elevated
+		}
+	}
+	defer userToken.Close()
+
+	var primaryToken windows.Token
+	if err := windows.DuplicateTokenEx(
+		userToken,
+		maximumAllowed,
+		nil,
+		securityIdentification,
+		tokenPrimary,
+		&primaryToken,
+	); err != nil {
+		return fmt.Errorf("DuplicateTokenEx: %w", err)
+	}
+	defer primaryToken.Close()
+
+	var envBlock *uint16
+	if err := windows.CreateEnvironmentBlock(&envBlock, primaryToken, false); err != nil {
+		return fmt.Errorf("CreateEnvironmentBlock: %w", err)
+	}
+	defer destroyEnvironmentBlock(envBlock)
+
+	desktop, err := windows.UTF16PtrFromString(`winsta0\default`)
+	if err != nil {
+		return fmt.Errorf("UTF16PtrFromString(desktop): %w", err)
+	}
+	si := windows.StartupInfo{
+		Cb:      uint32(unsafe.Sizeof(windows.StartupInfo{})),
+		Desktop: desktop,
+	}
+
+	cmdLine, err := windows.UTF16PtrFromString(fmt.Sprintf(`"%s" %s`, exe, flag))
+	if err != nil {
+		return fmt.Errorf("UTF16PtrFromString(cmd): %w", err)
+	}
+
+	var pi windows.ProcessInformation
+	err = windows.CreateProcessAsUser(
+		primaryToken,
+		nil,
+		cmdLine,
+		nil,
+		nil,
+		false,
+		createUnicodeEnv|createNewConsole,
+		envBlock,
+		nil,
+		&si,
+		&pi,
+	)
+	if err != nil {
+		return fmt.Errorf("CreateProcessAsUser: %w", err)
+	}
+	logf("shortcut-handler: spawned %q pid=%d in session %d", flag, pi.ProcessId, sessionID)
+	_ = windows.CloseHandle(pi.Thread)
+	_ = windows.CloseHandle(pi.Process)
+	return nil
+}
+
 // elevatedLinkedToken returns the elevated counterpart of a UAC-split
 // limited token. Returns (0, nil) if the token is not split (i.e.
 // elevation type is Default or Full — there's nothing to swap to). The

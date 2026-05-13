@@ -62,7 +62,7 @@ import (
 
 // currentVersion must be kept in sync with versioninfo.json. Used by the
 // --update flow to compare against the latest GitHub release tag.
-const currentVersion = "1.2.3"
+const currentVersion = "1.2.4"
 
 // Auto-update background-check timing. v1.2.1: the controller polls
 // GitHub's /releases/latest on startup (after autoUpdateInitialDelay so
@@ -285,8 +285,13 @@ const (
 	regAppKey         = `Software\KioskExitGuard`
 	regHashValue      = "PasswordHash"
 	regURLValue       = "KioskURL"
+	regZoomValue      = "KioskZoom"      // DWORD: page zoom percent (50–200, default 100). v1.2.4
 	regFilterModeVal  = "FilterMode"     // DWORD: 1 = active, 0 = paused
 	regPauseUntilVal  = "PauseUntilNano" // QWORD: unix nano of pause expiry, 0 = no pause
+
+	defaultKioskZoom = 100 // percent
+	minKioskZoom     = 50
+	maxKioskZoom     = 200
 
 	ifeoBase = `Software\Microsoft\Windows NT\CurrentVersion\Image File Execution Options`
 
@@ -638,6 +643,46 @@ func saveKioskURLToRegistry(url string) error {
 	return k.SetStringValue(regURLValue, url)
 }
 
+// clampKioskZoom keeps a user-supplied percent inside the supported
+// range. Anything below minKioskZoom or above maxKioskZoom is silently
+// snapped — both promptForKioskURL and the first-run wizard pre-validate,
+// but this is also the gate the runWebViewKiosk reader leans on so a
+// corrupted registry value can't render the kiosk at 1% or 10000%.
+func clampKioskZoom(percent int) int {
+	if percent < minKioskZoom {
+		return minKioskZoom
+	}
+	if percent > maxKioskZoom {
+		return maxKioskZoom
+	}
+	return percent
+}
+
+// loadKioskZoomPercent reads the persisted page-zoom percent from HKLM,
+// defaulting to defaultKioskZoom when the value is absent or unreadable.
+// The result is always inside [minKioskZoom, maxKioskZoom].
+func loadKioskZoomPercent() int {
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, regAppKey, registry.QUERY_VALUE)
+	if err != nil {
+		return defaultKioskZoom
+	}
+	defer k.Close()
+	v, _, err := k.GetIntegerValue(regZoomValue)
+	if err != nil {
+		return defaultKioskZoom
+	}
+	return clampKioskZoom(int(v))
+}
+
+func saveKioskZoomPercent(percent int) error {
+	k, _, err := registry.CreateKey(registry.LOCAL_MACHINE, regAppKey, registry.SET_VALUE)
+	if err != nil {
+		return err
+	}
+	defer k.Close()
+	return k.SetDWordValue(regZoomValue, uint32(clampKioskZoom(percent)))
+}
+
 func migrateLegacyHash() {
 	p, err := hashPath()
 	if err != nil {
@@ -754,8 +799,54 @@ func promptForKioskURL() (string, error) {
 		if err := saveKioskURLToRegistry(url); err != nil {
 			return "", err
 		}
+		// v1.2.4: also collect the WebView2 page-zoom percent. Saved to
+		// the same HKLM key so the kiosk respawn picks it up. A cancel
+		// at this second prompt does NOT roll back the URL save above —
+		// the URL change is the primary intent, the zoom is a secondary
+		// preference. Bad input gets snapped via clampKioskZoom rather
+		// than re-prompting in a loop, on the theory that an admin who
+		// typed "0" probably wants "50" (the minimum), not a re-prompt.
+		if _, err := promptForKioskZoom(); err != nil && !errors.Is(err, zenity.ErrCanceled) {
+			return "", err
+		}
 		return url, nil
 	}
+}
+
+// promptForKioskZoom asks the admin for the default page-zoom percent
+// (50–200) and persists it to HKLM. The default value pre-filled in the
+// entry is the currently-stored zoom (or 100 first time). Returns the
+// final saved percent. Cancel returns (0, zenity.ErrCanceled) so callers
+// can distinguish "I didn't want to change zoom" from a real error.
+func promptForKioskZoom() (int, error) {
+	current := loadKioskZoomPercent()
+	raw, err := zenity.Entry(
+		fmt.Sprintf("Default page zoom for the kiosk window.\nA value below 100 zooms out, above 100 zooms in.\nCurrent: %d%%\nAllowed range: %d–%d.", current, minKioskZoom, maxKioskZoom),
+		zenity.Title("kiosk-exit-guard — kiosk zoom"),
+		zenity.EntryText(strconv.Itoa(current)),
+	)
+	if err != nil {
+		return 0, err
+	}
+	raw = strings.TrimSpace(raw)
+	raw = strings.TrimSuffix(raw, "%")
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		// Empty input = keep current. Don't re-save, but treat as success.
+		return current, nil
+	}
+	parsed, err := strconv.Atoi(raw)
+	if err != nil {
+		// Garbage input — fall back to current rather than blocking the
+		// flow with a re-prompt loop. The admin can re-run --set-url if
+		// they care.
+		return current, nil
+	}
+	zoom := clampKioskZoom(parsed)
+	if err := saveKioskZoomPercent(zoom); err != nil {
+		return 0, err
+	}
+	return zoom, nil
 }
 
 // ---------- filter mode + pause persistence ----------
@@ -1607,76 +1698,195 @@ func ensureWebView2Installed() error {
 	return nil
 }
 
-// ---------- desktop shortcut ----------
-
-// createDesktopShortcut drops two .lnk files on the current user's desktop:
-//   - "Kiosk Exit Guard.lnk" — runs the controller exe (rarely needed
-//     since Task Scheduler launches it at logon, but useful as a fallback)
-//   - "Pause SK Filter.lnk" — runs the exe with --pause, which opens the
-//     password + duration prompt directly without going through the
-//     Ctrl+Shift+Alt+K hotkey
+// ---------- desktop shortcuts + per-action scheduled tasks ----------
 //
-// Idempotent: re-creating overwrites the existing shortcuts.
-func createDesktopShortcut() error {
-	exe, err := os.Executable()
-	if err != nil {
-		return err
+// v1.2.4 changed the shortcut model. Before, each .lnk pointed directly at
+// kiosk-exit-guard.exe with a flag like --pause; because the exe carries a
+// requireAdministrator manifest, every click fired UAC, and for non-admin
+// kiosk users the operation simply failed with "Access is denied" because
+// they couldn't pass the consent prompt and didn't have HKLM write rights
+// anyway.
+//
+// v1.2.4 routes each shortcut through a pre-registered Task Scheduler
+// task running as NT AUTHORITY\SYSTEM with HighestAvailable run level and
+// on-demand only. The shortcut's TargetPath is schtasks.exe and the
+// argument is `/Run /TN KioskExitGuard_<Action>`. Triggering a task
+// doesn't require UAC for the user (the default task DACL grants Users
+// Execute), and the task body runs as SYSTEM — which has every privilege
+// the action might need — and re-spawns the flag into the active user's
+// session via spawnFlagAsUserInSession so the password modal and any
+// other UI still render on the user's desktop.
+
+// shortcutSpec ties together the desktop .lnk filename, the scheduled-
+// task name, and the kiosk-exit-guard.exe flag the task executes.
+// Keeping these in one table means an admin adding a new shortcut later
+// only edits this list — createDesktopShortcut, installShortcutTasks,
+// uninstallShortcutTasks, and removeDesktopShortcuts all walk the same
+// data.
+type shortcutSpec struct {
+	lnkName     string // file under <Desktop>\ (without .lnk extension is added below)
+	taskName    string // Task Scheduler task name; prefixed KioskExitGuard_ for namespacing
+	flag        string // argument passed to kiosk-exit-guard.exe inside the task
+	description string // shown in the .lnk's tooltip
+}
+
+func shortcutSpecs() []shortcutSpec {
+	return []shortcutSpec{
+		{"Pause SK Filter", "KioskExitGuard_Pause", "--pause",
+			"Pause the SK Filter for a set time (password required)"},
+		{"Resume SK Filter", "KioskExitGuard_Resume", "--resume",
+			"End the current pause and re-activate the SK Filter"},
+		{"Launch Kiosk", "KioskExitGuard_LaunchKiosk", "--launch-kiosk",
+			"Re-open the kiosk window manually (no-op when filter is paused)"},
+		{"Update SK Filter", "KioskExitGuard_Update", "--update",
+			"Check GitHub for a new version of the SK Filter (password required to install)"},
+		{"Change Kiosk URL", "KioskExitGuard_SetURL", "--set-url",
+			"Change the URL the kiosk opens (password required)"},
+		{"Uninstall SK Filter", "KioskExitGuard_Uninstall", "--uninstall",
+			"Remove the SK Filter (password required)"},
 	}
-	exeQ := strings.ReplaceAll(exe, `'`, `''`)
-	workDir := strings.ReplaceAll(filepath.Dir(exe), `'`, `''`)
-	ps := fmt.Sprintf(`
-$ws = New-Object -ComObject WScript.Shell
-$desktop = [Environment]::GetFolderPath('Desktop')
+}
 
-$lnk1 = $ws.CreateShortcut(("$desktop\Pause SK Filter.lnk"))
-$lnk1.TargetPath = '%s'
-$lnk1.Arguments = '--pause'
-$lnk1.WorkingDirectory = '%s'
-$lnk1.IconLocation = ('%s' + ',0')
-$lnk1.Description = 'Pause the SK Filter for a set time (password required)'
-$lnk1.Save()
+// schtasksPath resolves to %SystemRoot%\System32\schtasks.exe. Using the
+// fully-qualified path means a kiosk user can't squat schtasks.exe in a
+// writable PATH directory.
+func schtasksPath() string {
+	sysroot := os.Getenv("SystemRoot")
+	if sysroot == "" {
+		sysroot = `C:\Windows`
+	}
+	return filepath.Join(sysroot, "System32", "schtasks.exe")
+}
 
-$lnk2 = $ws.CreateShortcut(("$desktop\Resume SK Filter.lnk"))
-$lnk2.TargetPath = '%s'
-$lnk2.Arguments = '--resume'
-$lnk2.WorkingDirectory = '%s'
-$lnk2.IconLocation = ('%s' + ',0')
-$lnk2.Description = 'End the current pause and re-activate the SK Filter (no password needed)'
-$lnk2.Save()
+// installShortcutTasks (idempotent) registers one Task Scheduler entry
+// per shortcut action under \KioskExitGuard\. Each task runs as SYSTEM
+// with HighestAvailable, on-demand only (no trigger), and its action
+// invokes `<canonical-exe> --shortcut-handler <flag>`. The handler
+// re-spawns the flag into the active user's session via
+// spawnFlagAsUserInSession so the action's UI lands on the user's
+// desktop. Re-running this function /Create /F-overwrites the existing
+// definitions, so it's safe to call on every controller startup.
+func installShortcutTasks() error {
+	exe := canonicalInstallPath()
+	for _, sc := range shortcutSpecs() {
+		// schtasks /Create /F /TN <name>
+		//   /TR "\"<exe>\" --shortcut-handler <flag>"
+		//   /SC ONCE /ST 00:00 /RU SYSTEM /RL HIGHEST
+		// /SC ONCE + /ST 00:00 is a no-op trigger in the past; combined
+		// with /Z (= delete after expiry) it would delete itself, so we
+		// omit /Z. Default DACL on a SYSTEM /HIGHEST task grants Users
+		// Read + Execute, which is exactly the "any logged-in user can
+		// /Run this" permission we need. We don't need to touch the SD.
+		tr := fmt.Sprintf(`"%s" --shortcut-handler %s`, exe, sc.flag)
+		args := []string{
+			"/Create", "/F",
+			"/TN", sc.taskName,
+			"/TR", tr,
+			"/SC", "ONCE",
+			"/ST", "00:00",
+			"/RU", "SYSTEM",
+			"/RL", "HIGHEST",
+		}
+		cmd := exec.Command(schtasksPath(), args...)
+		cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+		if out, err := cmd.CombinedOutput(); err != nil {
+			logf("installShortcutTasks: schtasks /Create %s failed: %v: %s", sc.taskName, err, strings.TrimSpace(string(out)))
+			return fmt.Errorf("schtasks /Create %s: %w", sc.taskName, err)
+		}
+	}
+	logf("installShortcutTasks: registered %d shortcut tasks", len(shortcutSpecs()))
+	return nil
+}
 
-$lnk3 = $ws.CreateShortcut(("$desktop\Launch Kiosk.lnk"))
-$lnk3.TargetPath = '%s'
-$lnk3.Arguments = '--launch-kiosk'
-$lnk3.WorkingDirectory = '%s'
-$lnk3.IconLocation = ('%s' + ',0')
-$lnk3.Description = 'Re-open the kiosk window manually (no-op when filter is paused)'
-$lnk3.Save()
+// uninstallShortcutTasks (idempotent) deletes every task registered by
+// installShortcutTasks. Errors are logged and swallowed — a task that's
+// already gone (or was never registered, e.g. upgrading from <v1.2.4) is
+// not an uninstall failure.
+func uninstallShortcutTasks() {
+	for _, sc := range shortcutSpecs() {
+		cmd := exec.Command(schtasksPath(), "/Delete", "/F", "/TN", sc.taskName)
+		cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+		if out, err := cmd.CombinedOutput(); err != nil {
+			// schtasks returns exit 1 with "ERROR: The system cannot find
+			// the file specified" when the task doesn't exist — fine.
+			outStr := strings.TrimSpace(string(out))
+			if !strings.Contains(outStr, "cannot find") {
+				logf("uninstallShortcutTasks: schtasks /Delete %s: %v: %s", sc.taskName, err, outStr)
+			}
+		}
+	}
+}
 
-$lnk4 = $ws.CreateShortcut(("$desktop\Update SK Filter.lnk"))
-$lnk4.TargetPath = '%s'
-$lnk4.Arguments = '--update'
-$lnk4.WorkingDirectory = '%s'
-$lnk4.IconLocation = ('%s' + ',0')
-$lnk4.Description = 'Check GitHub for a new version of the SK Filter (password required to install)'
-$lnk4.Save()
+// runShortcutHandler is the entry point for the SYSTEM-context scheduled
+// task fired by a desktop shortcut click. It looks up the active user
+// session and re-spawns the requested flag into that session via
+// spawnFlagAsUserInSession. The session-1 (or whatever) child runs in
+// the user's interactive desktop with their token, so UI (password
+// modal, duration picker, kiosk window) renders normally. The flag's
+// existing implementation in main() handles the rest exactly as if the
+// admin had double-clicked --pause / --resume / etc. directly.
+//
+// Errors are logged but otherwise swallowed — there's no UI in session 0
+// to surface them, and the shortcut click is already over.
+func runShortcutHandler(flag string) {
+	sessionID, ok := pickActiveUserSession()
+	if !ok {
+		logf("shortcut-handler %s: pickActiveUserSession found no active user; nothing to do", flag)
+		return
+	}
+	if err := spawnFlagAsUserInSession(sessionID, flag); err != nil {
+		logf("shortcut-handler %s: spawnFlagAsUserInSession(session=%d) failed: %v", flag, sessionID, err)
+		return
+	}
+}
 
-$lnk5 = $ws.CreateShortcut(("$desktop\Change Kiosk URL.lnk"))
-$lnk5.TargetPath = '%s'
-$lnk5.Arguments = '--set-url'
-$lnk5.WorkingDirectory = '%s'
-$lnk5.IconLocation = ('%s' + ',0')
-$lnk5.Description = 'Change the URL the kiosk opens (password required)'
-$lnk5.Save()
+// createDesktopShortcut (re)writes one .lnk per shortcutSpec on the
+// current user's desktop. v1.2.4: each .lnk's TargetPath is
+// schtasks.exe and the argument is `/Run /TN KioskExitGuard_<Action>`,
+// so clicking the shortcut triggers the corresponding scheduled task
+// (which then spawns the action into the user's session via
+// runShortcutHandler). The shortcut's IconLocation still points at the
+// canonical kiosk-exit-guard.exe so the .lnk shows the brand icon, not
+// the generic schtasks icon.
+//
+// WindowStyle = 7 (Minimized) hides the brief schtasks console window
+// flash that would otherwise pop on click; the actual UI surfaces from
+// the spawned user-session child a moment later.
+//
+// Idempotent: re-creating overwrites the existing .lnk.
+func createDesktopShortcut() error {
+	icon := canonicalInstallPath()
+	iconQ := strings.ReplaceAll(icon, `'`, `''`)
+	stPath := schtasksPath()
+	stPathQ := strings.ReplaceAll(stPath, `'`, `''`)
 
-$lnk6 = $ws.CreateShortcut(("$desktop\Uninstall SK Filter.lnk"))
-$lnk6.TargetPath = '%s'
-$lnk6.Arguments = '--uninstall'
-$lnk6.WorkingDirectory = '%s'
-$lnk6.IconLocation = ('%s' + ',0')
-$lnk6.Description = 'Remove the SK Filter (password required)'
-$lnk6.Save()
-`, exeQ, workDir, exeQ, exeQ, workDir, exeQ, exeQ, workDir, exeQ, exeQ, workDir, exeQ, exeQ, workDir, exeQ, exeQ, workDir, exeQ)
-	cmd := exec.Command("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps)
+	var sb strings.Builder
+	// v1.2.4: write to the Public/All Users desktop (CommonDesktopDirectory)
+	// instead of the current user's desktop. Wizard runs as admin, so
+	// pre-v1.2.4 the shortcuts landed on admin's desktop and a separate
+	// non-admin kiosk user never saw them. Public desktop is rendered on
+	// every user's desktop, so the shortcuts appear regardless of which
+	// account is logged in.
+	sb.WriteString(`$ws = New-Object -ComObject WScript.Shell
+$desktop = [Environment]::GetFolderPath('CommonDesktopDirectory')
+if (-not $desktop) { $desktop = [Environment]::GetFolderPath('Desktop') }
+`)
+	for _, sc := range shortcutSpecs() {
+		lnkNameQ := strings.ReplaceAll(sc.lnkName, `'`, `''`)
+		descQ := strings.ReplaceAll(sc.description, `'`, `''`)
+		fmt.Fprintf(&sb, `
+$lnk = $ws.CreateShortcut((Join-Path $desktop '%s.lnk'))
+$lnk.TargetPath = '%s'
+$lnk.Arguments = '/Run /TN %s'
+$lnk.WorkingDirectory = ''
+$lnk.IconLocation = ('%s' + ',0')
+$lnk.Description = '%s'
+$lnk.WindowStyle = 7
+$lnk.Save()
+`, lnkNameQ, stPathQ, sc.taskName, iconQ, descQ)
+	}
+
+	cmd := exec.Command("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", sb.String())
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("shortcut create failed: %v: %s", err, strings.TrimSpace(string(out)))
@@ -1757,6 +1967,11 @@ const firstRunHTML = `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"
       <input type="text" id="url" value="" />
       <p class="help">Pre-filled with the most recent value. Anything you can open in a browser works.</p>
     </div>
+    <div class="field">
+      <label for="zoom">Default page zoom (%)</label>
+      <input type="number" id="zoom" min="50" max="200" step="5" value="100" />
+      <p class="help">Below 100 zooms out, above 100 zooms in. 90 is a common pick for fitting more on screen.</p>
+    </div>
 
     <div class="error" id="error"></div>
 
@@ -1769,6 +1984,7 @@ const firstRunHTML = `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"
 
 <script>
   document.getElementById('url').value = window.__defaultURL || 'https://skluach.pages.dev/CMH/';
+  document.getElementById('zoom').value = window.__defaultZoom || 100;
   function showErr(msg) {
     var el = document.getElementById('error');
     el.textContent = msg;
@@ -1781,14 +1997,16 @@ const firstRunHTML = `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"
     var pw1 = document.getElementById('pw1').value;
     var pw2 = document.getElementById('pw2').value;
     var url = document.getElementById('url').value.trim();
+    var zoom = parseInt(document.getElementById('zoom').value, 10);
     if (!pw1) { showErr('Password is required.'); return; }
     if (pw1 !== pw2) { showErr('Passwords do not match.'); return; }
     if (!url) { showErr('Kiosk URL is required.'); return; }
+    if (!zoom || zoom < 50 || zoom > 200) { showErr('Zoom must be between 50 and 200.'); return; }
     clearErr();
     var btn = document.getElementById('submit');
     btn.disabled = true;
     btn.textContent = 'Saving…';
-    window.kgSubmit(pw1, url);
+    window.kgSubmit(pw1, url, zoom);
   }
   function cancel() { window.kgCancel(); }
   document.addEventListener('keydown', function(e) {
@@ -1801,6 +2019,7 @@ const firstRunHTML = `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"
 type firstRunInput struct {
 	password string
 	url      string
+	zoom     int // page-zoom percent, 0 = "wizard didn't collect" (zenity fallback)
 	ok       bool
 }
 
@@ -1828,9 +2047,10 @@ func runFirstRunWizard() *firstRunInput {
 	}
 	defer w.Destroy()
 
-	w.Bind("kgSubmit", func(pw, url string) {
+	w.Bind("kgSubmit", func(pw, url string, zoom int) {
 		result.password = pw
 		result.url = strings.TrimSpace(url)
+		result.zoom = clampKioskZoom(zoom)
 		result.ok = true
 		w.Terminate()
 	})
@@ -1838,9 +2058,9 @@ func runFirstRunWizard() *firstRunInput {
 		w.Terminate()
 	})
 
-	// Inject the default URL via a window-level global before the page
-	// runs so the input's value is correct on first paint.
-	w.Init(fmt.Sprintf(`window.__defaultURL = %q;`, loadKioskURL()))
+	// Inject the default URL + zoom via window-level globals before the
+	// page runs so the inputs' values are correct on first paint.
+	w.Init(fmt.Sprintf(`window.__defaultURL = %q; window.__defaultZoom = %d;`, loadKioskURL(), loadKioskZoomPercent()))
 	w.SetHtml(firstRunHTML)
 	// Fullscreen the wizard so it's impossible to miss and DPI-agnostic.
 	// The CSS centers the setup card on whatever screen size we get.
@@ -2062,9 +2282,20 @@ func firstRunWithWizard() bool {
 		_ = zenity.Error("Could not save URL: "+err.Error(), zenity.Title("kiosk-exit-guard"))
 		return false
 	}
+	// v1.2.4: persist the kiosk zoom captured by the first-run wizard.
+	// Zero means "the wizard didn't collect a zoom" (zenity-fallback path
+	// or pre-v1.2.4 form data), in which case we leave the existing
+	// registry value alone — loadKioskZoomPercent will fall back to
+	// defaultKioskZoom on read.
+	if input.zoom > 0 {
+		if err := saveKioskZoomPercent(input.zoom); err != nil {
+			logf("first-run: saveKioskZoomPercent(%d) failed: %v", input.zoom, err)
+		}
+	}
 
 	_ = uninstallChrome()
 	applyBrowserBlocks()
+	_ = installShortcutTasks()
 	_ = createDesktopShortcut()
 
 	// v1.1.4: belt-and-suspenders. v1.1.0 switched to a Service-only
@@ -2186,6 +2417,7 @@ func runWebViewKiosk(url string) {
 	// Lock navigation to the kiosk URL only. Anything else gets canceled
 	// at the JS level (and again at the navigation event in a real
 	// hardened build, but this catches all anchor clicks).
+	zoomPct := loadKioskZoomPercent()
 	w.Init(fmt.Sprintf(`
 		(function() {
 			var kioskPrefix = %q;
@@ -2196,8 +2428,30 @@ func runWebViewKiosk(url string) {
 					e.stopPropagation();
 				}
 			}, true);
+
+			// v1.2.4 kiosk zoom: apply persisted page-zoom percent via the
+			// CSS zoom property on <html>, which is the closest you can
+			// get to "Ctrl +/-" without going through WebView2's
+			// ZoomFactor COM property. Pages get laid out at the scaled
+			// size and scrollbars adjust naturally. Apply both at
+			// DOMContentLoaded (covers the initial paint) and again at
+			// load (covers framework-driven re-renders that overwrite
+			// inline styles on <html>).
+			var kioskZoomPct = %d;
+			function applyZoom() {
+				try {
+					var root = document.documentElement;
+					if (root) { root.style.zoom = (kioskZoomPct / 100); }
+				} catch (e) { /* swallow — kiosk URL might sandbox style */ }
+			}
+			if (document.readyState === 'loading') {
+				document.addEventListener('DOMContentLoaded', applyZoom);
+			} else {
+				applyZoom();
+			}
+			window.addEventListener('load', applyZoom);
 		})();
-	`, url))
+	`, url, zoomPct))
 
 	w.Navigate(url)
 	w.Run() // blocks until window destroyed
@@ -2438,6 +2692,30 @@ func hookCallback(nCode int32, wParam uintptr, lParam uintptr) uintptr {
 		kb := kbdLLHookStructFromLParam(lParam)
 		injected := (kb.Flags & llkhfInject) != 0
 		ourInjection := kb.DwExtraInfo == kioskMarker
+
+		// v1.2.4 carve-out: let the Ctrl+Shift+Alt+K pause hotkey fire even
+		// from injected input (AnyDesk's SendInput-based key forwarding,
+		// AutoHotkey, remote shells). The hook normally ignores injected
+		// events because the kiosk user can't physically inject and we
+		// don't want to second-guess remote admins' typing. But that also
+		// hid the pause hotkey from any tool an admin uses to escape a
+		// fullscreen kiosk window remotely. Scope is exactly one combo —
+		// every other injected key still falls straight through to
+		// procCallNextHookEx unmodified, so AnyDesk typing, paste, etc.
+		// keep working as today. GetAsyncKeyState reflects injected
+		// modifier state, so ctrlDown/shiftDown/altDown observe the
+		// SendInput-set modifiers correctly. ourInjection is excluded so
+		// a re-inject path that ever carried K-with-all-modifiers can't
+		// loop back through this.
+		isKeyDownAny := wParam == wmKeyDown || wParam == wmSysKeyDown
+		if injected && !ourInjection && isKeyDownAny &&
+			kb.VkCode == vkK && ctrlDown() && shiftDown() && altDown() {
+			if !promptOpen.Load() {
+				go promptAndPause()
+			}
+			return 1
+		}
+
 		if !injected && !ourInjection {
 			isKeyDown := wParam == wmKeyDown || wParam == wmSysKeyDown
 			isKeyUp := wParam == wmKeyUp || wParam == wmSysKeyUp
@@ -3323,7 +3601,8 @@ func runUninstallInvocation() {
 		}
 	}
 
-	// 6. Remove desktop shortcuts.
+	// 6. Remove desktop shortcuts + their backing scheduled tasks.
+	uninstallShortcutTasks()
 	removeDesktopShortcuts()
 
 	// v1.1.8 CRITICAL#1 cleanup: if we installed into
@@ -3479,6 +3758,7 @@ func purgeLeftoverState() {
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
 	_ = cmd.Run()
 
+	uninstallShortcutTasks()
 	removeDesktopShortcuts()
 
 	// Wipe HKLM config so the wizard genuinely starts from zero. (We're
@@ -3884,10 +4164,17 @@ func runUpdateInvocation() {
 }
 
 func removeDesktopShortcuts() {
+	// v1.2.4: wipe from both the per-user desktop (where pre-v1.2.4
+	// installs put the .lnks) AND the public/all-users desktop (where
+	// v1.2.4+ installs put them). Either path missing is fine —
+	// Remove-Item with -ErrorAction SilentlyContinue absorbs that.
 	ps := `
-$desktop = [Environment]::GetFolderPath('Desktop')
-foreach ($n in @('Kiosk Exit Guard.lnk','Pause SK Filter.lnk','Resume SK Filter.lnk','Launch Kiosk.lnk','Change Kiosk URL.lnk','Update SK Filter.lnk','Uninstall SK Filter.lnk')) {
-    Remove-Item -Path (Join-Path $desktop $n) -Force -ErrorAction SilentlyContinue
+$lnks = @('Kiosk Exit Guard.lnk','Pause SK Filter.lnk','Resume SK Filter.lnk','Launch Kiosk.lnk','Change Kiosk URL.lnk','Update SK Filter.lnk','Uninstall SK Filter.lnk')
+foreach ($d in @([Environment]::GetFolderPath('CommonDesktopDirectory'), [Environment]::GetFolderPath('Desktop'))) {
+    if (-not $d) { continue }
+    foreach ($n in $lnks) {
+        Remove-Item -Path (Join-Path $d $n) -Force -ErrorAction SilentlyContinue
+    }
 }
 `
 	cmd := exec.Command("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps)
@@ -4473,6 +4760,19 @@ func main() {
 		return
 	}
 
+	// v1.2.4 shortcut-handler entry: the scheduled task registered by
+	// installShortcutTasks fires `kiosk-exit-guard.exe --shortcut-handler
+	// <flag>` running as SYSTEM in session 0 when the user clicks a
+	// desktop shortcut. We look up the active user session and spawn the
+	// flag's normal handler (--pause, --resume, etc.) into that session
+	// via spawnFlagAsUserInSession. Session-0 has no UI, so we exit
+	// immediately; the spawned child surfaces the password modal / kiosk
+	// window / duration picker on the user's desktop.
+	if len(os.Args) > 2 && os.Args[1] == "--shortcut-handler" {
+		runShortcutHandler(os.Args[2])
+		return
+	}
+
 	// --pause: triggered by the "Pause SK Filter" desktop shortcut.
 	if len(os.Args) > 1 && os.Args[1] == "--pause" {
 		runPauseInvocation()
@@ -4744,6 +5044,7 @@ func main() {
 		// race the SCM and stop our own parent during steady-state
 		// operation. The admin's manual / desktop-shortcut launches still
 		// refresh.
+		_ = installShortcutTasks()
 		_ = createDesktopShortcut()
 		if !isLaunchedByService() {
 			// v1.1.4: always refresh BOTH the Service and the scheduled

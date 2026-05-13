@@ -155,7 +155,7 @@
 <div class="wrap">
 
 <header>
-  <h1>kiosk-exit-guard <span class="version-pill">v1.2.3</span></h1>
+  <h1>kiosk-exit-guard <span class="version-pill">v1.2.4</span></h1>
   <p class="tagline">Single-binary kiosk lockdown for <strong>Windows 11 Home</strong> and <strong>Windows Server 2022 (RDP / physical console)</strong>. Embedded WebView2 kiosk, password-gated keyboard, Chrome uninstalled, Edge launches blocked at the OS level, self-installing, self-updating, all from one ~7.9&nbsp;MB exe.</p>
 </header>
 
@@ -195,7 +195,35 @@
   <a href="#build">Build</a>
 </nav>
 
-<h2 id="whats-new">v1.2.3 — service-spawn elevation hotfix</h2>
+<h2 id="whats-new">v1.2.4 — usable admin surface (shortcuts, scheduled tasks, AnyDesk hotkey)</h2>
+
+<div class="callout callout-good">
+  <strong>Desktop shortcuts no longer fire UAC and no longer fail with "Access is denied" for non-admin kiosk users.</strong> v1.2.4 introduces a <em>shortcut &rarr; scheduled task &rarr; spawn-into-session</em> indirection: each .lnk now points at <code>schtasks.exe /Run /TN KioskExitGuard_&lt;Action&gt;</code>, the task runs as <code>NT AUTHORITY\SYSTEM</code> with HighestAvailable, and the task body invokes a new <code>--shortcut-handler &lt;flag&gt;</code> entry that spawns the action's UI into the active user's session via the same elevated-token logic the Service uses. Shortcuts also moved from the per-user desktop to <code>CommonDesktopDirectory</code> so every logged-in user sees them.
+  <ul style="margin: 0.6rem 0 0; padding-left: 1.25rem;">
+    <li><strong>Before.</strong> Each .lnk pointed straight at <code>kiosk-exit-guard.exe --pause</code> (etc.). The exe's <code>requireAdministrator</code> manifest meant every click fired UAC; for non-admin kiosk users the consent prompt couldn't be passed at all, so the operation never reached the HKLM-writing code that needs admin. Shortcuts also landed on the wizard runner's desktop (usually admin), so a separate non-admin kiosk user never saw them in the first place.</li>
+    <li><strong>After.</strong> <code>installShortcutTasks()</code> registers <code>KioskExitGuard_Pause</code> / <code>_Resume</code> / <code>_LaunchKiosk</code> / <code>_Update</code> / <code>_SetURL</code> / <code>_Uninstall</code>. Each task runs as SYSTEM with HighestAvailable, on-demand only. Default DACL on a SYSTEM/HIGHEST task grants <code>BUILTIN\Users</code> Read + Execute, so any logged-in user can <code>/Run</code> it without UAC. The task's action is <code>&lt;canonical-exe&gt; --shortcut-handler &lt;flag&gt;</code>; the handler calls <code>pickActiveUserSession()</code> and <code>spawnFlagAsUserInSession()</code> (the v1.2.4 sibling of <code>spawnControllerInSession</code>) to drop the action's UI on the user's desktop with their token + v1.2.3 elevated-linked-token swap.</li>
+    <li><strong>Shortcut cosmetics.</strong> TargetPath is <code>%SystemRoot%\System32\schtasks.exe</code>; IconLocation stays <code>canonicalInstallPath()</code> so the brand icon is preserved; WindowStyle = 7 (Minimized) hides the brief schtasks console flash on click. <code>createDesktopShortcut()</code> writes to <code>CommonDesktopDirectory</code> with a per-user-desktop fallback for environments where the common dir resolves empty. <code>removeDesktopShortcuts()</code> wipes both locations so an upgrade from a pre-v1.2.4 install doesn't leave orphan .lnks on the admin's personal desktop.</li>
+    <li><strong>Uninstall.</strong> <code>uninstallShortcutTasks()</code> deletes every <code>KioskExitGuard_*</code> task via <code>schtasks /Delete /F</code>; missing-task errors are swallowed so an upgrade from <code>&lt;v1.2.4</code> (which never registered any tasks) doesn't fail uninstall.</li>
+    <li><strong>Known limitation: true non-admin users.</strong> When <code>spawnFlagAsUserInSession</code> runs against a user whose primary token has no elevated linked counterpart (a real Standard User, not a split-token admin), <code>CreateProcessAsUser</code> against the <code>requireAdministrator</code> exe still returns <code>ERROR_ELEVATION_REQUIRED</code>. Same failure mode the v1.2.3 <code>spawnControllerInSession</code> path has for that case. Fully supporting non-admin kiosk users requires a follow-up — either flip the manifest to <code>asInvoker</code> and move privileged ops into a SYSTEM-side dispatcher, or run the action body inside the SYSTEM task instead of spawning into the user session. Tracked as future work.</li>
+  </ul>
+</div>
+
+<div class="callout callout-good">
+  <strong>Kiosk page now has a configurable default zoom (50–200%, persisted in HKLM).</strong> The first-run wizard grew a <code>Default page zoom (%)</code> field next to the URL input, and the "Change Kiosk URL" shortcut now also prompts for a zoom percent. <code>runWebViewKiosk</code> reads the persisted value and injects an IIFE inside the existing <code>w.Init</code> block that sets <code>document.documentElement.style.zoom = pct / 100</code> on both <code>DOMContentLoaded</code> and <code>load</code> — covering the initial paint and any SPA re-render that overwrites inline styles on <code>&lt;html&gt;</code>. Default is 100%; existing installs without the registry key behave exactly as before. Setting 90 once persists across kiosk respawns, pause/resume cycles, and auto-updates.
+</div>
+
+<div class="callout callout-good">
+  <strong>Ctrl+Shift+Alt+K now triggers the password modal even when the keystroke is forwarded by AnyDesk, AutoHotkey, or any other <code>SendInput</code>-based remote tool.</strong> Before v1.2.4 the LL keyboard hook ignored all injected events wholesale, so an admin remoting into a fullscreen kiosk via AnyDesk had no way to reach the pause flow without physical keyboard access. v1.2.4 carves out exactly one combo from the ignore-injected rule. Every other injected event still falls straight through unmodified — AnyDesk typing, paste, mouse macros, etc. keep working as before.
+  <ul style="margin: 0.6rem 0 0; padding-left: 1.25rem;">
+    <li><strong>Scope is one combo.</strong> Only <code>vkK</code> with Ctrl + Shift + Alt held matches the new injected-path branch. Injected Win, injected Win+R, injected Ctrl+Esc, injected typing — all unchanged from v1.2.3.</li>
+    <li><strong>Modifier state is correct.</strong> <code>ctrlDown</code> / <code>shiftDown</code> / <code>altDown</code> wrap <code>GetAsyncKeyState</code>, which Windows updates regardless of whether the modifier-down event was injected. AnyDesk's <code>SendInput(Ctrl-down, Shift-down, Alt-down, K-down)</code> chain leaves the async state reflecting all three modifiers by the time the K event arrives at the hook, so the combo is detected reliably.</li>
+    <li><strong><code>ourInjection</code> excluded.</strong> A re-inject path that ever carries the same combo can't loop through this branch.</li>
+    <li><strong><code>promptOpen.Load()</code> gate.</strong> Matches the existing physical-keyboard path so an AnyDesk admin who mashes the hotkey while the modal is already open doesn't spawn a second one.</li>
+    <li><strong>Local physical keyboard unchanged.</strong> Those keystrokes were never injected, so the existing <code>!injected &amp;&amp; !ourInjection</code> branch already handles them. v1.2.4 is purely additive — a remote admin path that didn't exist before, with no behavioral change for any other input source.</li>
+  </ul>
+</div>
+
+<h2 id="v123">v1.2.3 — service-spawn elevation hotfix</h2>
 
 <div class="callout callout-good">
   <strong>Companion hotfix to v1.2.2.</strong> With the WebView2 data-directory ACL fixed, the next layer of the Win 11 breakage surfaced: the Windows Service spun in a 2-second respawn loop, logging <code>service: spawnControllerInSession(1) failed: CreateProcessAsUser: The requested operation requires elevation.</code> every tick. No controller meant no kiosk window, no keyboard hook, and no filter enforcement. v1.2.3 makes the spawn succeed by handing <code>CreateProcessAsUser</code> the user's elevated linked token instead of the filtered one.
