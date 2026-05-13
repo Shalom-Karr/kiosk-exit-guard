@@ -737,6 +737,24 @@ func (s *kioskExitGuardService) spawnControllerInSession(sessionID uint32) (wind
 		}
 		userToken = fallback
 		logf("service: WTSQueryUserToken failed (%v); user-session-process fallback found <%s> in session %d", wtsErr, candidateName, sessionID)
+	} else {
+		// v1.2.3 elevation fix: WTSQueryUserToken hands back the *filtered*
+		// (UAC-limited) primary token for a split-token administrator.
+		// app.manifest declares requireAdministrator, so CreateProcessAsUser
+		// against the filtered token fails with ERROR_ELEVATION_REQUIRED
+		// ("The requested operation requires elevation.") in an infinite
+		// 2 s respawn loop. Swap to the elevated linked counterpart — the
+		// same swap tokenFromUserSessionProcess already does for the
+		// fallback path. elevatedLinkedToken returns (0, nil) when the
+		// token isn't split (UAC off, built-in admin, or already full), in
+		// which case we keep the original token as-is.
+		if elevated, eErr := elevatedLinkedToken(userToken); eErr == nil && elevated != 0 {
+			_ = userToken.Close()
+			userToken = elevated
+			logf("service: swapped WTSQueryUserToken's filtered token for its elevated linked counterpart")
+		} else if eErr != nil {
+			logf("service: elevatedLinkedToken on WTS token failed (%v); proceeding with filtered token", eErr)
+		}
 	}
 	defer userToken.Close()
 

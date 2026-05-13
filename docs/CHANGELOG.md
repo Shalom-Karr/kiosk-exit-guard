@@ -5,6 +5,80 @@ All notable changes to kiosk-exit-guard, newest first. Versions follow [Semantic
 For the current state of the project, see the [landing page](https://shalom-karr.github.io/kiosk-exit-guard/), the [architecture doc](architecture.md), and the [admin runbook](admin-runbook.md).
 
 
+## v1.2.3 — 2026-05-12
+
+Companion hotfix to v1.2.2. With the WebView2 data-directory ACL fixed,
+the next layer of the v1.1.8+ Win 11 breakage surfaced: the Windows
+Service spun in a 2-second respawn loop, logging
+
+```
+service: spawnControllerInSession(1) failed: CreateProcessAsUser:
+  The requested operation requires elevation.
+```
+
+every tick — meaning no controller, no kiosk window, no keyboard hook,
+no filter enforcement. v1.2.3 makes the spawn succeed by handing
+CreateProcessAsUser the user's elevated linked token instead of the
+filtered one.
+
+### Cause
+
+`spawnControllerInSession` (service_windows.go:717) gets the target
+session's user token via `WTSQueryUserToken`, then duplicates it and
+calls `CreateProcessAsUserW`. On Win 11 Home with a split-token
+administrator (UAC enabled), `WTSQueryUserToken` returns the
+**filtered** (limited) primary token — the one Explorer.exe runs
+under. `app.manifest` declares
+
+```xml
+<requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
+```
+
+so Windows refuses to launch kiosk-exit-guard.exe under a non-elevated
+token and `CreateProcessAsUser` fails with **ERROR_ELEVATION_REQUIRED
+(740)**. The Service's supervisor goroutine retries every 2 s,
+producing the loop seen in field logs.
+
+The fallback path (`tokenFromUserSessionProcess`, used only when
+`WTSQueryUserToken` *itself* errors — Win 11 Home / ERROR_NO_TOKEN
+edge case) already calls `elevatedLinkedToken` at line 960 to swap
+the filtered token for its elevated linked counterpart. The primary
+path didn't, so any install where `WTSQueryUserToken` succeeded but
+returned a filtered token would deadlock on launch.
+
+### Fix
+
+After a successful `WTSQueryUserToken` call, run the same swap the
+fallback path uses:
+
+```go
+if elevated, eErr := elevatedLinkedToken(userToken); eErr == nil && elevated != 0 {
+    _ = userToken.Close()
+    userToken = elevated
+    logf("service: swapped WTSQueryUserToken's filtered token for its elevated linked counterpart")
+}
+```
+
+`elevatedLinkedToken` returns `(0, nil)` when the token isn't split
+(UAC off, built-in administrator, already full elevation), in which
+case the original token is kept as-is — so non-split-token boxes are
+unaffected. Errors from `GetTokenInformation` are logged and the
+filtered token is used as a best-effort fallback (won't help on
+require-admin manifests, but avoids regressing the rare case where
+`TokenLinkedToken` fails on a token that's actually already elevated).
+
+### Diagnostics
+
+Every controller spawn now logs one of:
+
+- `service: swapped WTSQueryUserToken's filtered token for its elevated linked counterpart` — split-token admin path, the v1.2.3 fix kicked in
+- `service: elevatedLinkedToken on WTS token failed (%v); proceeding with filtered token` — GetTokenInformation error, rare
+- (no message) — token was already non-split (built-in admin / UAC off / linked-token elevation), no swap needed
+- `service: WTSQueryUserToken failed (%v); user-session-process fallback found <%s> in session %d` — pre-v1.2.3 fallback path, unchanged
+
+so a field log makes it obvious which spawn path each install is on.
+
+
 ## v1.2.2 — 2026-05-12
 
 Hotfix for a v1.1.8 regression: on Windows 11, the controller's WebView2

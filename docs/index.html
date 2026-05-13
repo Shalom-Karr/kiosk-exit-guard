@@ -155,7 +155,7 @@
 <div class="wrap">
 
 <header>
-  <h1>kiosk-exit-guard <span class="version-pill">v1.2.2</span></h1>
+  <h1>kiosk-exit-guard <span class="version-pill">v1.2.3</span></h1>
   <p class="tagline">Single-binary kiosk lockdown for <strong>Windows 11 Home</strong> and <strong>Windows Server 2022 (RDP / physical console)</strong>. Embedded WebView2 kiosk, password-gated keyboard, Chrome uninstalled, Edge launches blocked at the OS level, self-installing, self-updating, all from one ~7.9&nbsp;MB exe.</p>
 </header>
 
@@ -195,7 +195,18 @@
   <a href="#build">Build</a>
 </nav>
 
-<h2 id="whats-new">v1.2.2 — WebView2 data-directory hotfix</h2>
+<h2 id="whats-new">v1.2.3 — service-spawn elevation hotfix</h2>
+
+<div class="callout callout-good">
+  <strong>Companion hotfix to v1.2.2.</strong> With the WebView2 data-directory ACL fixed, the next layer of the Win 11 breakage surfaced: the Windows Service spun in a 2-second respawn loop, logging <code>service: spawnControllerInSession(1) failed: CreateProcessAsUser: The requested operation requires elevation.</code> every tick. No controller meant no kiosk window, no keyboard hook, and no filter enforcement. v1.2.3 makes the spawn succeed by handing <code>CreateProcessAsUser</code> the user's elevated linked token instead of the filtered one.
+  <ul style="margin: 0.6rem 0 0; padding-left: 1.25rem;">
+    <li><strong>Cause.</strong> <code>spawnControllerInSession</code> gets the target session's user token via <code>WTSQueryUserToken</code>, then calls <code>CreateProcessAsUserW</code>. On a split-token administrator (UAC enabled — i.e. every default Win 11 Home install), <code>WTSQueryUserToken</code> returns the <strong>filtered</strong> primary token — the one Explorer.exe runs under. <code>app.manifest</code> declares <code>requireAdministrator</code>, so Windows refuses to launch <code>kiosk-exit-guard.exe</code> under a non-elevated token and <code>CreateProcessAsUser</code> fails with <code>ERROR_ELEVATION_REQUIRED (740)</code>. The supervisor retries every 2 s, producing the loop.</li>
+    <li><strong>Fix.</strong> After a successful <code>WTSQueryUserToken</code>, run the same elevated-linked-token swap the fallback path (<code>tokenFromUserSessionProcess</code>, used only when <code>WTSQueryUserToken</code> itself errors) already used at <code>service_windows.go:960</code>. <code>elevatedLinkedToken</code> returns <code>(0, nil)</code> when the token isn't split (UAC off, built-in administrator, already full) — non-split-token boxes are unaffected.</li>
+    <li><strong>New log lines.</strong> Every controller spawn now logs one of: <code>service: swapped WTSQueryUserToken's filtered token for its elevated linked counterpart</code> (the v1.2.3 fix kicked in) / <code>service: elevatedLinkedToken on WTS token failed (...); proceeding with filtered token</code> (rare GetTokenInformation error) / silence (token was already non-split) / the existing fallback-path message. A field <code>kiosk-exit-guard.log</code> now makes it obvious which spawn path each install is on.</li>
+  </ul>
+</div>
+
+<h2 id="v122">v1.2.2 — WebView2 data-directory hotfix</h2>
 
 <div class="callout callout-good">
   <strong>Fixes a v1.1.8 regression that broke every fresh install on Windows 11 where the kiosk account wasn't an Administrator.</strong> On launch — first-run wizard, kiosk page, password modal, toast, or the v1.2.1 auto-update notify — WebView2 popped <em>"Microsoft Edge can't read and write to its data directory: C:\ProgramData\KioskExitGuard\WebView2\EBWebView — We couldn't create the data directory."</em> v1.2.2 restores access in one line of ACL.
