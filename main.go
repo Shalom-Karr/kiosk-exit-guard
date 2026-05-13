@@ -2477,7 +2477,7 @@ func runWebViewKiosk(url string) {
 			// any kiosk page that ran its own document.body.style.zoom
 			// fallback — net rendered scale became (admin × page) e.g.
 			// 0.9 × 0.9 = 0.81. Targeting <body> means a page-side
-			// `body.style.zoom = '0.9'` and our `body.style.zoom = '0.9'`
+			// body.style.zoom = "0.9" and our body.style.zoom = "0.9"
 			// land on the same property, so the zoom level doesn't
 			// compound and a page-side idempotence check sees our value
 			// correctly on SPA re-renders.
