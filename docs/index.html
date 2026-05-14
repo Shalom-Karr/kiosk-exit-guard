@@ -155,7 +155,7 @@
 <div class="wrap">
 
 <header>
-  <h1>kiosk-exit-guard <span class="version-pill">v1.2.8</span></h1>
+  <h1>kiosk-exit-guard <span class="version-pill">v1.2.9</span></h1>
   <p class="tagline">Single-binary kiosk lockdown for <strong>Windows 11 Home</strong> and <strong>Windows Server 2022 (RDP / physical console)</strong>. Embedded WebView2 kiosk, password-gated keyboard, Chrome uninstalled, Edge launches blocked at the OS level, self-installing, self-updating, all from one ~7.9&nbsp;MB exe.</p>
 </header>
 
@@ -195,7 +195,20 @@
   <a href="#build">Build</a>
 </nav>
 
-<h2 id="whats-new">v1.2.8 — admin hotkeys, AnyDesk reliability, top-aligned password modal</h2>
+<h2 id="whats-new">v1.2.9 — WebView2 URL form, log rotation, versioned shortcuts, double-right-click pause</h2>
+
+<div class="callout callout-good">
+  <strong>Cleans up the v1.2.8 queue: WebView2 form for the URL change flow, six-hour log rotation, versioned shortcut filenames, and a new LL mouse hook for double-right-click pause.</strong>
+  <ul style="margin: 0.6rem 0 0; padding-left: 1.25rem;">
+    <li><strong>WebView2 URL/zoom form.</strong> <code>runSetURLAndZoomDialog</code> replaces the two zenity.Entry prompts the <code>--set-url</code> flow chained. Native Win32 dialogs can't be programmatically top-aligned; the new WebView2 form is fixed at <code>.wrap { align-items: flex-start; padding-top: 4vh }</code> so AnyDesk admins can reach the inputs even when the AnyDesk overlay covers the middle of the viewport. Matches the password-modal color scheme. Fall-back to the legacy zenity prompt if <code>webview2.NewWithOptions</code> returns nil.</li>
+    <li><strong>Six-hour log rotation.</strong> Logs now live in <code>&lt;install&gt;/logs/kiosk-exit-guard-YYYY-MM-DD-HH.log</code> where HH ∈ {00, 06, 12, 18} — four files per day. <code>logf</code> rotates on every write when the bucket label crosses. <code>--- rolled into new bucket v%s pid=%d ---</code> banner lands in each new file so it's self-describing. <code>cleanupInstallDir</code>'s allowed-subdirs list now includes <code>logs</code>.</li>
+    <li><strong>Version-suffixed shortcut filenames.</strong> Each <code>.lnk</code> is now named <code>&lt;action&gt; v&lt;version&gt;.lnk</code> — e.g. <code>Pause SK Filter v1.2.9.lnk</code>. Cleanup paths (<code>removeStalePerUserShortcuts</code>, <code>removeDesktopShortcuts</code>) use two glob patterns per action — <code>&lt;action&gt;.lnk</code> legacy + <code>&lt;action&gt; v*.lnk</code> versioned — so an upgrade reliably scrubs old-version files.</li>
+    <li><strong>Double-right-click → pause.</strong> New <code>mouseCallback</code> installed via <code>SetWindowsHookExW(WH_MOUSE_LL, …)</code> alongside the keyboard hook. Watches WM_RBUTTONDOWN; on a second right-button-down within 500 ms and ≤30 screen pixels of the previous one, fires <code>promptAndPause</code> — the same flow Ctrl+Shift+Alt+K triggers. Events pass through unmodified (right-clicks aren't swallowed); the prompt opens on top. Honors both <code>LLMHF_INJECTED (0x01)</code> and <code>LLMHF_LOWER_IL_INJECTED (0x02)</code>, so AnyDesk-forwarded right-clicks trigger the prompt the same way local hardware clicks do.</li>
+    <li><strong>Hook install failure is non-fatal.</strong> A <code>WARN: SetWindowsHookEx (mouse LL) failed: %v</code> line lands in the log and the keyboard hook (primary enforcement) continues running.</li>
+  </ul>
+</div>
+
+<h2 id="v128">v1.2.8 — admin hotkeys, AnyDesk reliability, top-aligned password modal</h2>
 
 <div class="callout callout-good">
   <strong>Two new admin hotkeys + AnyDesk Ctrl+Shift+Alt+K actually works now + the password modal can render at the top of the screen for AnyDesk-driven URL changes.</strong>

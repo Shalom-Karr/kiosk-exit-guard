@@ -5,6 +5,76 @@ All notable changes to kiosk-exit-guard, newest first. Versions follow [Semantic
 For the current state of the project, see the [landing page](https://shalom-karr.github.io/kiosk-exit-guard/), the [architecture doc](architecture.md), and the [admin runbook](admin-runbook.md).
 
 
+## v1.2.9 — 2026-05-13
+
+Bundles the four queued items from v1.2.8: WebView2 URL/zoom form,
+six-hour log rotation in a `logs/` subdirectory, version-suffixed
+desktop shortcut filenames, and double-right-click → pause via a new
+LL mouse hook.
+
+### WebView2 URL/zoom form replaces the zenity entries
+
+`--set-url` previously chained two `zenity.Entry` dialogs (one for
+URL, one for zoom). Native Windows dialogs center themselves on the
+screen with no programmatic positioning, so an AnyDesk admin whose
+session bar overlapped the middle of the viewport couldn't reliably
+reach the input. v1.2.9 replaces both with `runSetURLAndZoomDialog` —
+a single branded WebView2 form matching the password modal's color
+scheme, with URL + zoom inputs, validation messages, and a fixed
+top-aligned layout (`.wrap { align-items: flex-start; padding-top:
+4vh }`). Fall-back path: if `webview2.NewWithOptions` returns nil
+(WebView2 runtime broken), we drop to the legacy zenity prompt so
+admins on stripped-down boxes still have a path to change the URL.
+
+### Six-hour log rotation in `<install>/logs/`
+
+`initLogging` no longer writes to a single growing
+`kiosk-exit-guard.log` next to the exe. Instead it creates a `logs/`
+subdirectory and writes per-bucket files named
+`kiosk-exit-guard-YYYY-MM-DD-HH.log` where HH ∈ {00, 06, 12, 18} —
+four files per day. `logf` checks the bucket label against the
+currently-open file on every write and rolls over when the boundary
+crosses. The previous "5 MB → .log.old" size-based rotation handed
+back a single coarse blob; v1.2.9's time buckets let an admin
+investigating a field report jump straight to the relevant slice.
+
+New log lines on rollover: `--- rolled into new bucket v%s pid=%d ---`
+so each bucket file is self-describing for the reader.
+
+`cleanupInstallDir`'s allowed-subdirs list grew `logs` so uninstall
+can wipe the rotated files alongside the staging directory.
+
+### Version-suffixed desktop shortcut filenames
+
+Each `.lnk` createDesktopShortcut writes is now named
+`<action> v<version>.lnk` — e.g. `Pause SK Filter v1.2.9.lnk`,
+`Update SK Filter v1.2.9.lnk`. A glance at the desktop tells you the
+installed version. `removeStalePerUserShortcuts` and
+`removeDesktopShortcuts` switched from a fixed seven-name list to two
+glob patterns per action (`<action>.lnk` legacy + `<action> v*.lnk`
+versioned) so an upgrade cleans up old-version files alongside the
+pre-v1.2.9 unversioned ones. `Remove-Item -ErrorAction SilentlyContinue`
+absorbs missing-file cases.
+
+### Double-right-click pauses the filter (LL mouse hook)
+
+New `mouseCallback` installed via `SetWindowsHookExW(WH_MOUSE_LL, …)`
+alongside the keyboard hook. Watches WM_RBUTTONDOWN events and on a
+second right-button-down within 500 ms and ≤30 screen pixels of the
+previous one, fires `promptAndPause` — the same flow Ctrl+Shift+Alt+K
+triggers. Events pass through unmodified (we don't swallow
+right-clicks); the prompt opens on top.
+
+Honors both `LLMHF_INJECTED (0x01)` and `LLMHF_LOWER_IL_INJECTED
+(0x02)`, so AnyDesk-forwarded right-clicks trigger the prompt the
+same way local hardware clicks do — the deliberate mouse-side admin
+escape hatch matching the keyboard side's K hotkey carve-out.
+
+Hook install failure is non-fatal: a `WARN: SetWindowsHookEx (mouse
+LL) failed: %v` line lands in the log and the keyboard hook (the
+primary enforcement path) continues running.
+
+
 ## v1.2.8 — 2026-05-13
 
 Admin hotkeys + AnyDesk reliability + top-aligned password modal for

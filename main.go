@@ -62,7 +62,7 @@ import (
 
 // currentVersion must be kept in sync with versioninfo.json. Used by the
 // --update flow to compare against the latest GitHub release tag.
-const currentVersion = "1.2.8"
+const currentVersion = "1.2.9"
 
 // Auto-update background-check timing. v1.2.1: the controller polls
 // GitHub's /releases/latest on startup (after autoUpdateInitialDelay so
@@ -86,36 +86,101 @@ const globalAutoUpdateNotifyMutexName = `Global\KioskExitGuardAutoUpdateNotify`
 // ---------- logging ----------
 
 const (
-	logFileName    = "kiosk-exit-guard.log"
-	logRotateBytes = 5 * 1024 * 1024 // 5 MB
+	logFileName    = "kiosk-exit-guard.log" // legacy single-file path (pre-v1.2.9)
+	logDirName     = "logs"                 // v1.2.9: subdirectory under <install-dir>
+	logRotateHours = 6                      // v1.2.9: new file every N hours → 4 files/day
 )
 
 var (
-	logFile *os.File
-	logMu   sync.Mutex
+	logFile        *os.File
+	logFileBucket  string // current bucket label, e.g. "2026-05-13-12"; empty if file is the legacy single-file path
+	logMu          sync.Mutex
 )
 
-// initLogging opens kiosk-exit-guard.log next to the exe for append.
-// Best-effort — if the open fails (read-only directory, permissions),
-// logging silently no-ops and the rest of the controller keeps working.
+// logBucketLabel returns the rotation-bucket label for time t — date plus
+// the start of the current logRotateHours-wide bucket. Example with
+// logRotateHours=6: 2026-05-13T13:42:09 → "2026-05-13-12" (the 12:00–17:59
+// bucket). Four buckets per day: 00, 06, 12, 18.
+func logBucketLabel(t time.Time) string {
+	bucketHour := (t.Hour() / logRotateHours) * logRotateHours
+	return fmt.Sprintf("%04d-%02d-%02d-%02d",
+		t.Year(), int(t.Month()), t.Day(), bucketHour)
+}
+
+// logPathForBucket returns the full path of the log file for the given
+// bucket label, inside <install-dir>/logs/.
+func logPathForBucket(bucket string) (string, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(filepath.Dir(exe), logDirName,
+		fmt.Sprintf("kiosk-exit-guard-%s.log", bucket)), nil
+}
+
+// initLogging opens the current-bucket log file under <install-dir>/logs/
+// for append. Best-effort — if the open fails (read-only directory,
+// permissions), logging silently no-ops and the rest of the controller
+// keeps working.
+//
+// v1.2.9 changed the layout from a single growing kiosk-exit-guard.log
+// to one file per 6-hour bucket inside a logs/ subdirectory, named
+// kiosk-exit-guard-YYYY-MM-DD-HH.log with HH ∈ {00, 06, 12, 18}.
+// Rationale: four files per day means an admin investigating a field
+// report can find the relevant slice in seconds instead of scrolling
+// through a 5 MB combined log. Size-based rotation (the pre-v1.2.9
+// behavior) handed back a single .old file that was almost always too
+// coarse — half a day of logs at once.
 func initLogging() {
-	p, err := nextToExe(logFileName)
+	now := time.Now()
+	bucket := logBucketLabel(now)
+	p, err := logPathForBucket(bucket)
 	if err != nil {
 		return
 	}
-	// Naive size-based rotation: if the existing file is over the
-	// rotate threshold, rename to .old (overwriting any previous .old)
-	// and start a fresh file.
-	if fi, err := os.Stat(p); err == nil && fi.Size() > logRotateBytes {
-		_ = os.Remove(p + ".old")
-		_ = os.Rename(p, p+".old")
-	}
+	// Ensure the logs/ directory exists. MkdirAll absorbs "already exists"
+	// so this is safe to call on every startup.
+	_ = os.MkdirAll(filepath.Dir(p), 0o700)
 	f, err := os.OpenFile(p, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return
 	}
 	logFile = f
+	logFileBucket = bucket
 	logf("--- start v%s pid=%d args=%v ---", currentVersion, os.Getpid(), os.Args[1:])
+}
+
+// rotateLogIfBucketChangedLocked checks whether time t falls into a
+// different bucket than the currently-open log file and rotates if so.
+// MUST be called with logMu held. Best-effort — on any error the
+// existing logFile is left in place and the next call retries.
+func rotateLogIfBucketChangedLocked(t time.Time) {
+	if logFile == nil {
+		return
+	}
+	bucket := logBucketLabel(t)
+	if bucket == logFileBucket {
+		return
+	}
+	p, err := logPathForBucket(bucket)
+	if err != nil {
+		return
+	}
+	_ = os.MkdirAll(filepath.Dir(p), 0o700)
+	f, err := os.OpenFile(p, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
+	prev := logFile
+	logFile = f
+	logFileBucket = bucket
+	// Note in the new file which version+pid is continuing, mirroring
+	// the initLogging start-banner so a reader of any single bucket
+	// file knows what process they're looking at.
+	line := fmt.Sprintf("[%s] --- rolled into new bucket v%s pid=%d ---\n",
+		t.Format("2006-01-02 15:04:05.000"), currentVersion, os.Getpid())
+	_, _ = logFile.WriteString(line)
+	_ = prev.Close()
 }
 
 func logf(format string, args ...interface{}) {
@@ -124,8 +189,13 @@ func logf(format string, args ...interface{}) {
 	}
 	logMu.Lock()
 	defer logMu.Unlock()
+	now := time.Now()
+	rotateLogIfBucketChangedLocked(now)
+	if logFile == nil {
+		return
+	}
 	line := fmt.Sprintf("[%s] %s\n",
-		time.Now().Format("2006-01-02 15:04:05.000"),
+		now.Format("2006-01-02 15:04:05.000"),
 		fmt.Sprintf(format, args...))
 	_, _ = logFile.WriteString(line)
 }
@@ -244,6 +314,21 @@ func forceForeground(hwnd uintptr) {
 
 const (
 	whKeyboardLL = 13
+	whMouseLL    = 14 // v1.2.9 mouse hook for double-right-click pause trigger
+
+	// Mouse window messages we care about. WM_RBUTTONDOWN is sent for a
+	// right-button press; the LL mouse hook receives it via wParam.
+	wmRButtonDown = 0x0204
+
+	// Low-level mouse hook flags. LLMHF_INJECTED + LLMHF_LOWER_IL_INJECTED
+	// mirror the keyboard hook's LLKHF_INJECTED / LLKHF_LOWER_IL_INJECTED:
+	// AnyDesk-forwarded mouse events arrive with the latter bit when
+	// AnyDesk's helper runs at lower IL than the kiosk-exit-guard hook
+	// host. v1.2.9 accepts both for the double-right-click pause trigger
+	// so an AnyDesk admin can drive the prompt from a remote session.
+	llmhfInject         = 0x01
+	llmhfLowerIlInject  = 0x02
+	llmhfMouseAnyInject = llmhfInject | llmhfLowerIlInject
 	wmKeyDown    = 0x0100
 	wmKeyUp      = 0x0101
 	wmSysKeyDown = 0x0104
@@ -369,6 +454,19 @@ var hwndTopmost = ^uintptr(0) // (HWND)-1
 type kbdLLHookStruct struct {
 	VkCode      uint32
 	ScanCode    uint32
+	Flags       uint32
+	Time        uint32
+	DwExtraInfo uintptr
+}
+
+// msllHookStruct mirrors MSLLHOOKSTRUCT (the LL mouse hook event
+// struct). Pt is the screen-space mouse coordinates in physical pixels
+// for DPI-aware apps. MouseData carries wheel/X-button info we don't
+// use. Flags has LLMHF_INJECTED / LLMHF_LOWER_IL_INJECTED.
+// v1.2.9 — installed for the double-right-click pause trigger.
+type msllHookStruct struct {
+	Pt          struct{ X, Y int32 }
+	MouseData   uint32
 	Flags       uint32
 	Time        uint32
 	DwExtraInfo uintptr
@@ -888,6 +986,203 @@ func promptForKioskZoom() (int, error) {
 		return 0, err
 	}
 	return zoom, nil
+}
+
+// setURLHTML is the v1.2.9 branded WebView2 dialog that collects the
+// kiosk URL + page-zoom percent. Replaces the back-to-back zenity.Entry
+// prompts the --set-url flow used before, which could not be
+// programmatically top-aligned for AnyDesk reachability. Layout matches
+// the password modal (same color scheme + card geometry) and is
+// permanently top-aligned via `.wrap { align-items: flex-start }`.
+//
+// Pre-fill values arrive via window.__defaultURL / __defaultZoom set in
+// w.Init before SetHtml runs. Submit returns the (url, zoom) tuple via
+// the kgSubmit JS binding; Cancel via kgCancel.
+const setURLHTML = `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<style>
+  *,*::before,*::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0;
+    background: radial-gradient(ellipse at top left, #1e293b, #0b1220 70%);
+    color: #f1f5f9; font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
+    min-height: 100vh; -webkit-font-smoothing: antialiased; }
+  .wrap { min-height: 100vh; display: flex; align-items: flex-start; justify-content: center; padding: 4vh 1.25rem 1.25rem; overflow-y: auto; }
+  .card { background: linear-gradient(180deg, rgba(35, 47, 72, 0.95), rgba(26, 36, 56, 0.95));
+    border: 1px solid rgba(148, 163, 184, 0.22); border-radius: 16px;
+    padding: 2rem 2.25rem; width: 100%; max-width: 560px;
+    box-shadow: 0 30px 70px rgba(0,0,0,0.6); backdrop-filter: blur(8px); }
+  .header { display: flex; align-items: center; gap: 0.9rem; margin: 0 0 1.5rem; }
+  .icon { width: 48px; height: 48px; border-radius: 12px;
+    background: linear-gradient(135deg, rgba(56, 189, 248, 0.18), rgba(56, 189, 248, 0.06));
+    border: 1px solid rgba(56, 189, 248, 0.32); display: flex; align-items: center;
+    justify-content: center; flex-shrink: 0; }
+  .icon svg { width: 22px; height: 22px; color: #38bdf8; }
+  .brand { color: #38bdf8; font-size: 0.7rem; font-weight: 700;
+    letter-spacing: 0.12em; text-transform: uppercase; margin: 0; }
+  h1 { font-size: 1.25rem; margin: 0.15rem 0 0; letter-spacing: -0.015em;
+    line-height: 1.25; font-weight: 700; }
+  .subtitle { color: #cbd5e1; font-size: 0.92rem; margin: 0 0 1.25rem;
+    line-height: 1.5; }
+  .field { margin-bottom: 1.1rem; }
+  label { display: block; font-size: 0.72rem; color: #94a3b8;
+    margin-bottom: 0.4rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.08em; }
+  input { width: 100%; padding: 0.85rem 1.05rem; border-radius: 9px;
+    border: 1px solid rgba(148, 163, 184, 0.3); background: rgba(11, 18, 32, 0.7);
+    color: #f1f5f9; font-size: 1rem; font-family: inherit;
+    transition: border-color 0.15s, box-shadow 0.15s; }
+  input:focus { outline: none; border-color: #38bdf8;
+    box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.2); }
+  .help { color: #64748b; font-size: 0.8rem; margin: 0.35rem 0 0; }
+  .err { color: #fca5a5; font-size: 0.85rem; margin: 0.65rem 0 0;
+    background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.32);
+    padding: 0.55rem 0.8rem; border-radius: 7px; display: none; }
+  .err.show { display: block; }
+  .actions { display: flex; gap: 0.6rem; justify-content: flex-end; margin-top: 1.4rem; }
+  button { padding: 0.7rem 1.5rem; border-radius: 8px; border: 0; cursor: pointer;
+    font-weight: 700; font-size: 0.92rem; font-family: inherit;
+    transition: background 0.15s, transform 0.05s; }
+  button:active { transform: translateY(1px); }
+  .btn-primary { background: #38bdf8; color: #0b1220; }
+  .btn-primary:hover { background: #7dd3fc; }
+  .btn-secondary { background: transparent; color: #94a3b8;
+    border: 1px solid rgba(148, 163, 184, 0.3); }
+  .btn-secondary:hover { color: #f1f5f9; border-color: rgba(148, 163, 184, 0.55); }
+</style></head>
+<body>
+<div class="wrap"><div class="card">
+  <div class="header">
+    <div class="icon" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
+        <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.72-1.71"/>
+      </svg>
+    </div>
+    <div>
+      <p class="brand">SK Filter</p>
+      <h1>Change kiosk URL &amp; zoom</h1>
+    </div>
+  </div>
+  <p class="subtitle">Both values save together. Zoom is the default page-zoom percent (50–200).</p>
+  <div class="field">
+    <label for="url">Kiosk URL</label>
+    <input type="text" id="url" />
+    <p class="help">Must start with https://, http://, or file:///.</p>
+  </div>
+  <div class="field">
+    <label for="zoom">Default page zoom (%)</label>
+    <input type="number" id="zoom" min="50" max="200" step="5" />
+    <p class="help">Below 100 zooms out, above 100 zooms in. 90 fits more on screen.</p>
+  </div>
+  <div class="err" id="err"></div>
+  <div class="actions">
+    <button class="btn-secondary" onclick="cancel()">Cancel</button>
+    <button class="btn-primary" onclick="submit()">Save</button>
+  </div>
+</div></div>
+<script>
+  var urlIn  = document.getElementById('url');
+  var zoomIn = document.getElementById('zoom');
+  urlIn.value  = window.__defaultURL  || '';
+  zoomIn.value = window.__defaultZoom || 100;
+  setTimeout(function() { urlIn.focus(); urlIn.select(); }, 0);
+  window.addEventListener('load', function() { urlIn.focus(); });
+  function showErr(m) { var e = document.getElementById('err'); e.textContent = m; e.classList.add('show'); }
+  function clearErr()  { document.getElementById('err').classList.remove('show'); }
+  function submit() {
+    var u = urlIn.value.trim();
+    var z = parseInt(zoomIn.value, 10);
+    if (!u) { showErr('URL is required.'); return; }
+    var lo = u.toLowerCase();
+    if (!(lo.indexOf('https://')===0 || lo.indexOf('http://')===0 || lo.indexOf('file:///')===0)) {
+      showErr('URL must start with https://, http://, or file:///.'); return;
+    }
+    if (!z || z < 50 || z > 200) { showErr('Zoom must be between 50 and 200.'); return; }
+    clearErr();
+    window.kgSubmit(u, z);
+  }
+  function cancel() { window.kgCancel(); }
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter')  { e.preventDefault(); submit(); }
+    if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+  });
+</script>
+</body></html>`
+
+// runSetURLAndZoomDialog renders the v1.2.9 WebView2 form replacing the
+// back-to-back zenity.Entry prompts. Returns (url, zoom, ok). ok=false
+// on Cancel or any WebView2 failure (callers fall back gracefully).
+// Top-aligned via fixed CSS — no env-var plumbing needed since the
+// dialog is only invoked from --set-url and always wants top alignment.
+func runSetURLAndZoomDialog() (string, int, bool) {
+	w := webview2.NewWithOptions(webview2.WebViewOptions{
+		Debug:     false,
+		AutoFocus: true,
+		DataPath:  ensureWebView2DataDir(),
+		WindowOptions: webview2.WindowOptions{
+			Title:  "SK Filter — change URL",
+			Width:  640,
+			Height: 480,
+			Center: true,
+		},
+	})
+	if w == nil {
+		// WebView2 unavailable — fall back to the legacy zenity prompts
+		// so the URL-change flow still works on stripped-down machines.
+		url, err := promptForKioskURL()
+		if err != nil {
+			return "", 0, false
+		}
+		return url, loadKioskZoomPercent(), true
+	}
+	defer w.Destroy()
+
+	var (
+		gotURL    string
+		gotZoom   int
+		submitted bool
+	)
+	w.Bind("kgSubmit", func(u string, z int) {
+		gotURL = strings.TrimSpace(u)
+		gotZoom = clampKioskZoom(z)
+		submitted = true
+		w.Terminate()
+	})
+	w.Bind("kgCancel", func() { w.Terminate() })
+
+	go func() {
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			h := uintptr(w.Window())
+			if h != 0 {
+				makeModalFullscreenTopmost(h)
+				return
+			}
+			time.Sleep(15 * time.Millisecond)
+		}
+	}()
+
+	w.Init(fmt.Sprintf(`window.__defaultURL = %q; window.__defaultZoom = %d;`,
+		loadKioskURL(), loadKioskZoomPercent()))
+	w.SetHtml(setURLHTML)
+	w.Run()
+
+	if !submitted {
+		return "", 0, false
+	}
+	if !isValidKioskURL(gotURL) {
+		return "", 0, false
+	}
+	if err := saveKioskURLToRegistry(gotURL); err != nil {
+		logf("runSetURLAndZoomDialog: saveKioskURLToRegistry failed: %v", err)
+		return "", 0, false
+	}
+	if err := saveKioskZoomPercent(gotZoom); err != nil {
+		logf("runSetURLAndZoomDialog: saveKioskZoomPercent failed: %v", err)
+		// URL saved, zoom didn't — still return ok since URL is the
+		// primary intent. The kiosk respawn picks up the new URL even
+		// without zoom updating.
+	}
+	return gotURL, gotZoom, true
 }
 
 // ---------- filter mode + pause persistence ----------
@@ -1924,12 +2219,18 @@ func runShortcutHandler(flag string) {
 // Idempotent. Missing .lnks (fresh install, already-cleaned) are
 // absorbed by Remove-Item -ErrorAction SilentlyContinue.
 func removeStalePerUserShortcuts() {
+	// v1.2.9 glob: catch BOTH the legacy unversioned filenames (pre-v1.2.9
+	// per-user installs) AND every version-suffixed variant the v1.2.9+
+	// public-desktop write could have leaked back here from a stale path.
+	// Patterns are anchored with " v*.lnk" + the bare ".lnk" name so we
+	// don't accidentally match an admin's unrelated "Pause something.lnk".
 	ps := `
-$lnks = @('Kiosk Exit Guard.lnk','Pause SK Filter.lnk','Resume SK Filter.lnk','Launch Kiosk.lnk','Change Kiosk URL.lnk','Update SK Filter.lnk','Uninstall SK Filter.lnk')
+$patterns = @('Kiosk Exit Guard','Pause SK Filter','Resume SK Filter','Launch Kiosk','Change Kiosk URL','Update SK Filter','Uninstall SK Filter')
 $d = [Environment]::GetFolderPath('Desktop')
 if ($d) {
-    foreach ($n in $lnks) {
-        Remove-Item -Path (Join-Path $d $n) -Force -ErrorAction SilentlyContinue
+    foreach ($p in $patterns) {
+        Remove-Item -Path (Join-Path $d ($p + '.lnk')) -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path (Join-Path $d ($p + ' v*.lnk')) -Force -ErrorAction SilentlyContinue
     }
 }
 `
@@ -1975,7 +2276,13 @@ $desktop = [Environment]::GetFolderPath('CommonDesktopDirectory')
 if (-not $desktop) { $desktop = [Environment]::GetFolderPath('Desktop') }
 `)
 	for _, sc := range shortcutSpecs() {
-		lnkNameQ := strings.ReplaceAll(sc.lnkName, `'`, `''`)
+		// v1.2.9: append " v<version>" to the .lnk filename so a glance at
+		// the desktop tells you which version each shortcut belongs to.
+		// On upgrade, removeStalePerUserShortcuts and
+		// removeDesktopShortcuts glob "<name>*.lnk" to clean up old-
+		// version files alongside the legacy unversioned ones.
+		lnkNameVersioned := fmt.Sprintf("%s v%s", sc.lnkName, currentVersion)
+		lnkNameQ := strings.ReplaceAll(lnkNameVersioned, `'`, `''`)
 		descQ := strings.ReplaceAll(sc.description, `'`, `''`)
 		fmt.Fprintf(&sb, `
 $lnk = $ws.CreateShortcut((Join-Path $desktop '%s.lnk'))
@@ -2823,6 +3130,71 @@ func askCustomMinutes() (time.Duration, bool) {
 //go:nocheckptr
 func kbdLLHookStructFromLParam(lParam uintptr) *kbdLLHookStruct {
 	return (*kbdLLHookStruct)(unsafe.Pointer(lParam)) //nolint:govet // Win32 LowLevelKeyboardProc ABI
+}
+
+// v1.2.9 double-right-click pause trigger state. The mouseCallback below
+// tracks the last right-button-down event's timestamp and screen
+// position; if a second right-button-down arrives within
+// rclickDoubleWindow at a screen distance under rclickDoubleRadius,
+// promptAndPause fires. Injected events (AnyDesk, AutoHotkey) are
+// honored — this is the only mouse-side admin escape hatch, mirroring
+// the Ctrl+Shift+Alt+K keyboard equivalent.
+const (
+	rclickDoubleWindow = 500 * time.Millisecond
+	rclickDoubleRadius = 30 // screen pixels (DPI-aware)
+)
+
+var (
+	lastRClickAt time.Time
+	lastRClickX  int32
+	lastRClickY  int32
+)
+
+// mslHookStructFromLParam decodes the lParam pointer of LowLevelMouseProc.
+//
+//go:nosplit
+//go:nocheckptr
+func mslHookStructFromLParam(lParam uintptr) *msllHookStruct {
+	return (*msllHookStruct)(unsafe.Pointer(lParam)) //nolint:govet // Win32 LowLevelMouseProc ABI
+}
+
+// mouseCallback is the WH_MOUSE_LL hook. It watches for right-button-
+// down events; on a second right-button-down within 500ms and 30 screen
+// pixels of the previous one, it fires the pause prompt. All events
+// (including the detected double-click) pass through to the kiosk page
+// unmodified — we don't swallow right-clicks. v1.2.9.
+func mouseCallback(nCode int32, wParam uintptr, lParam uintptr) uintptr {
+	if nCode >= 0 && wParam == wmRButtonDown {
+		ms := mslHookStructFromLParam(lParam)
+		// AnyDesk-forwarded right-clicks come in with the LLMHF_LOWER_IL
+		// injected bit set. We honor those the same as local hardware
+		// clicks because the admin uses AnyDesk to drive the kiosk
+		// remotely; this is the deliberate mouse-side escape hatch.
+		now := time.Now()
+		dx := ms.Pt.X - lastRClickX
+		if dx < 0 {
+			dx = -dx
+		}
+		dy := ms.Pt.Y - lastRClickY
+		if dy < 0 {
+			dy = -dy
+		}
+		if !lastRClickAt.IsZero() &&
+			now.Sub(lastRClickAt) <= rclickDoubleWindow &&
+			dx <= rclickDoubleRadius && dy <= rclickDoubleRadius {
+			lastRClickAt = time.Time{} // consume the double so a third click doesn't re-trigger
+			if !promptOpen.Load() {
+				logf("hook: double right-click detected (flags=0x%02x at %d,%d) — triggering pause", ms.Flags, ms.Pt.X, ms.Pt.Y)
+				go promptAndPause()
+			}
+		} else {
+			lastRClickAt = now
+			lastRClickX = ms.Pt.X
+			lastRClickY = ms.Pt.Y
+		}
+	}
+	ret, _, _ := procCallNextHookEx.Call(0, uintptr(nCode), wParam, lParam)
+	return ret
 }
 
 func hookCallback(nCode int32, wParam uintptr, lParam uintptr) uintptr {
@@ -3918,6 +4290,7 @@ func cleanupInstallDir() {
 	}
 	allowedDirs := map[string]struct{}{
 		"staging": {},
+		"logs":    {}, // v1.2.9 log rotation subdirectory
 	}
 	for _, e := range entries {
 		name := e.Name()
@@ -4389,16 +4762,17 @@ func runUpdateInvocation() {
 }
 
 func removeDesktopShortcuts() {
-	// v1.2.4: wipe from both the per-user desktop (where pre-v1.2.4
-	// installs put the .lnks) AND the public/all-users desktop (where
-	// v1.2.4+ installs put them). Either path missing is fine —
-	// Remove-Item with -ErrorAction SilentlyContinue absorbs that.
+	// v1.2.4: wipe from both the per-user desktop (pre-v1.2.4) AND the
+	// public/all-users desktop (v1.2.4+). v1.2.9 glob: also catch every
+	// version-suffixed variant ("Pause SK Filter v1.2.9.lnk", "v1.2.10.lnk",
+	// etc.), alongside the legacy unversioned filenames.
 	ps := `
-$lnks = @('Kiosk Exit Guard.lnk','Pause SK Filter.lnk','Resume SK Filter.lnk','Launch Kiosk.lnk','Change Kiosk URL.lnk','Update SK Filter.lnk','Uninstall SK Filter.lnk')
+$patterns = @('Kiosk Exit Guard','Pause SK Filter','Resume SK Filter','Launch Kiosk','Change Kiosk URL','Update SK Filter','Uninstall SK Filter')
 foreach ($d in @([Environment]::GetFolderPath('CommonDesktopDirectory'), [Environment]::GetFolderPath('Desktop'))) {
     if (-not $d) { continue }
-    foreach ($n in $lnks) {
-        Remove-Item -Path (Join-Path $d $n) -Force -ErrorAction SilentlyContinue
+    foreach ($p in $patterns) {
+        Remove-Item -Path (Join-Path $d ($p + '.lnk')) -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path (Join-Path $d ($p + ' v*.lnk')) -Force -ErrorAction SilentlyContinue
     }
 }
 `
@@ -5120,24 +5494,21 @@ func main() {
 		case pwCancel:
 			os.Exit(0)
 		}
-		newURL, err := promptForKioskURL()
-		if err != nil {
-			// User-cancel of zenity.Entry returns an error too; don't
-			// scare them with a raw error dialog — treat as cancel.
-			if errors.Is(err, zenity.ErrCanceled) {
-				return
-			}
-			_ = zenity.Error(err.Error(), zenity.Title("SK Filter"))
-			os.Exit(1)
+		// v1.2.9: replaced the back-to-back zenity.Entry prompts with a
+		// single top-aligned WebView2 form so the URL change flow is
+		// AnyDesk-friendly. The form persists both URL and zoom to HKLM
+		// internally; on cancel/failure it returns ok=false and we exit
+		// without restarting the kiosk child.
+		newURL, _, ok := runSetURLAndZoomDialog()
+		if !ok {
+			return
 		}
 		// v1.1.9 UX LOW#11: defensively re-save the URL to HKLM BEFORE
-		// killing the kiosk child. promptForKioskURL already persists
-		// it as its last step, but an explicit save here guards the
-		// invariant against future refactors of promptForKioskURL:
-		// the kiosk respawn loaded the OLD URL if Kill ever fired
-		// before the registry write completed. Idempotent.
+		// killing the kiosk child. runSetURLAndZoomDialog already
+		// persists it, but the redundant save guards against future
+		// refactors that might drop the persist step.
 		if err := saveKioskURLToRegistry(newURL); err != nil {
-			logf("--set-url: re-save before kiosk restart failed: %v (URL was already saved by promptForKioskURL)", err)
+			logf("--set-url: re-save before kiosk restart failed: %v (URL was already saved by runSetURLAndZoomDialog)", err)
 		}
 		// Restart the kiosk child so it loads the new URL immediately
 		// rather than waiting for the controller's next watchdog tick.
@@ -5203,6 +5574,21 @@ func main() {
 	}
 	logf("LL keyboard hook installed early (handle=%d) before killRunningController", hookHandle)
 	defer procUnhookWindowsHookEx.Call(hookHandle)
+
+	// v1.2.9: install the LL mouse hook on the same thread. Detects
+	// double-right-click and routes to the pause prompt — the mouse-side
+	// admin escape hatch matching the Ctrl+Shift+Alt+K keyboard one.
+	// Failure here is non-fatal: the keyboard hook is the primary
+	// enforcement; without the mouse hook only the double-right-click
+	// pause shortcut is unavailable.
+	mcb := syscall.NewCallback(mouseCallback)
+	mouseHookHandle, _, mouseHookErr := procSetWindowHookExW.Call(uintptr(whMouseLL), mcb, 0, 0)
+	if mouseHookHandle == 0 {
+		logf("WARN: SetWindowsHookEx (mouse LL) failed: %v — double-right-click pause unavailable", mouseHookErr)
+	} else {
+		logf("LL mouse hook installed (handle=%d)", mouseHookHandle)
+		defer procUnhookWindowsHookEx.Call(mouseHookHandle)
+	}
 
 	// v1.1.9 UX HIGH#1: take the cross-process "controller is running"
 	// mutex BEFORE killRunningController. Without this, at logon both
