@@ -155,7 +155,7 @@
 <div class="wrap">
 
 <header>
-  <h1>kiosk-exit-guard <span class="version-pill">v1.2.7</span></h1>
+  <h1>kiosk-exit-guard <span class="version-pill">v1.2.8</span></h1>
   <p class="tagline">Single-binary kiosk lockdown for <strong>Windows 11 Home</strong> and <strong>Windows Server 2022 (RDP / physical console)</strong>. Embedded WebView2 kiosk, password-gated keyboard, Chrome uninstalled, Edge launches blocked at the OS level, self-installing, self-updating, all from one ~7.9&nbsp;MB exe.</p>
 </header>
 
@@ -195,7 +195,19 @@
   <a href="#build">Build</a>
 </nav>
 
-<h2 id="whats-new">v1.2.7 — disable Win+L (lock workstation) via registry policy</h2>
+<h2 id="whats-new">v1.2.8 — admin hotkeys, AnyDesk reliability, top-aligned password modal</h2>
+
+<div class="callout callout-good">
+  <strong>Two new admin hotkeys + AnyDesk Ctrl+Shift+Alt+K actually works now + the password modal can render at the top of the screen for AnyDesk-driven URL changes.</strong>
+  <ul style="margin: 0.6rem 0 0; padding-left: 1.25rem;">
+    <li><strong>Ctrl+Shift+Alt+U → <code>--update</code>, Ctrl+Shift+Alt+C → <code>--set-url</code>.</strong> Two siblings of the existing pause hotkey. Both spawn the corresponding invocation as a detached child via the new <code>launchSelfWithFlag</code> helper. All three (K, U, C) work from both local physical keyboard <em>and</em> injected input (AnyDesk, AutoHotkey).</li>
+    <li><strong>AnyDesk Ctrl+Shift+Alt+K actually fires now.</strong> v1.2.4's injected-event carve-out checked only <code>LLKHF_INJECTED (0x10)</code>, but AnyDesk's keyboard forwarder runs at user-medium integrity level while the kiosk runs at user-high IL (requireAdministrator manifest), so remote-typed keys actually arrive with <code>LLKHF_LOWER_IL_INJECTED (0x02)</code> — <em>not</em> 0x10. The carve-out silently never fired. v1.2.8 introduces <code>llkhfAnyInject = 0x10 | 0x02</code> and treats either bit as "injected". New log line <code>hook: injected Ctrl+Shift+Alt+&lt;K|U|C&gt; detected (flags=0x%02x)</code> makes the path observable.</li>
+    <li><strong>Top-aligned password modal for <code>--set-url</code>.</strong> New <code>askPasswordModalTop</code> renders the card near the top of the screen instead of vertically centered, so AnyDesk admins can reach the input even when AnyDesk's session bar overlays the middle of the viewport. The child <code>--ask-password</code> process receives the hint via env var <code>KEG_ASK_PASSWORD_TOP=1</code>; the password HTML reads <code>window.__topAlign</code> and adds a <code>.top</code> class on <code>.wrap</code> that switches <code>align-items</code> from <code>center</code> to <code>flex-start</code> with <code>padding-top: 4vh</code>.</li>
+    <li><strong>Queued for v1.2.9.</strong> WebView2 URL/zoom form to replace the remaining zenity entries in <code>--set-url</code>; version-suffixed desktop .lnk filenames; log rotation (six-hour buckets in a <code>logs/</code> subfolder); double-right-click → pause-filter prompt (mouse hook).</li>
+  </ul>
+</div>
+
+<h2 id="v127">v1.2.7 — disable Win+L (lock workstation) via registry policy</h2>
 
 <div class="callout callout-good">
   <strong>Win+L was the last Win+key combo that leaked past the LL keyboard hook.</strong> The hook can swallow the visible Start-menu hop, but lock-workstation is intercepted by <code>winlogon.exe</code> at a layer beneath the hook, so the lock initiates anyway. v1.2.7 sets the canonical Windows policy <code>HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\System\DisableLockWorkstation = 1</code> in <code>applyLockdown</code> alongside the existing DisableTaskMgr / NoRun / NoTrayContextMenu / NoViewContextMenu / NoTaskbar entries, and clears it in <code>removeLockdown</code> so an uninstall/reset restores the lock-screen shortcut.

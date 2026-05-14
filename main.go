@@ -62,7 +62,7 @@ import (
 
 // currentVersion must be kept in sync with versioninfo.json. Used by the
 // --update flow to compare against the latest GitHub release tag.
-const currentVersion = "1.2.7"
+const currentVersion = "1.2.8"
 
 // Auto-update background-check timing. v1.2.1: the controller polls
 // GitHub's /releases/latest on startup (after autoUpdateInitialDelay so
@@ -273,6 +273,13 @@ const (
 	vkF12    = 0x7B
 	vkR      = 0x52
 	vkK      = 0x4B
+	// v1.2.8 admin hotkeys (mirror the Ctrl+Shift+Alt+K pause hotkey
+	// pattern). U = Update, C = Change URL. Both spawn the corresponding
+	// --update / --set-url invocation as a detached child so the action
+	// runs in the user's session (password modal, download, etc.) without
+	// blocking the hook thread.
+	vkU = 0x55
+	vkC = 0x43
 	vk0      = 0x30 // browser zoom reset
 	vkNum0   = 0x60 // numpad 0
 	// VK_OEM_MINUS / VK_OEM_PLUS are the top-row -/= keys; numpad has
@@ -291,6 +298,15 @@ const (
 	vkRShift = 0xA1
 
 	llkhfInject = 0x10
+	// LLKHF_LOWER_IL_INJECTED — event was injected from a process running
+	// at a lower integrity level than the hook. AnyDesk's keyboard-
+	// forwarding worker typically runs at user-medium IL while the kiosk
+	// (UIAccess=false, requireAdministrator) runs at user-high IL, so
+	// remote-typed keys often arrive with this flag set instead of (or in
+	// addition to) the generic LLKHF_INJECTED. v1.2.8 treats both as
+	// "injected" for the Ctrl+Shift+Alt+K/U/C carve-outs.
+	llkhfLowerIlInject = 0x02
+	llkhfAnyInject     = llkhfInject | llkhfLowerIlInject
 
 	// HKCU policy paths used for Task Manager + Run dialog lockdown
 	regPolicySystem   = `Software\Microsoft\Windows\CurrentVersion\Policies\System`
@@ -2586,6 +2602,28 @@ func findOurWebViewChild() *process.Process {
 	return nil
 }
 
+// launchSelfWithFlag (v1.2.8) spawns a detached child running the same
+// exe with a single flag argument (e.g. "--update" or "--set-url"),
+// used by the Ctrl+Shift+Alt+U/C admin hotkeys. The child inherits the
+// caller's user/elevation context, runs its own UI on the user's
+// desktop, and exits independently of the controller.
+//
+// Best-effort: on Start() failure we just log; the hotkey was already
+// swallowed (return 1 in the hook) so there's no caller waiting for a
+// result code.
+func launchSelfWithFlag(flag string) {
+	exe, err := os.Executable()
+	if err != nil {
+		logf("launchSelfWithFlag(%s): os.Executable failed: %v", flag, err)
+		return
+	}
+	cmd := exec.Command(exe, flag)
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+	if err := cmd.Start(); err != nil {
+		logf("launchSelfWithFlag(%s): Start failed: %v", flag, err)
+	}
+}
+
 func launchWebViewChild() {
 	exe, err := os.Executable()
 	if err != nil {
@@ -2790,30 +2828,41 @@ func kbdLLHookStructFromLParam(lParam uintptr) *kbdLLHookStruct {
 func hookCallback(nCode int32, wParam uintptr, lParam uintptr) uintptr {
 	if nCode >= 0 {
 		kb := kbdLLHookStructFromLParam(lParam)
-		injected := (kb.Flags & llkhfInject) != 0
+		// v1.2.8: treat LLKHF_INJECTED *and* LLKHF_LOWER_IL_INJECTED as
+		// "injected". AnyDesk's keyboard forwarder typically runs at
+		// user-medium IL while the kiosk runs at user-high IL (it has
+		// requireAdministrator manifest); on that path the flag arrives
+		// as 0x02, not 0x10. Pre-v1.2.8 we only checked 0x10, so the
+		// AnyDesk Ctrl+Shift+Alt+K carve-out silently never fired even
+		// though the events were injected.
+		injected := (kb.Flags & llkhfAnyInject) != 0
 		ourInjection := kb.DwExtraInfo == kioskMarker
 
-		// v1.2.4 carve-out: let the Ctrl+Shift+Alt+K pause hotkey fire even
-		// from injected input (AnyDesk's SendInput-based key forwarding,
-		// AutoHotkey, remote shells). The hook normally ignores injected
-		// events because the kiosk user can't physically inject and we
-		// don't want to second-guess remote admins' typing. But that also
-		// hid the pause hotkey from any tool an admin uses to escape a
-		// fullscreen kiosk window remotely. Scope is exactly one combo —
-		// every other injected key still falls straight through to
-		// procCallNextHookEx unmodified, so AnyDesk typing, paste, etc.
-		// keep working as today. GetAsyncKeyState reflects injected
-		// modifier state, so ctrlDown/shiftDown/altDown observe the
-		// SendInput-set modifiers correctly. ourInjection is excluded so
-		// a re-inject path that ever carried K-with-all-modifiers can't
-		// loop back through this.
+		// v1.2.4 (broadened in v1.2.8) carve-out: let the admin hotkeys
+		// fire even from injected input (AnyDesk, AutoHotkey, remote
+		// shells). The hook normally ignores injected events, but that
+		// hides the hotkeys from any tool an admin uses to drive a
+		// fullscreen kiosk remotely. Scope is exactly three combos —
+		// every other injected key still falls straight through.
 		isKeyDownAny := wParam == wmKeyDown || wParam == wmSysKeyDown
 		if injected && !ourInjection && isKeyDownAny &&
-			kb.VkCode == vkK && ctrlDown() && shiftDown() && altDown() {
-			if !promptOpen.Load() {
-				go promptAndPause()
+			ctrlDown() && shiftDown() && altDown() {
+			switch kb.VkCode {
+			case vkK:
+				logf("hook: injected Ctrl+Shift+Alt+K detected (flags=0x%02x) — triggering pause", kb.Flags)
+				if !promptOpen.Load() {
+					go promptAndPause()
+				}
+				return 1
+			case vkU:
+				logf("hook: injected Ctrl+Shift+Alt+U detected (flags=0x%02x) — triggering --update", kb.Flags)
+				go launchSelfWithFlag("--update")
+				return 1
+			case vkC:
+				logf("hook: injected Ctrl+Shift+Alt+C detected (flags=0x%02x) — triggering --set-url", kb.Flags)
+				go launchSelfWithFlag("--set-url")
+				return 1
 			}
-			return 1
 		}
 
 		if !injected && !ourInjection {
@@ -2856,12 +2905,26 @@ func hookCallback(nCode int32, wParam uintptr, lParam uintptr) uintptr {
 					winKeyChord.Store(false)
 				}
 
-				// Pause hotkey works in either filter state.
-				if kb.VkCode == vkK && ctrlDown() && shiftDown() && altDown() {
-					if !promptOpen.Load() {
-						go promptAndPause()
+				// Admin hotkeys work in either filter state.
+				if ctrlDown() && shiftDown() && altDown() {
+					switch kb.VkCode {
+					case vkK:
+						if !promptOpen.Load() {
+							go promptAndPause()
+						}
+						return 1
+					case vkU:
+						// v1.2.8: trigger the update flow. Spawn the
+						// existing --update entry as a detached child so
+						// it runs in this user's session with its own
+						// password modal + GitHub fetch + atomic swap.
+						go launchSelfWithFlag("--update")
+						return 1
+					case vkC:
+						// v1.2.8: trigger the change-URL flow.
+						go launchSelfWithFlag("--set-url")
+						return 1
 					}
-					return 1
 				}
 
 				if filterMode.Load() {
@@ -2940,6 +3003,11 @@ const passwordPromptHTML = `<!DOCTYPE html><html lang="en"><head><meta charset="
      align-items: center keeps the card vertically centered when it does
      fit. */
   .wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 1.25rem; overflow-y: auto; }
+  /* v1.2.8 top-align: --set-url (and any other flow that opts in via
+     KEG_ASK_PASSWORD_TOP=1) lays out the card near the top of the
+     screen instead of centered, so AnyDesk admins can reach it even
+     when AnyDesk's session bar covers the middle of the viewport. */
+  .wrap.top { align-items: flex-start; padding-top: 4vh; }
   .card { background: linear-gradient(180deg, rgba(35, 47, 72, 0.95), rgba(26, 36, 56, 0.95));
     border: 1px solid rgba(148, 163, 184, 0.22); border-radius: 16px;
     padding: 2rem 2.25rem; width: 100%; max-width: 540px;
@@ -3009,6 +3077,10 @@ const passwordPromptHTML = `<!DOCTYPE html><html lang="en"><head><meta charset="
 <script>
   if (window.__title)    document.getElementById('title').textContent    = window.__title;
   if (window.__subtitle) document.getElementById('subtitle').textContent = window.__subtitle;
+  if (window.__topAlign) {
+    var wrap = document.querySelector('.wrap');
+    if (wrap) wrap.classList.add('top');
+  }
   var input = document.getElementById('pw');
   // Autofocus — belt and suspenders to handle the race between WebView2's
   // first paint and document focus events. Both work; one is enough.
@@ -3198,6 +3270,17 @@ const (
 	pwCancel                         // user dismissed (Cancel / Esc / window close)
 )
 
+// askPasswordModalTop is the top-aligned variant of askPasswordModal:
+// the modal's card lays out near the top of the screen instead of
+// vertically centered. Used by --set-url (v1.2.8) so admins driving via
+// AnyDesk can reach the input even when AnyDesk's session overlay sits
+// at the bottom of the screen and absorbs clicks near the center. Same
+// child-process plumbing as askPasswordModal — top-alignment is conveyed
+// via the KEG_ASK_PASSWORD_TOP=1 env var.
+func askPasswordModalTop(title, subtitle string) passwordResult {
+	return askPasswordModalCommon(title, subtitle, true)
+}
+
 // askPasswordModal spawns a `--ask-password` child process to render
 // the branded WebView2 password dialog and waits for its exit code:
 // 0 = pwOK, 1 = pwWrong, 2 = pwCancel. Routing the modal through a
@@ -3215,15 +3298,28 @@ const (
 // askPasswordModalInProcess and is invoked only by the child's
 // --ask-password flag handler in main().
 func askPasswordModal(title, subtitle string) passwordResult {
+	return askPasswordModalCommon(title, subtitle, false)
+}
+
+// askPasswordModalCommon is the v1.2.8 underlying implementation of
+// both askPasswordModal and askPasswordModalTop. topAlign=true sets the
+// KEG_ASK_PASSWORD_TOP env var on the spawned --ask-password child;
+// the child's askPasswordModalInProcess reads it and switches its CSS
+// to flex-start + top padding so the card lands near the top of the
+// screen.
+func askPasswordModalCommon(title, subtitle string, topAlign bool) passwordResult {
 	exe, err := os.Executable()
 	if err != nil {
 		// Can't locate ourselves — fall back to in-process. Last-resort
 		// path that may still panic on second-instance, but better than
 		// no auth at all.
-		return askPasswordModalInProcess(title, subtitle)
+		return askPasswordModalInProcess(title, subtitle, topAlign)
 	}
 	cmd := exec.Command(exe, "--ask-password", title, subtitle)
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+	if topAlign {
+		cmd.Env = append(os.Environ(), "KEG_ASK_PASSWORD_TOP=1")
+	}
 	runErr := cmd.Run()
 	if runErr == nil {
 		return pwOK
@@ -3254,7 +3350,7 @@ func askPasswordModal(title, subtitle string) passwordResult {
 // bcrypt hash. Only called by the `--ask-password` child process; all
 // other callers must use the parent-side askPasswordModal which spawns
 // this in a child to avoid the go-webview2 double-instance panic.
-func askPasswordModalInProcess(title, subtitle string) passwordResult {
+func askPasswordModalInProcess(title, subtitle string, topAlign bool) passwordResult {
 	// v1.1.9 NEW: auto-dismiss the modal after this many seconds of
 	// inactivity so a walked-away user can't hold the kiosk hostage
 	// indefinitely. The kgSubmit / kgCancel bindings reset the timer
@@ -3381,7 +3477,7 @@ func askPasswordModalInProcess(title, subtitle string) passwordResult {
 		w.Terminate()
 	})
 
-	w.Init(fmt.Sprintf(`window.__title = %q; window.__subtitle = %q;`, title, subtitle))
+	w.Init(fmt.Sprintf(`window.__title = %q; window.__subtitle = %q; window.__topAlign = %t;`, title, subtitle, topAlign))
 	w.SetHtml(passwordPromptHTML)
 	// Fullscreen the modal so DPI scaling doesn't matter — the CSS
 	// centers the card inside whatever screen size we get. Also makes
@@ -4842,7 +4938,12 @@ func main() {
 			os.Exit(2)
 		}
 		storedHash = hash
-		switch askPasswordModalInProcess(title, subtitle) {
+		// v1.2.8: parent sets KEG_ASK_PASSWORD_TOP=1 when it wants the
+		// card top-aligned (e.g. from --set-url, so AnyDesk admins can
+		// reach the input even when AnyDesk's session bar is at the
+		// bottom).
+		topAlign := os.Getenv("KEG_ASK_PASSWORD_TOP") == "1"
+		switch askPasswordModalInProcess(title, subtitle, topAlign) {
 		case pwOK:
 			os.Exit(0)
 		case pwWrong:
@@ -5004,7 +5105,10 @@ func main() {
 			os.Exit(1)
 		}
 		storedHash = hash
-		switch askPasswordModal(
+		// v1.2.8: render the password card at the top of the screen so
+		// AnyDesk admins driving the kiosk can reach the input even when
+		// AnyDesk's session bar covers the middle of the viewport.
+		switch askPasswordModalTop(
 			"Change the kiosk URL?",
 			"Enter the admin password to confirm.",
 		) {

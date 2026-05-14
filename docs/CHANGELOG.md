@@ -5,6 +5,61 @@ All notable changes to kiosk-exit-guard, newest first. Versions follow [Semantic
 For the current state of the project, see the [landing page](https://shalom-karr.github.io/kiosk-exit-guard/), the [architecture doc](architecture.md), and the [admin runbook](admin-runbook.md).
 
 
+## v1.2.8 — 2026-05-13
+
+Admin hotkeys + AnyDesk reliability + top-aligned password modal for
+the URL-change flow.
+
+### New hotkeys — Ctrl+Shift+Alt+U (update) and Ctrl+Shift+Alt+C (change URL)
+
+Two siblings of the existing Ctrl+Shift+Alt+K pause hotkey. Both spawn
+the corresponding `--update` / `--set-url` invocation as a detached
+child via the new `launchSelfWithFlag` helper, so the action runs in
+the user's session with its own password modal + GitHub fetch (for
+update) or password modal + URL/zoom entry (for set-url). All three
+hotkeys (K, U, C) work from both local physical keyboard *and*
+injected input (AnyDesk, AutoHotkey).
+
+### Fix — AnyDesk Ctrl+Shift+Alt+K now actually triggers
+
+v1.2.4 added an injected-key carve-out for the pause hotkey but
+checked only `LLKHF_INJECTED (0x10)`. AnyDesk's keyboard-forwarding
+worker runs at user-medium integrity level while the kiosk runs at
+user-high IL (it carries a `requireAdministrator` manifest), so
+remote-typed keys actually arrive with `LLKHF_LOWER_IL_INJECTED (0x02)`
+in the LL hook struct flags — *not* 0x10. The carve-out silently never
+fired.
+
+v1.2.8 introduces `llkhfAnyInject = llkhfInject | llkhfLowerIlInject`
+and treats either bit as "injected" for the K/U/C carve-outs. New
+`logf` lines at the injected-detection site (`hook: injected
+Ctrl+Shift+Alt+<K|U|C> detected (flags=0x%02x) — triggering ...`) make
+the path observable in `kiosk-exit-guard.log` so a future
+no-hotkey-from-AnyDesk report can be diagnosed in one log read.
+
+### Password modal can render top-aligned
+
+New `askPasswordModalTop(title, subtitle)` is the top-aligned sibling
+of `askPasswordModal`. The child `--ask-password` process receives the
+hint via env var `KEG_ASK_PASSWORD_TOP=1`; the password HTML reads
+`window.__topAlign` and adds a `.top` class on `.wrap` that switches
+`align-items` from `center` to `flex-start` with `padding-top: 4vh`.
+Used by the `--set-url` flow so admins driving via AnyDesk can reach
+the password input even when AnyDesk's session bar overlays the
+center of the viewport.
+
+### Known gaps tracked for v1.2.9
+
+- URL/zoom entry after the password modal still uses `zenity.Entry`
+  (native Win32 dialog, no programmatic positioning). Replacing it
+  with a WebView2 form that lays out at the top is queued.
+- Desktop .lnk filenames don't yet carry the version suffix.
+- Log rotation (six-hour buckets in a `logs/` subfolder) not yet
+  implemented — the log file still grows indefinitely as
+  `kiosk-exit-guard.log`.
+- Double-right-click → pause-filter prompt (mouse hook) not yet wired.
+
+
 ## v1.2.7 — 2026-05-13
 
 Disable Win+L (lock workstation) via the canonical Windows registry
