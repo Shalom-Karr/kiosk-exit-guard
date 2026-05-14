@@ -5,6 +5,33 @@ All notable changes to kiosk-exit-guard, newest first. Versions follow [Semantic
 For the current state of the project, see the [landing page](https://shalom-karr.github.io/kiosk-exit-guard/), the [architecture doc](architecture.md), and the [admin runbook](admin-runbook.md).
 
 
+## v1.2.7 — 2026-05-13
+
+Disable Win+L (lock workstation) via the canonical Windows registry
+policy. Win+L is intercepted by `winlogon.exe` at a layer beneath the
+LL keyboard hook — the v1.2.6 always-block + Win-modifier swallow can
+suppress the visible Start menu hop, but the lock initiates anyway
+because winlogon sees the key combo first. The proper Windows
+mechanism is the policy
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\System\DisableLockWorkstation = 1`,
+which disables Win+L *and* the Start menu's "Lock" entry at the OS
+level. v1.2.7 sets this in `applyLockdown` alongside the existing
+DisableTaskMgr / NoRun / NoTrayContextMenu / NoViewContextMenu /
+NoTaskbar policies, and clears it in `removeLockdown` so an
+uninstall/reset restores the lock-screen shortcut.
+
+### Other system commands
+
+The pre-existing modifier+key block already catches everything else
+in the Win+key family (Win+R, Win+E, Win+I, Win+D, Win+X, Win+.,
+Win+Tab) — the LL hook swallows them and routes through the
+password-prompt path. Win+L was the one outlier because of the
+winlogon-level interception. Ctrl+Alt+Del (Secure Attention Sequence)
+remains genuinely unblockable from user mode — it requires a
+kernel-mode filter driver, which is outside scope for kiosk-exit-
+guard.
+
+
 ## v1.2.6 — 2026-05-13
 
 Lockdown widening: bare F1–F12, Tab, Escape, AppMenu (right-click

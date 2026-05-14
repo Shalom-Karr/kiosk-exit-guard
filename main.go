@@ -62,7 +62,7 @@ import (
 
 // currentVersion must be kept in sync with versioninfo.json. Used by the
 // --update flow to compare against the latest GitHub release tag.
-const currentVersion = "1.2.6"
+const currentVersion = "1.2.7"
 
 // Auto-update background-check timing. v1.2.1: the controller polls
 // GitHub's /releases/latest on startup (after autoUpdateInitialDelay so
@@ -300,6 +300,12 @@ const (
 	regNoTrayContextMenu  = "NoTrayContextMenu"
 	regNoViewContextMenu  = "NoViewContextMenu"
 	regNoTaskbar          = "NoTaskbar" // hides the taskbar entirely when filter active
+	// v1.2.7: DisableLockWorkstation kills Win+L (and the Start menu's
+	// "Lock" command). Win+L is processed by winlogon.exe at a layer
+	// below the LL keyboard hook, so swallowing the Win-down + L-down
+	// events isn't enough — the lock initiates regardless. This policy
+	// is the canonical Windows-supported way to disable the shortcut.
+	regDisableLockWorkstation = "DisableLockWorkstation"
 
 	regAppKey         = `Software\KioskExitGuard`
 	regHashValue      = "PasswordHash"
@@ -1008,6 +1014,11 @@ func applyLockdown() {
 	// Start button opens Start menu — from which Settings/File Explorer
 	// are reachable. The Win-key keyboard hook can't catch a mouse click.
 	_ = setPolicyDWORD(regPolicyExplorer, regNoTaskbar, 1)
+	// v1.2.7: kill Win+L. Lock workstation is handled by winlogon.exe at
+	// a level beneath the LL keyboard hook, so swallowing the key events
+	// isn't enough — the lock initiates anyway. DisableLockWorkstation
+	// is the documented Windows way to disable the shortcut entirely.
+	_ = setPolicyDWORD(regPolicySystem, regDisableLockWorkstation, 1)
 	// NoTaskbar requires Explorer to reload its policy cache. Restart
 	// Explorer so the change takes effect immediately.
 	restartExplorer()
@@ -1019,6 +1030,7 @@ func removeLockdown() {
 	_ = deletePolicyValue(regPolicyExplorer, regNoTrayContextMenu)
 	_ = deletePolicyValue(regPolicyExplorer, regNoViewContextMenu)
 	_ = deletePolicyValue(regPolicyExplorer, regNoTaskbar)
+	_ = deletePolicyValue(regPolicySystem, regDisableLockWorkstation)
 	// Bring the taskbar back immediately rather than waiting for next
 	// Explorer restart.
 	restartExplorer()

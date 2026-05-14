@@ -155,7 +155,7 @@
 <div class="wrap">
 
 <header>
-  <h1>kiosk-exit-guard <span class="version-pill">v1.2.6</span></h1>
+  <h1>kiosk-exit-guard <span class="version-pill">v1.2.7</span></h1>
   <p class="tagline">Single-binary kiosk lockdown for <strong>Windows 11 Home</strong> and <strong>Windows Server 2022 (RDP / physical console)</strong>. Embedded WebView2 kiosk, password-gated keyboard, Chrome uninstalled, Edge launches blocked at the OS level, self-installing, self-updating, all from one ~7.9&nbsp;MB exe.</p>
 </header>
 
@@ -195,7 +195,17 @@
   <a href="#build">Build</a>
 </nav>
 
-<h2 id="whats-new">v1.2.6 — block bare F-keys, Tab, Escape, AppMenu, PrintScreen, Insert</h2>
+<h2 id="whats-new">v1.2.7 — disable Win+L (lock workstation) via registry policy</h2>
+
+<div class="callout callout-good">
+  <strong>Win+L was the last Win+key combo that leaked past the LL keyboard hook.</strong> The hook can swallow the visible Start-menu hop, but lock-workstation is intercepted by <code>winlogon.exe</code> at a layer beneath the hook, so the lock initiates anyway. v1.2.7 sets the canonical Windows policy <code>HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\System\DisableLockWorkstation = 1</code> in <code>applyLockdown</code> alongside the existing DisableTaskMgr / NoRun / NoTrayContextMenu / NoViewContextMenu / NoTaskbar entries, and clears it in <code>removeLockdown</code> so an uninstall/reset restores the lock-screen shortcut.
+  <ul style="margin: 0.6rem 0 0; padding-left: 1.25rem;">
+    <li><strong>Other Win+key combos were already blocked.</strong> Win+R, Win+E, Win+I, Win+D, Win+X, Win+., Win+Tab — the existing modifier+key block routes all of these through the password-prompt path. Win+L was the one outlier because of the winlogon-level interception.</li>
+    <li><strong>Ctrl+Alt+Del remains unblockable.</strong> The Secure Attention Sequence requires a kernel-mode filter driver, outside scope.</li>
+  </ul>
+</div>
+
+<h2 id="v126">v1.2.6 — block bare F-keys, Tab, Escape, AppMenu, PrintScreen, Insert</h2>
 
 <div class="callout callout-good">
   <strong>Lockdown widening.</strong> Pre-v1.2.6 the LL keyboard hook only caught <code>&lt;modifier&gt; + key</code> combos, so a bare F11 (toggle browser fullscreen), F12 (DevTools), Tab (focus next form field / address bar in normal Edge), or Escape (exit fullscreen / close modals) all fell straight through to the kiosk URL. v1.2.6 adds an <code>isAlwaysBlockedKey</code> helper that swallows F1–F12, Tab, Escape, the AppMenu (right-click keyboard) key, PrintScreen, and Insert regardless of modifier state, routing each press through the password-prompt → re-inject path (same UX as Win+R).
