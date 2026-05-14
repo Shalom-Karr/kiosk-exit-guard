@@ -62,7 +62,7 @@ import (
 
 // currentVersion must be kept in sync with versioninfo.json. Used by the
 // --update flow to compare against the latest GitHub release tag.
-const currentVersion = "1.2.5"
+const currentVersion = "1.2.6"
 
 // Auto-update background-check timing. v1.2.1: the controller polls
 // GitHub's /releases/latest on startup (after autoUpdateInitialDelay so
@@ -250,8 +250,27 @@ const (
 	wmSysKeyUp   = 0x0105
 	wmClose      = 0x0010
 
+	// Function keys + system-shortcut keys. v1.2.6 widens the always-
+	// blocked set to cover bare F1–F12, Tab, Escape, AppMenu (right-click
+	// keyboard equivalent), PrintScreen, and Insert — see
+	// isAlwaysBlockedKey for the swallow logic.
+	vkTab    = 0x09
+	vkEscape = 0x1B
+	vkApps   = 0x5D // "menu" key, opens right-click context menu
+	vkSnapshot = 0x2C // PrintScreen
+	vkInsert = 0x2D
+	vkF1     = 0x70
+	vkF2     = 0x71
+	vkF3     = 0x72
 	vkF4     = 0x73
 	vkF5     = 0x74
+	vkF6     = 0x75
+	vkF7     = 0x76
+	vkF8     = 0x77
+	vkF9     = 0x78
+	vkF10    = 0x79
+	vkF11    = 0x7A
+	vkF12    = 0x7B
 	vkR      = 0x52
 	vkK      = 0x4B
 	vk0      = 0x30 // browser zoom reset
@@ -1262,21 +1281,42 @@ func isModifierVK(vk uint32) bool {
 	return false
 }
 
+// isAlwaysBlockedKey returns true for keys that are blocked regardless
+// of modifier state — even bare presses go through the password-prompt
+// path instead of reaching the kiosk page. v1.2.6 widened the lockdown
+// in response to a field report that bare F-keys, Tab, and similar
+// "system shortcut" keys were leaking through to the kiosk URL. The
+// previous hook only swallowed *modifier+key* combos; a bare F11 (toggle
+// fullscreen), F12 (DevTools — already disabled by WebView2 but a
+// hardening defense), Tab (focus the address bar in normal Edge, focus
+// next form field in the kiosk page), or Escape (exit fullscreen / close
+// modals) all fell straight through to the page.
+//
+// The intent: nothing on this list is a typing key. Letters, numbers,
+// space, punctuation, Enter, Backspace, arrows, and Delete still reach
+// the page normally for form fill-in. Page-scroll navigation keys
+// (Home/End/PgUp/PgDn) are intentionally NOT on this list so the kiosk
+// page can be scrolled.
+func isAlwaysBlockedKey(vk uint32) bool {
+	switch vk {
+	case vkTab, vkEscape, vkApps, vkSnapshot, vkInsert,
+		vkF1, vkF2, vkF3, vkF4, vkF5, vkF6,
+		vkF7, vkF8, vkF9, vkF10, vkF11, vkF12:
+		return true
+	}
+	return false
+}
+
 // isAlwaysAllowedCombo lets specific keystrokes through even when the
-// filter is active. Allowlist:
-//   - F5 alone: page reload
+// filter is active. Allowlist (Ctrl-only — no Alt / no Win):
 //   - Ctrl+R: page reload
 //   - Ctrl+0 / Ctrl+numpad-0: browser zoom reset
 //   - Ctrl+- / Ctrl+numpad-minus: browser zoom out
 //   - Ctrl++ / Ctrl+= / Ctrl+numpad-plus: browser zoom in
 //
-// All require Ctrl-only (no Alt / no Win) so Win+0 / Alt+- etc. still
-// hit the lockdown path. Add more here as legitimate kiosk use cases
-// emerge.
+// v1.2.6 removed bare F5 — it's now caught by isAlwaysBlockedKey.
+// Admins who want a manual reload still have Ctrl+R.
 func isAlwaysAllowedCombo(vk uint32) bool {
-	if vk == vkF5 && !ctrlDown() && !altDown() && !winDown() {
-		return true
-	}
 	if !ctrlDown() || altDown() || winDown() {
 		return false
 	}
@@ -2813,7 +2853,28 @@ func hookCallback(nCode int32, wParam uintptr, lParam uintptr) uintptr {
 				}
 
 				if filterMode.Load() {
-					// Allowlist (Ctrl+R, F5) before the broad block.
+					// v1.2.6: bare F-keys, Tab, Escape, AppMenu key, PrintScreen,
+					// and Insert get the same swallow + password-prompt
+					// treatment as modifier+key combos, regardless of whether
+					// any modifier is held. Closes the "F-keys and Tab leak
+					// through" gap. capturedModifiers() may return an empty
+					// set here when the key was pressed alone — that's fine,
+					// the re-injection path handles bare keys (it just sends
+					// the VK with no modifier prefix).
+					if isAlwaysBlockedKey(kb.VkCode) {
+						mods := capturedModifiers()
+						if hookPromptInFlight.CompareAndSwap(false, true) {
+							pendingComboMu.Lock()
+							pendingComboV = &pendingCombo{
+								vk:        kb.VkCode,
+								modifiers: mods,
+							}
+							pendingComboMu.Unlock()
+							go promptAndReinject()
+						}
+						return 1
+					}
+					// Allowlist (Ctrl+R, Ctrl+zoom) before the broad block.
 					if isAlwaysAllowedCombo(kb.VkCode) {
 						// fall through to procCallNextHookEx
 					} else if !isModifierVK(kb.VkCode) && (ctrlDown() || winDown() || altDown()) {

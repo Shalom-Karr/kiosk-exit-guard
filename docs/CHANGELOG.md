@@ -5,6 +5,45 @@ All notable changes to kiosk-exit-guard, newest first. Versions follow [Semantic
 For the current state of the project, see the [landing page](https://shalom-karr.github.io/kiosk-exit-guard/), the [architecture doc](architecture.md), and the [admin runbook](admin-runbook.md).
 
 
+## v1.2.6 — 2026-05-13
+
+Lockdown widening: bare F1–F12, Tab, Escape, AppMenu (right-click
+keyboard key), PrintScreen, and Insert are now swallowed and route
+through the password-prompt path, even with no modifier held. Pre-
+v1.2.6 the LL keyboard hook only caught `<modifier> + key` combos,
+so a bare F11 (toggle browser fullscreen), F12 (DevTools), Tab (focus
+next form field / address bar in normal Edge), or Escape (exit
+fullscreen / close modals) all fell straight through to the kiosk
+URL.
+
+### What changed
+
+- New `isAlwaysBlockedKey(vk)` helper in `main.go` returns true for
+  the keys above. The hook calls it inside the existing
+  `filterMode.Load()` branch, before the modifier+key block. Match
+  triggers `promptAndReinject` (the same UX path as Win+R etc.) so
+  an admin can authenticate and let the key through.
+- `isAlwaysAllowedCombo` lost its bare-F5 case. F5 alone was an
+  intentional v1.0 carve-out for page reload, but it conflicted with
+  the new always-block list. Admins who want a manual reload still
+  have Ctrl+R.
+- `sendKeyCombo` already handles the bare-key re-injection case (no
+  modifiers in the slice → just press+release the VK with the
+  kiosk-exit-guard marker so the hook lets it through).
+
+### What still works (intentionally not blocked)
+
+- Letters, numbers, space, punctuation, Enter, Backspace, Delete —
+  normal form fill-in on the kiosk page.
+- Arrow keys, Home/End/PgUp/PgDn — page scrolling.
+- Ctrl+R, Ctrl+0/+/− — manual reload and browser zoom (unchanged
+  Ctrl-only allowlist).
+- Caps Lock, Num Lock, Scroll Lock — toggle keys, not commands.
+- AnyDesk-injected Ctrl+Shift+Alt+K — pause-hotkey carve-out from
+  v1.2.4 is preserved; the new block list runs inside the
+  `!injected && !ourInjection` branch.
+
+
 ## v1.2.5 — 2026-05-13
 
 UI/UX audit pass for unusual viewports (sideways 4K TVs at 300% display

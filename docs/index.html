@@ -155,7 +155,7 @@
 <div class="wrap">
 
 <header>
-  <h1>kiosk-exit-guard <span class="version-pill">v1.2.5</span></h1>
+  <h1>kiosk-exit-guard <span class="version-pill">v1.2.6</span></h1>
   <p class="tagline">Single-binary kiosk lockdown for <strong>Windows 11 Home</strong> and <strong>Windows Server 2022 (RDP / physical console)</strong>. Embedded WebView2 kiosk, password-gated keyboard, Chrome uninstalled, Edge launches blocked at the OS level, self-installing, self-updating, all from one ~7.9&nbsp;MB exe.</p>
 </header>
 
@@ -195,7 +195,19 @@
   <a href="#build">Build</a>
 </nav>
 
-<h2 id="whats-new">v1.2.5 — UI audit, zoom-target fix, stale-shortcut cleanup</h2>
+<h2 id="whats-new">v1.2.6 — block bare F-keys, Tab, Escape, AppMenu, PrintScreen, Insert</h2>
+
+<div class="callout callout-good">
+  <strong>Lockdown widening.</strong> Pre-v1.2.6 the LL keyboard hook only caught <code>&lt;modifier&gt; + key</code> combos, so a bare F11 (toggle browser fullscreen), F12 (DevTools), Tab (focus next form field / address bar in normal Edge), or Escape (exit fullscreen / close modals) all fell straight through to the kiosk URL. v1.2.6 adds an <code>isAlwaysBlockedKey</code> helper that swallows F1–F12, Tab, Escape, the AppMenu (right-click keyboard) key, PrintScreen, and Insert regardless of modifier state, routing each press through the password-prompt → re-inject path (same UX as Win+R).
+  <ul style="margin: 0.6rem 0 0; padding-left: 1.25rem;">
+    <li><strong>Where it lives.</strong> Inside the existing <code>if filterMode.Load()</code> branch in <code>hookCallback</code>, before the modifier+key block. Match triggers <code>promptAndReinject</code>; <code>sendKeyCombo</code> with an empty modifier slice already handles the bare-VK re-injection.</li>
+    <li><strong>Removed: bare F5 from the allowlist.</strong> F5-alone was an intentional v1.0 carve-out for page reload but conflicted with the new always-block list. Manual reload now needs Ctrl+R (which stays in <code>isAlwaysAllowedCombo</code>).</li>
+    <li><strong>What still passes through.</strong> Typing keys (letters, numbers, space, punctuation, Enter, Backspace, Delete) for form fill-in; arrow keys + Home/End/PgUp/PgDn for page scrolling; Ctrl+R + Ctrl+0/+/− for manual reload and browser zoom (unchanged Ctrl-only allowlist); Caps Lock / Num Lock / Scroll Lock as toggle keys.</li>
+    <li><strong>AnyDesk hotkey preserved.</strong> v1.2.4's injected Ctrl+Shift+Alt+K carve-out lives above the <code>!injected &amp;&amp; !ourInjection</code> gate, so the new always-block list applies only to non-injected (local physical) keys. Remote admin keystrokes through AnyDesk still trigger the pause modal on the dedicated chord.</li>
+  </ul>
+</div>
+
+<h2 id="v125">v1.2.5 — UI audit, zoom-target fix, stale-shortcut cleanup</h2>
 
 <div class="callout callout-good">
   <strong>UI/UX audit pass for unusual viewports (sideways 4K TVs at 300% display scaling, low-DPI 1080p landscape, etc.), plus a zoom-target fix so kiosk pages can't double-zoom on top of the v1.2.4 admin-configured zoom, plus stale-shortcut cleanup for upgrades from &lt;v1.2.4.</strong>
