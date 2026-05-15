@@ -5,6 +5,39 @@ All notable changes to kiosk-exit-guard, newest first. Versions follow [Semantic
 For the current state of the project, see the [landing page](https://shalom-karr.github.io/kiosk-exit-guard/), the [architecture doc](architecture.md), and the [admin runbook](admin-runbook.md).
 
 
+## v1.3.2 — 2026-05-15
+
+True browser zoom (Ctrl+- equivalent) for the kiosk page.
+
+Through v1.3.1 the kiosk zoom was applied via `document.body.style.zoom`.
+That scales the body box but the layout **viewport never reflows** — a
+page whose body width is pinned to the viewport just looked vertically
+squished ("just made the height shorter"), nothing like a real browser
+Ctrl+- zoom-out.
+
+v1.3.2 calls the WebView2 controller's **`PutZoomFactor`** — the exact
+COM property Ctrl+- drives, so the viewport reflows and content
+re-lays-out to fill it. The high-level `go-webview2` package hides the
+`*edge.Chromium` behind an unexported field with no accessor, so
+`applyWebViewZoomFactor` reaches it via `reflect`+`unsafe`:
+`webview.browser` → `*edge.Chromium` → `GetController()` →
+`controller.vtbl.PutZoomFactor`. The `double` argument is passed as
+`math.Float64bits` through `ComProc.Call` → `syscall.SyscallN`; Go's
+windows/amd64 syscall ABI mirrors the first integer-register args into
+XMM0–XMM3, so `put_ZoomFactor(double)` reads it correctly from XMM1.
+
+Defensive: the whole path is wrapped in `recover()`, every reflection
+step is nil/validity-checked, and on **any** failure it falls back to
+the legacy CSS-`zoom` injection so zoom never silently no-ops. Applied
+once right after the controller is ready and re-applied via
+`w.Dispatch` once the message loop is pumping. Skipped entirely when
+zoom is 100%. Logs `applyWebViewZoomFactor: PutZoomFactor(<f>) hr=0x<hr>`
+or the fallback reason.
+
+zoom.txt / registry / `--cli-set-zoom` precedence is unchanged — only
+the *mechanism* that consumes the resolved percent changed.
+
+
 ## v1.3.1 — 2026-05-15
 
 Drop-in zoom override file + two diagnostic log lines.

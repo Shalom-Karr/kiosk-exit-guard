@@ -39,11 +39,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"runtime/debug"
 	"strconv"
@@ -55,6 +57,7 @@ import (
 	"unsafe"
 
 	"github.com/jchv/go-webview2"
+	webview2edge "github.com/jchv/go-webview2/pkg/edge"
 	"github.com/ncruces/zenity"
 	"github.com/shirou/gopsutil/v4/process"
 	"golang.org/x/crypto/bcrypt"
@@ -64,7 +67,7 @@ import (
 
 // currentVersion must be kept in sync with versioninfo.json. Used by the
 // --update flow to compare against the latest GitHub release tag.
-const currentVersion = "1.3.1"
+const currentVersion = "1.3.2"
 
 // Auto-update background-check timing. v1.2.1: the controller polls
 // GitHub's /releases/latest on startup (after autoUpdateInitialDelay so
@@ -2985,39 +2988,104 @@ func runWebViewKiosk(url string) {
 					e.stopPropagation();
 				}
 			}, true);
-
-			// v1.2.5 kiosk zoom: apply persisted page-zoom percent via the
-			// CSS zoom property on <body>. v1.2.4 originally targeted
-			// <html> (document.documentElement), which compounded with
-			// any kiosk page that ran its own document.body.style.zoom
-			// fallback — net rendered scale became (admin × page) e.g.
-			// 0.9 × 0.9 = 0.81. Targeting <body> means a page-side
-			// body.style.zoom = "0.9" and our body.style.zoom = "0.9"
-			// land on the same property, so the zoom level doesn't
-			// compound and a page-side idempotence check sees our value
-			// correctly on SPA re-renders.
-			//
-			// Admin config still wins: we apply at DOMContentLoaded AND
-			// window.load, so even a page that sets its own body.zoom
-			// inline during parse gets overridden by the admin's
-			// configured value at DOMContentLoaded.
-			var kioskZoomPct = %d;
-			function applyZoom() {
-				try {
-					if (document.body) { document.body.style.zoom = (kioskZoomPct / 100); }
-				} catch (e) { /* swallow — kiosk URL might sandbox style */ }
-			}
-			if (document.readyState === 'loading') {
-				document.addEventListener('DOMContentLoaded', applyZoom);
-			} else {
-				applyZoom();
-			}
-			window.addEventListener('load', applyZoom);
 		})();
-	`, url, zoomPct))
+	`, url))
+
+	// v1.3.2: apply TRUE browser zoom via the WebView2 controller's
+	// PutZoomFactor (the Ctrl+- equivalent — the layout VIEWPORT reflows)
+	// instead of the CSS `zoom` property used through v1.3.1, which only
+	// scaled the <body> box without reflow ("just made the height
+	// shorter" in the field report). The controller exists by now —
+	// webview2.NewWithOptions blocks until CreateCoreWebView2Controller
+	// completes. If the reflection path fails for any reason we fall back
+	// to the legacy CSS-zoom injection so zoom never silently no-ops.
+	if zoomPct != 100 {
+		if applyWebViewZoomFactor(w, zoomPct) {
+			// Re-apply once the message loop is pumping — belt and
+			// suspenders against any "must be on UI thread" timing.
+			w.Dispatch(func() { applyWebViewZoomFactor(w, zoomPct) })
+		} else {
+			logf("kiosk: PutZoomFactor unavailable — falling back to CSS zoom %d%%", zoomPct)
+			w.Init(fmt.Sprintf(`
+				(function() {
+					var z = %d / 100;
+					function applyZoom() {
+						try { if (document.body) document.body.style.zoom = z; } catch (e) {}
+					}
+					if (document.readyState === 'loading') {
+						document.addEventListener('DOMContentLoaded', applyZoom);
+					} else { applyZoom(); }
+					window.addEventListener('load', applyZoom);
+				})();
+			`, zoomPct))
+		}
+	}
 
 	w.Navigate(url)
 	w.Run() // blocks until window destroyed
+}
+
+// applyWebViewZoomFactor reaches go-webview2's unexported *edge.Chromium
+// (via reflect+unsafe) and calls the controller's PutZoomFactor ComProc,
+// giving the kiosk page TRUE browser zoom — the Ctrl+- equivalent where
+// the layout viewport reflows — instead of the CSS `zoom` property which
+// only scales the body box without reflow. v1.3.2; the high-level
+// webview2 package hides *edge.Chromium behind an unexported field with
+// no public accessor, hence the reflection.
+//
+// Returns true if the COM call was issued. Best-effort: any reflection /
+// nil / COM failure is recovered and returns false so the caller falls
+// back to the legacy CSS-zoom injection. The double argument is passed
+// as math.Float64bits through ComProc.Call → syscall.SyscallN; Go's
+// windows/amd64 syscall ABI mirrors the first integer-register args into
+// XMM0–XMM3, so put_ZoomFactor(double) reads it correctly from XMM1.
+func applyWebViewZoomFactor(w webview2.WebView, pct int) (ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			logf("applyWebViewZoomFactor: recovered from %v — CSS-zoom fallback", r)
+			ok = false
+		}
+	}()
+	factor := float64(pct) / 100.0
+
+	wv := reflect.ValueOf(w)
+	if wv.Kind() != reflect.Ptr || wv.IsNil() {
+		return false
+	}
+	bf := wv.Elem().FieldByName("browser")
+	if !bf.IsValid() {
+		logf("applyWebViewZoomFactor: webview has no 'browser' field (go-webview2 changed?)")
+		return false
+	}
+	bf = reflect.NewAt(bf.Type(), unsafe.Pointer(bf.UnsafeAddr())).Elem()
+	chromium, _ := bf.Interface().(*webview2edge.Chromium)
+	if chromium == nil {
+		logf("applyWebViewZoomFactor: browser is not *edge.Chromium")
+		return false
+	}
+	ctrl := chromium.GetController()
+	if ctrl == nil {
+		logf("applyWebViewZoomFactor: controller nil (not ready)")
+		return false
+	}
+	cv := reflect.ValueOf(ctrl).Elem()
+	vf := cv.FieldByName("vtbl")
+	if !vf.IsValid() {
+		return false
+	}
+	vf = reflect.NewAt(vf.Type(), unsafe.Pointer(vf.UnsafeAddr())).Elem()
+	if vf.IsNil() {
+		return false
+	}
+	pz := vf.Elem().FieldByName("PutZoomFactor")
+	if !pz.IsValid() {
+		return false
+	}
+	proc := webview2edge.ComProc(uintptr(pz.Uint()))
+	thisPtr := reflect.ValueOf(ctrl).Pointer()
+	r1, _, _ := proc.Call(thisPtr, uintptr(math.Float64bits(factor)))
+	logf("applyWebViewZoomFactor: PutZoomFactor(%.2f) hr=0x%x", factor, r1)
+	return true
 }
 
 // ---------- watchdog (manages the WebView2 child) ----------

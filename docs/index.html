@@ -155,7 +155,7 @@
 <div class="wrap">
 
 <header>
-  <h1>kiosk-exit-guard <span class="version-pill">v1.3.1</span></h1>
+  <h1>kiosk-exit-guard <span class="version-pill">v1.3.2</span></h1>
   <p class="tagline">Single-binary kiosk lockdown for <strong>Windows 11 Home</strong> and <strong>Windows Server 2022 (RDP / physical console)</strong>. Embedded WebView2 kiosk, password-gated keyboard, Chrome uninstalled, Edge launches blocked at the OS level, self-installing, self-updating, all from one ~7.9&nbsp;MB exe.</p>
 </header>
 
@@ -195,7 +195,13 @@
   <a href="#build">Build</a>
 </nav>
 
-<h2 id="whats-new">v1.3.1 — shortcut root-cause fix, CLI url/zoom flags, zoom.txt</h2>
+<h2 id="whats-new">v1.3.2 — true browser zoom (Ctrl+- equivalent)</h2>
+
+<div class="callout callout-good">
+  <strong>Kiosk zoom now uses the WebView2 controller's <code>PutZoomFactor</code> — the exact COM property Ctrl+- drives — instead of CSS <code>zoom</code>.</strong> Through v1.3.1, <code>document.body.style.zoom</code> scaled the body box but the layout viewport never reflowed, so a viewport-pinned page just looked vertically squished. v1.3.2 reflows the viewport like a real browser zoom-out. The high-level go-webview2 package hides <code>*edge.Chromium</code> behind an unexported field, so <code>applyWebViewZoomFactor</code> reaches it via reflect+unsafe (<code>webview.browser → *edge.Chromium → GetController() → controller.vtbl.PutZoomFactor</code>); the <code>double</code> arg goes through <code>ComProc.Call → syscall.SyscallN</code> with <code>math.Float64bits</code> (Go's windows/amd64 ABI mirrors args into XMM, so <code>put_ZoomFactor</code> reads XMM1 correctly). Wrapped in <code>recover()</code> with full nil-checking; on any failure it falls back to the legacy CSS-zoom injection so zoom never silently no-ops. zoom.txt / registry / <code>--cli-set-zoom</code> precedence is unchanged — only the mechanism that consumes the percent changed.
+</div>
+
+<h2 id="v131">v1.3.1 — shortcut root-cause fix, CLI url/zoom flags, zoom.txt</h2>
 
 <div class="callout callout-good">
   <strong>Fixes the real reason desktop shortcuts did nothing, adds a console-only escape hatch, and a drop-in zoom override file.</strong>
