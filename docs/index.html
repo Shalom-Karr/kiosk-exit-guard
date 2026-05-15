@@ -195,7 +195,31 @@
   <a href="#build">Build</a>
 </nav>
 
-<h2 id="whats-new">v1.3.0 — WebView2 URL form, log rotation, versioned shortcuts, double-right-click pause</h2>
+<h2 id="whats-new">v1.3.1 — shortcut root-cause fix, CLI url/zoom flags, zoom.txt</h2>
+
+<div class="callout callout-good">
+  <strong>Fixes the real reason desktop shortcuts did nothing, adds a console-only escape hatch, and a drop-in zoom override file.</strong>
+  <ul style="margin: 0.6rem 0 0; padding-left: 1.25rem;">
+    <li><strong>Shortcut bug root cause.</strong> The v1.2.4 code assumed a <code>schtasks /Create /RU SYSTEM /RL HIGHEST</code> task's default security descriptor grants interactive Users RUN permission. It does not — only SYSTEM and Administrators get RUN. A desktop <code>.lnk</code> click never elevates, so it ran <code>schtasks /Run</code> with the split-token admin's <em>filtered</em> token, which had no run permission → access-denied → the minimized window hid the error → "shortcut does nothing", no <code>--shortcut-handler</code> ever logged. v1.3.1's <code>grantTaskRunToUsers</code> rewrites each task's SD via the <code>Schedule.Service</code> COM <code>SetSecurityDescriptor</code> to <code>D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;AU)</code> — SYSTEM + Administrators full, Authenticated Users read+execute — so a non-elevated click can finally trigger it. The <code>.lnk</code> task name is also quoted now.</li>
+    <li><strong><code>--cli-set-url</code> / <code>--cli-set-zoom</code>.</strong> Console-only admin flags, run from an elevated PowerShell after pausing the filter (double-right-click). Password and value read from stdin, verified against the bcrypt hash — no WebView2, no zenity, no scheduled task — so the URL/zoom are changeable even if the shortcut path is broken. <code>--cli-set-url</code> saves and kills the kiosk child so it reloads; <code>--cli-set-zoom</code> writes both the registry and zoom.txt.</li>
+    <li><strong>zoom.txt drop-in override.</strong> Write a number into <code>%ProgramData%\KioskExitGuard\zoom.txt</code> (e.g. <code>90</code>) and the kiosk renders at that page-zoom on the next launch. zoom.txt wins over the <code>KioskZoom</code> registry value and syncs back into it, so the <code>--set-url</code> form's pre-fill stays consistent. Tolerates a trailing <code>%</code>, comment, and CRLF; clamped 50–200.</li>
+    <li><strong>Two new field-log lines.</strong> <code>kiosk: rendering "&lt;url&gt;" at zoom &lt;n&gt;%</code> on every kiosk paint, and <code>watchdog: kiosk child not running — relaunching (next tick in 30s)</code> on the relaunch transition only (silent when the child is alive, so the 30 s cadence doesn't flood the log).</li>
+  </ul>
+</div>
+
+<h2 id="v130">v1.3.0 — runtime fixes: SID mapping, log path, service privileges</h2>
+
+<div class="callout callout-good">
+  <strong>Four field-reported runtime fixes (contributed via Copilot cloud-agent PRs). These close out the elevation / SID-mapping / log-path problems chased across the v1.2.x line.</strong>
+  <ul style="margin: 0.6rem 0 0; padding-left: 1.25rem;">
+    <li><strong>installStartupTask SID mapping.</strong> <code>New-ScheduledTaskPrincipal</code> used <code>$env:USERNAME</code>, which is <code>SYSTEM</code> (or empty) in the LocalSystem service context — Task Scheduler can't map that to an interactive-logon SID and returned <code>HRESULT 0x80070534</code> ("No mapping between account names and security IDs was done"), the error that flooded the v1.2.3 field logs. Now resolves the real interactive user via <code>os/user.Current()</code>, strips the <code>DOMAIN\</code> prefix, passes it as <code>KEG_USER</code>, fails early with a clear log line if it still can't resolve.</li>
+    <li><strong>parentProcessImagePath.</strong> <code>ERROR_GEN_FAILURE (31)</code> ("a device attached to the system is not functioning") is now absorbed silently like the other expected parent-already-exited errors instead of logging a scary line every service spawn.</li>
+    <li><strong>Log path moved to <code>%ProgramData%\KioskExitGuard\logs\</code>.</strong> The v1.2.9 <code>&lt;install-dir&gt;/logs/</code> layout failed once the exe relocated to <code>C:\Program Files\KioskExitGuard\</code> — standard users can't create files there. <code>%ProgramData%</code> is user-writable and already hosts the WebView2 data dir.</li>
+    <li><strong>Service spawn privileges.</strong> <code>enableServiceSpawnPrivileges</code> enables <code>SeAssignPrimaryTokenPrivilege</code> + <code>SeIncreaseQuotaPrivilege</code> on the process token before <code>CreateProcessAsUser</code>. LocalSystem holds these by default but they're disabled; enabling them is the root-cause fix for the <code>ERROR_ELEVATION_REQUIRED</code> spawn loop the v1.2.3 linked-token swap only treated symptomatically. Applied to both the Service supervisor path and <code>spawnFlagAsUserInSession</code>. Release workflow also gained a <code>workflow_dispatch</code> trigger.</li>
+  </ul>
+</div>
+
+<h2 id="v129">v1.2.9 — WebView2 URL form, log rotation, versioned shortcuts, double-right-click pause</h2>
 
 <div class="callout callout-good">
   <strong>Cleans up the v1.2.8 queue: WebView2 form for the URL change flow, six-hour log rotation, versioned shortcut filenames, and a new LL mouse hook for double-right-click pause.</strong>
