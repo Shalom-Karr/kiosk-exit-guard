@@ -715,6 +715,10 @@ func wtsSessionString(sessionID uint32, infoClass uint32) string {
 // Returns the process handle on success — the caller is responsible for
 // closing it. The thread handle is closed inside this function.
 func (s *kioskExitGuardService) spawnControllerInSession(sessionID uint32) (windows.Handle, error) {
+	// v1.2.10: ensure SE_ASSIGNPRIMARYTOKEN_NAME and SE_INCREASE_QUOTA_NAME
+	// are enabled on our process token before calling CreateProcessAsUser.
+	enableServiceSpawnPrivileges()
+
 	exe, err := os.Executable()
 	if err != nil {
 		return 0, fmt.Errorf("Executable: %w", err)
@@ -1093,6 +1097,9 @@ func isLegitimateCandidateHandle(hProc windows.Handle, expectedPath string) bool
 // the caller does not wait). Errors flow back to the --shortcut-handler
 // entry point in main.go which logs them.
 func spawnFlagAsUserInSession(sessionID uint32, flag string) error {
+	// v1.2.10: same privilege enablement as the main Service spawn path.
+	enableServiceSpawnPrivileges()
+
 	exe := canonicalInstallPath()
 
 	var userToken windows.Token
@@ -1258,6 +1265,47 @@ func appendEnvVar(block *uint16, name, value string) []uint16 {
 	return out
 }
 
+// enableServiceSpawnPrivileges enables the SE_ASSIGNPRIMARYTOKEN_NAME and
+// SE_INCREASE_QUOTA_NAME privileges on the current process token. Both are
+// required by CreateProcessAsUser when spawning a process under a different
+// user's token from a service context. LocalSystem normally possesses these
+// privileges but they are disabled by default; enabling them avoids the
+// "The requested operation requires elevation" error when the token
+// duplication itself succeeds but the spawn call rejects the token.
+//
+// Best-effort: errors are logged but not returned. On failure the subsequent
+// CreateProcessAsUser call will produce a descriptive error anyway.
+func enableServiceSpawnPrivileges() {
+	var token windows.Token
+	proc := windows.CurrentProcess()
+	if err := windows.OpenProcessToken(proc, windows.TOKEN_ADJUST_PRIVILEGES|windows.TOKEN_QUERY, &token); err != nil {
+		logf("enableServiceSpawnPrivileges: OpenProcessToken: %v", err)
+		return
+	}
+	defer token.Close()
+
+	for _, name := range []string{"SeAssignPrimaryTokenPrivilege", "SeIncreaseQuotaPrivilege"} {
+		namePtr, err := syscall.UTF16PtrFromString(name)
+		if err != nil {
+			continue
+		}
+		var luid windows.LUID
+		if err := windows.LookupPrivilegeValue(nil, namePtr, &luid); err != nil {
+			logf("enableServiceSpawnPrivileges: LookupPrivilegeValue(%s): %v", name, err)
+			continue
+		}
+		tp := windows.Tokenprivileges{
+			PrivilegeCount: 1,
+			Privileges: [1]windows.LUIDAndAttributes{
+				{Luid: luid, Attributes: windows.SE_PRIVILEGE_ENABLED},
+			},
+		}
+		if err := windows.AdjustTokenPrivileges(token, false, &tp, 0, nil, nil); err != nil {
+			logf("enableServiceSpawnPrivileges: AdjustTokenPrivileges(%s): %v", name, err)
+		}
+	}
+}
+
 // ---------- entry points ----------
 
 // runService is the --service-run entry point. SCM invokes the exe with
@@ -1393,6 +1441,15 @@ func parentProcessImagePath() (string, bool) {
 	buf := make([]uint16, windows.MAX_PATH)
 	size := uint32(len(buf))
 	if err := windows.QueryFullProcessImageName(hProc, 0, &buf[0], &size); err != nil {
+		// v1.2.10: ERROR_GEN_FAILURE (31, "A device attached to the
+		// system is not functioning") occurs when the parent process has
+		// already terminated or entered a zombie state before we could
+		// query its image path. Treat it the same as the OpenProcess
+		// expected-errors — silently return so the caller falls back to
+		// the env-var hint.
+		if errors.Is(err, syscall.Errno(windows.ERROR_GEN_FAILURE)) {
+			return "", false
+		}
 		logf("parentProcessImagePath: QueryFullProcessImageName(parent=%d) failed: %v", parentPID, err)
 		return "", false
 	}

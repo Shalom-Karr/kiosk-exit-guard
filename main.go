@@ -41,6 +41,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
@@ -108,13 +109,14 @@ func logBucketLabel(t time.Time) string {
 }
 
 // logPathForBucket returns the full path of the log file for the given
-// bucket label, inside <install-dir>/logs/.
+// bucket label, inside %ProgramData%\KioskExitGuard\logs\.
+//
+// v1.2.10: moved from <install-dir>/logs/ to %ProgramData%\KioskExitGuard\logs/
+// because when the exe is relocated to C:\Program Files\KioskExitGuard\,
+// standard users cannot create or write files under that directory. The
+// %ProgramData% root is user-writable and already used for WebView2 data.
 func logPathForBucket(bucket string) (string, error) {
-	exe, err := os.Executable()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(filepath.Dir(exe), logDirName,
+	return filepath.Join(programDataDir(), logDirName,
 		fmt.Sprintf("kiosk-exit-guard-%s.log", bucket)), nil
 }
 
@@ -1543,11 +1545,32 @@ func installStartupTask() error {
 	// PowerShell's -EncodedCommand expects a UTF-16-LE base64-encoded
 	// script. cmd.Env scoping keeps KEG_EXE/KEG_TASKNAME out of the
 	// parent process's environment.
+	// v1.2.10: resolve the real interactive user's account name instead
+	// of relying on $env:USERNAME, which evaluates to "SYSTEM" (or empty)
+	// when the function runs under the LocalSystem service context. The
+	// Task Scheduler cannot map "SYSTEM" to an interactive-logon SID and
+	// returns HRESULT 0x80070534 ("No mapping between account names and
+	// security IDs was done."). user.Current().Username gives us the
+	// correct DOMAIN\user even from an elevated or service context;
+	// we pass it as KEG_USER and reference $env:KEG_USER in the script.
+	userName := os.Getenv("USERNAME")
+	if u, err := user.Current(); err == nil {
+		// user.Current().Username is "DOMAIN\user"; Task Scheduler
+		// accepts either form, but the bare username is safer for
+		// workgroup machines where the domain part equals the machine
+		// name and sometimes confuses the SID mapper.
+		parts := strings.SplitN(u.Username, `\`, 2)
+		if len(parts) == 2 {
+			userName = parts[1]
+		} else {
+			userName = u.Username
+		}
+	}
 	const psScript = `
 $action  = New-ScheduledTaskAction -Execute $env:KEG_EXE
 $logon   = New-ScheduledTaskTrigger -AtLogOn
 $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -Hidden
-$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -RunLevel Highest -LogonType Interactive
+$principal = New-ScheduledTaskPrincipal -UserId $env:KEG_USER -RunLevel Highest -LogonType Interactive
 Register-ScheduledTask -TaskName $env:KEG_TASKNAME -Action $action -Trigger $logon -Settings $settings -Principal $principal -Force | Out-Null
 `
 	utf16 := utf16LEBytes(psScript)
@@ -1557,6 +1580,7 @@ Register-ScheduledTask -TaskName $env:KEG_TASKNAME -Action $action -Trigger $log
 	cmd.Env = append(os.Environ(),
 		"KEG_EXE="+exe,
 		"KEG_TASKNAME="+taskName,
+		"KEG_USER="+userName,
 	)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("Register-ScheduledTask failed: %v: %s", err, strings.TrimSpace(string(out)))
