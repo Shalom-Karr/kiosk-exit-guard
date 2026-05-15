@@ -1553,7 +1553,7 @@ func installStartupTask() error {
 	// security IDs was done."). user.Current().Username gives us the
 	// correct DOMAIN\user even from an elevated or service context;
 	// we pass it as KEG_USER and reference $env:KEG_USER in the script.
-	userName := os.Getenv("USERNAME")
+	var userName string
 	if u, err := user.Current(); err == nil {
 		// user.Current().Username is "DOMAIN\user"; Task Scheduler
 		// accepts either form, but the bare username is safer for
@@ -1565,6 +1565,9 @@ func installStartupTask() error {
 		} else {
 			userName = u.Username
 		}
+	}
+	if userName == "" || strings.EqualFold(userName, "SYSTEM") {
+		return fmt.Errorf("installStartupTask: cannot resolve interactive user name (got %q); scheduled task requires a real user account", userName)
 	}
 	const psScript = `
 $action  = New-ScheduledTaskAction -Execute $env:KEG_EXE
