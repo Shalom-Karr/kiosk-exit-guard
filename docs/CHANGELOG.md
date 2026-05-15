@@ -5,6 +5,42 @@ All notable changes to kiosk-exit-guard, newest first. Versions follow [Semantic
 For the current state of the project, see the [landing page](https://shalom-karr.github.io/kiosk-exit-guard/), the [architecture doc](architecture.md), and the [admin runbook](admin-runbook.md).
 
 
+## v1.3.4 — 2026-05-15
+
+Root-cause fix for the recurring WebView2 panic — per-purpose profile
+directories.
+
+Through v1.3.3 every WebView2 instance (kiosk window, password modal,
+toast, first-run wizard, update-notify, set-url dialog, pause dialog)
+shared ONE user-data folder: `%ProgramData%\KioskExitGuard\WebView2`.
+WebView2 takes an **exclusive lock** on its user-data folder. The kiosk
+window is the only long-lived one and the watchdog respawns it every
+30 s, so whenever a second WebView2 touched the same profile while the
+kiosk held it — a service restart racing the old controller, an
+update/notify/password modal popping while the kiosk was up, two
+controllers briefly co-existing during `killRunningController` — the
+loser's `CreateCoreWebView2Controller` failed and go-webview2
+dereferenced nil → `PANIC in main` at
+`CreateCoreWebView2ControllerCompleted`. It only "recovered" because
+`recoverAndLog` caught it and the watchdog relaunched 30 s later once
+the lock cleared: a 30-second kiosk gap plus an ugly panic in the log
+after every restart and every auto-update.
+
+v1.3.4 makes `webView2DataPath`/`ensureWebView2DataDir` take a
+`purpose` argument and return
+`%ProgramData%\KioskExitGuard\WebView2\<purpose>`. Each of the seven
+WebView2 uses now has its own lockable folder — `kiosk`, `modal`,
+`pause`, `update`, `seturl`, `toast`, `wizard` — so the kiosk's
+profile is never contended by anything else. The v1.1.8 HIGH#4 intent
+(keep the profile out of user-writable `%LOCALAPPDATA%`) is preserved;
+it's still under `%ProgramData%`, just partitioned.
+
+Old installs have a flat profile at `…\WebView2\EBWebView`; the new
+layout uses `…\WebView2\kiosk\EBWebView` etc. The old flat directory
+becomes orphaned disk space after upgrade (harmless) — no migration
+step.
+
+
 ## v1.3.3 — 2026-05-15
 
 One-step pause dialog. Triggering a pause (Ctrl+Shift+Alt+K or

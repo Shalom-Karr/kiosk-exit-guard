@@ -155,7 +155,7 @@
 <div class="wrap">
 
 <header>
-  <h1>kiosk-exit-guard <span class="version-pill">v1.3.3</span></h1>
+  <h1>kiosk-exit-guard <span class="version-pill">v1.3.4</span></h1>
   <p class="tagline">Single-binary kiosk lockdown for <strong>Windows 11 Home</strong> and <strong>Windows Server 2022 (RDP / physical console)</strong>. Embedded WebView2 kiosk, password-gated keyboard, Chrome uninstalled, Edge launches blocked at the OS level, self-installing, self-updating, all from one ~7.9&nbsp;MB exe.</p>
 </header>
 
@@ -195,7 +195,13 @@
   <a href="#build">Build</a>
 </nav>
 
-<h2 id="whats-new">v1.3.3 — one-step pause dialog</h2>
+<h2 id="whats-new">v1.3.4 — root-cause fix: per-purpose WebView2 profiles (kills the recurring panic)</h2>
+
+<div class="callout callout-good">
+  <strong>The recurring <code>PANIC in main</code> at <code>CreateCoreWebView2ControllerCompleted</code> after every restart/update is fixed at the root.</strong> Through v1.3.3 all seven WebView2 instances shared one user-data folder, and WebView2 takes an exclusive lock on it. The kiosk window is long-lived and the watchdog respawns it every 30 s, so any time a second WebView2 touched the shared profile while the kiosk held it (service restart racing the old controller, a modal/update prompt popping while the kiosk was up, two controllers co-existing during <code>killRunningController</code>) the loser's controller-create failed and go-webview2 deref'd nil → panic → 30 s kiosk gap + ugly log spam. v1.3.4 gives each purpose its own folder under <code>%ProgramData%\KioskExitGuard\WebView2\&lt;purpose&gt;</code> (<code>kiosk</code>, <code>modal</code>, <code>pause</code>, <code>update</code>, <code>seturl</code>, <code>toast</code>, <code>wizard</code>) so the kiosk's profile is never contended. v1.1.8 HIGH#4's intent is preserved — still under <code>%ProgramData%</code>, just partitioned. Old flat <code>…\WebView2\EBWebView</code> becomes harmless orphaned disk space after upgrade; no migration step.
+</div>
+
+<h2 id="v133">v1.3.3 — one-step pause dialog</h2>
 
 <div class="callout callout-good">
   <strong>Pausing is now a single screen: password + duration together.</strong> Ctrl+Shift+Alt+K, double-right-click, or the "Pause SK Filter" shortcut opens one modal with the password field and a duration grid (1/5/10/15/20/30/45/60 min + a custom 1–100 box). Type the password, click a duration, done — replacing the old two-step flow (password modal, then a separate zenity duration list). New <code>pausePromptHTML</code> + <code>runPauseDialogInProcess</code> (sibling of the password modal: same prompt lock, inactivity/fallback timers, fullscreen-topmost host, 3-attempt inline retry) + an <code>--ask-pause</code> child (zero prior WebView2 → no second-instance panic; minutes via stdout). The pre-kill of the kiosk before the picker is gone (the combined modal is itself topmost, so no kiosk blink on cancel); the kiosk is killed only once the pause is committed. WebView2-unavailable machines fall back to the legacy two-step zenity flow.

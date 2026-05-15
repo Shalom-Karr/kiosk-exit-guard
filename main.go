@@ -67,7 +67,7 @@ import (
 
 // currentVersion must be kept in sync with versioninfo.json. Used by the
 // --update flow to compare against the latest GitHub release tag.
-const currentVersion = "1.3.3"
+const currentVersion = "1.3.4"
 
 // Auto-update background-check timing. v1.2.1: the controller polls
 // GitHub's /releases/latest on startup (after autoUpdateInitialDelay so
@@ -620,13 +620,32 @@ func ensureAdminOnlyDir(dir string) error {
 	return nil
 }
 
-// webView2DataPath is the WebView2 user-data folder shared across all
-// in-process WebView2 instances (password modal, toast, first-run wizard,
-// kiosk page, update notify). v1.1.8 security fix HIGH#4 moved the profile
-// out of %LOCALAPPDATA% to keep the kiosk user from planting a service
-// worker that intercepts the password modal's kgSubmit binding.
-func webView2DataPath() string {
-	return filepath.Join(programDataDir(), "WebView2")
+// webView2DataPath returns the per-purpose WebView2 user-data folder:
+// %ProgramData%\KioskExitGuard\WebView2\<purpose>.
+//
+// v1.3.4 ROOT-CAUSE FIX for the recurring nil-deref panic in
+// go-webview2's CreateCoreWebView2ControllerCompleted: through v1.3.3
+// EVERY WebView2 instance (kiosk window, password modal, toast,
+// first-run wizard, update-notify, set-url, pause dialog) shared ONE
+// profile dir. WebView2 takes an exclusive lock on its user-data
+// folder. The kiosk window is long-lived AND the watchdog respawns it
+// every 30 s; whenever a second WebView2 touched the SAME profile while
+// the kiosk held it (service restart racing the old controller, an
+// update/notify/password modal popping while the kiosk was up, two
+// controllers briefly co-existing during killRunningController), the
+// loser's CreateCoreWebView2Controller failed and go-webview2 deref'd
+// nil → panic. It "recovered" only because recoverAndLog caught it and
+// the watchdog relaunched 30 s later once the lock cleared — a 30 s
+// kiosk gap + an ugly panic after every restart/update.
+//
+// Per-purpose subdirs mean the kiosk's profile is never contended by
+// any other WebView2: each lives in its own lockable folder. v1.1.8
+// HIGH#4's intent (keep the profile out of user-writable %LOCALAPPDATA%)
+// is preserved — still under %ProgramData% — and isolation across
+// purposes is now actually real rather than the false claim the old
+// comment made.
+func webView2DataPath(purpose string) string {
+	return filepath.Join(programDataDir(), "WebView2", purpose)
 }
 
 // ensureWebView2DataDir lazily creates the WebView2 user-data directory
@@ -658,8 +677,8 @@ func webView2DataPath() string {
 //   icacls "C:\ProgramData\KioskExitGuard\WebView2" /grant "Users:(OI)(CI)M"
 //
 // to repair the existing install.
-func ensureWebView2DataDir() string {
-	p := webView2DataPath()
+func ensureWebView2DataDir(purpose string) string {
+	p := webView2DataPath(purpose)
 	_ = os.MkdirAll(p, 0o700)
 	cmd := exec.Command("icacls", p, "/grant", `BUILTIN\Users:(OI)(CI)M`)
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
@@ -1190,7 +1209,7 @@ func runSetURLAndZoomDialog() (string, int, bool) {
 	w := webview2.NewWithOptions(webview2.WebViewOptions{
 		Debug:     false,
 		AutoFocus: true,
-		DataPath:  ensureWebView2DataDir(),
+		DataPath:  ensureWebView2DataDir("seturl"),
 		WindowOptions: webview2.WindowOptions{
 			Title:  "SK Filter — change URL",
 			Width:  640,
@@ -1959,7 +1978,7 @@ func showFrontmostToast(text string, duration time.Duration) {
 	w := webview2.NewWithOptions(webview2.WebViewOptions{
 		Debug:     false,
 		AutoFocus: false,
-		DataPath:  ensureWebView2DataDir(),
+		DataPath:  ensureWebView2DataDir("toast"),
 		WindowOptions: webview2.WindowOptions{
 			Title:  "SK Filter",
 			Width:  scaleToastDim(480),
@@ -2593,7 +2612,7 @@ func runFirstRunWizard() *firstRunInput {
 	w := webview2.NewWithOptions(webview2.WebViewOptions{
 		Debug:     false,
 		AutoFocus: true,
-		DataPath:  ensureWebView2DataDir(),
+		DataPath:  ensureWebView2DataDir("wizard"),
 		WindowOptions: webview2.WindowOptions{
 			Title:  "kiosk-exit-guard — first run",
 			Width:  720, // overridden by makeModalFullscreenTopmost
@@ -2953,7 +2972,7 @@ func runWebViewKiosk(url string) {
 	w := webview2.NewWithOptions(webview2.WebViewOptions{
 		Debug:     false,
 		AutoFocus: true,
-		DataPath:  ensureWebView2DataDir(),
+		DataPath:  ensureWebView2DataDir("kiosk"),
 		WindowOptions: webview2.WindowOptions{
 			Title:  "Kiosk",
 			Width:  1024,
@@ -4116,7 +4135,7 @@ func askPasswordModalInProcess(title, subtitle string, topAlign bool) passwordRe
 	w := webview2.NewWithOptions(webview2.WebViewOptions{
 		Debug:     false,
 		AutoFocus: true,
-		DataPath:  ensureWebView2DataDir(),
+		DataPath:  ensureWebView2DataDir("modal"),
 		WindowOptions: webview2.WindowOptions{
 			Title:  "SK Filter — password required",
 			Width:  640, // overridden by makeModalFullscreenTopmost
@@ -4311,7 +4330,7 @@ func runPauseDialogInProcess() pauseResult {
 	w := webview2.NewWithOptions(webview2.WebViewOptions{
 		Debug:     false,
 		AutoFocus: true,
-		DataPath:  ensureWebView2DataDir(),
+		DataPath:  ensureWebView2DataDir("pause"),
 		WindowOptions: webview2.WindowOptions{
 			Title:  "SK Filter — pause",
 			Width:  640,
@@ -5506,7 +5525,7 @@ func runAutoUpdateNotifyInvocation() {
 	w := webview2.NewWithOptions(webview2.WebViewOptions{
 		Debug:     false,
 		AutoFocus: true,
-		DataPath:  ensureWebView2DataDir(),
+		DataPath:  ensureWebView2DataDir("update"),
 		WindowOptions: webview2.WindowOptions{
 			Title:  "SK Filter — update available",
 			Width:  640, // overridden by makeModalFullscreenTopmost
