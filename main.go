@@ -28,6 +28,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -63,7 +64,7 @@ import (
 
 // currentVersion must be kept in sync with versioninfo.json. Used by the
 // --update flow to compare against the latest GitHub release tag.
-const currentVersion = "1.3.0"
+const currentVersion = "1.3.1"
 
 // Auto-update background-check timing. v1.2.1: the controller polls
 // GitHub's /releases/latest on startup (after autoUpdateInitialDelay so
@@ -799,10 +800,77 @@ func clampKioskZoom(percent int) int {
 	return percent
 }
 
-// loadKioskZoomPercent reads the persisted page-zoom percent from HKLM,
-// defaulting to defaultKioskZoom when the value is absent or unreadable.
+// zoomTxtPath is the v1.3.1 drop-in override file:
+// %ProgramData%\KioskExitGuard\zoom.txt. An admin (or an admin script)
+// can write a single number into it to force the kiosk page zoom
+// without going through the --set-url WebView2 form. Read on every
+// --webview launch by loadKioskZoomPercent.
+func zoomTxtPath() string {
+	return filepath.Join(programDataDir(), "zoom.txt")
+}
+
+// readZoomTxt returns (percent, true) if zoom.txt exists and its first
+// whitespace-trimmed token parses as an integer. A trailing "%", CRLF,
+// surrounding whitespace, and extra lines are tolerated — only the first
+// token is parsed. Returns (0, false) when the file is absent, empty,
+// or unparseable so the caller falls back to the registry.
+func readZoomTxt() (int, bool) {
+	b, err := os.ReadFile(zoomTxtPath())
+	if err != nil {
+		return 0, false
+	}
+	s := strings.TrimSpace(string(b))
+	if s == "" {
+		return 0, false
+	}
+	// Take the first whitespace-delimited token so "90", "90%", and
+	// "90 # comment" all work.
+	if i := strings.IndexAny(s, " \t\r\n"); i >= 0 {
+		s = s[:i]
+	}
+	s = strings.TrimSuffix(strings.TrimSpace(s), "%")
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// loadKioskZoomPercent resolves the page-zoom percent. v1.3.1 precedence:
+//
+//  1. %ProgramData%\KioskExitGuard\zoom.txt — if present and valid, it
+//     WINS, and the clamped value is synced back into the registry so
+//     the --set-url WebView2 form and zoom.txt stay consistent (the
+//     file becomes the source of truth on each launch).
+//  2. HKLM\Software\KioskExitGuard\KioskZoom DWORD — the value the
+//     WebView2 form reads/writes.
+//  3. defaultKioskZoom (100) when neither is set or readable.
+//
 // The result is always inside [minKioskZoom, maxKioskZoom].
 func loadKioskZoomPercent() int {
+	if raw, ok := readZoomTxt(); ok {
+		z := clampKioskZoom(raw)
+		// Sync into the registry so the --set-url form shows the same
+		// value next time it's opened. Best-effort — a failed sync just
+		// means the form's pre-fill is stale until the next save; the
+		// kiosk still renders at z because we return it regardless.
+		if cur := registryZoomPercent(); cur != z {
+			if err := saveKioskZoomPercent(z); err != nil {
+				logf("loadKioskZoomPercent: zoom.txt=%d sync to registry failed: %v", z, err)
+			} else {
+				logf("loadKioskZoomPercent: zoom.txt=%d (raw %d) synced to registry (was %d)", z, raw, cur)
+			}
+		}
+		return z
+	}
+	return registryZoomPercent()
+}
+
+// registryZoomPercent reads just the HKLM KioskZoom DWORD, clamped,
+// defaulting to defaultKioskZoom. Split out of loadKioskZoomPercent so
+// the zoom.txt sync path can compare against the current registry value
+// without recursing through the zoom.txt check.
+func registryZoomPercent() int {
 	k, err := registry.OpenKey(registry.LOCAL_MACHINE, regAppKey, registry.QUERY_VALUE)
 	if err != nil {
 		return defaultKioskZoom
@@ -2164,9 +2232,21 @@ func installShortcutTasks() error {
 		//   /SC ONCE /ST 00:00 /RU SYSTEM /RL HIGHEST
 		// /SC ONCE + /ST 00:00 is a no-op trigger in the past; combined
 		// with /Z (= delete after expiry) it would delete itself, so we
-		// omit /Z. Default DACL on a SYSTEM /HIGHEST task grants Users
-		// Read + Execute, which is exactly the "any logged-in user can
-		// /Run this" permission we need. We don't need to touch the SD.
+		// omit /Z.
+		//
+		// v1.3.1 ROOT-CAUSE FIX: the pre-v1.3.1 comment here claimed the
+		// default DACL on a `/RU SYSTEM /RL HIGHEST` task grants Users
+		// Read+Execute. That was WRONG. schtasks /Create's default
+		// security descriptor grants RUN only to SYSTEM and
+		// Administrators — NOT to interactive Users, and NOT to a
+		// split-token admin's *filtered* (non-elevated) token. So a
+		// plain desktop-shortcut click (which never elevates) invoked
+		// `schtasks /Run /TN KioskExitGuard_X` with a token that had no
+		// run permission on the task → access denied → the .lnk's
+		// minimized window hid the error → "shortcut does nothing", no
+		// --shortcut-handler line ever logged. grantTaskRunToUsers below
+		// rewrites the task SD to additionally grant Authenticated Users
+		// read+execute so the non-elevated click can trigger it.
 		tr := fmt.Sprintf(`"%s" --shortcut-handler %s`, exe, sc.flag)
 		args := []string{
 			"/Create", "/F",
@@ -2183,9 +2263,41 @@ func installShortcutTasks() error {
 			logf("installShortcutTasks: schtasks /Create %s failed: %v: %s", sc.taskName, err, strings.TrimSpace(string(out)))
 			return fmt.Errorf("schtasks /Create %s: %w", sc.taskName, err)
 		}
+		grantTaskRunToUsers(sc.taskName)
 	}
 	logf("installShortcutTasks: registered %d shortcut tasks", len(shortcutSpecs()))
 	return nil
+}
+
+// grantTaskRunToUsers rewrites a scheduled task's security descriptor so
+// SYSTEM and Administrators keep full control and Authenticated Users
+// gain read+execute (the right needed to invoke `schtasks /Run`). schtasks
+// itself has no /SD option on /Create or /CHANGE, so we go through the
+// Schedule.Service COM object's SetSecurityDescriptor. Best-effort: a
+// failure is logged but doesn't abort install — the task still exists,
+// it's just only triggerable by an elevated admin (the pre-v1.3.1
+// behavior). v1.3.1.
+//
+// SDDL: D:P(...) — P = protected (don't inherit a broader ACL from the
+// Tasks folder). FA = full for SYSTEM (SY) and Administrators (BA).
+// 0x1200a9 = the task read+execute mask (generic-read + generic-execute
+// equivalent) for Authenticated Users (AU), which is exactly enough to
+// /Run the task without granting modify/delete.
+func grantTaskRunToUsers(taskName string) {
+	const ps = `
+$ErrorActionPreference='Stop'
+$svc = New-Object -ComObject Schedule.Service
+$svc.Connect()
+$f = $svc.GetFolder('\')
+$t = $f.GetTask($env:KEG_TN)
+$t.SetSecurityDescriptor('D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;AU)', 0)
+`
+	cmd := exec.Command("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps)
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+	cmd.Env = append(os.Environ(), "KEG_TN="+taskName)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		logf("grantTaskRunToUsers(%s): SetSecurityDescriptor failed: %v: %s", taskName, err, strings.TrimSpace(string(out)))
+	}
 }
 
 // uninstallShortcutTasks (idempotent) deletes every task registered by
@@ -2314,7 +2426,7 @@ if (-not $desktop) { $desktop = [Environment]::GetFolderPath('Desktop') }
 		fmt.Fprintf(&sb, `
 $lnk = $ws.CreateShortcut((Join-Path $desktop '%s.lnk'))
 $lnk.TargetPath = '%s'
-$lnk.Arguments = '/Run /TN %s'
+$lnk.Arguments = '/Run /TN "%s"'
 $lnk.WorkingDirectory = ''
 $lnk.IconLocation = ('%s' + ',0')
 $lnk.Description = '%s'
@@ -2862,6 +2974,7 @@ func runWebViewKiosk(url string) {
 	// at the JS level (and again at the navigation event in a real
 	// hardened build, but this catches all anchor clicks).
 	zoomPct := loadKioskZoomPercent()
+	logf("kiosk: rendering %q at zoom %d%%", url, zoomPct)
 	w.Init(fmt.Sprintf(`
 		(function() {
 			var kioskPrefix = %q;
@@ -3023,9 +3136,16 @@ func watchdogTick() {
 		// flipped (syncFilterStateLoop polls every 2s). Skip the
 		// relaunch so the user doesn't see the kiosk briefly reappear.
 		if pauseJustAppliedActive() {
+			logf("watchdog: filter active but pause-just-applied marker set — skipping relaunch this tick")
 			return
 		}
 		if findOurWebViewChild() == nil {
+			// v1.3.1: log the relaunch so the field log shows exactly
+			// when (and how often) the kiosk window is being respawned.
+			// Only logged on the relaunch transition — a tick that finds
+			// the child already alive is a silent no-op so the 30 s
+			// cadence doesn't flood the log.
+			logf("watchdog: kiosk child not running — relaunching (next tick in %s)", watchdogInterval)
 			launchWebViewChild()
 		}
 	} else {
@@ -5133,6 +5253,127 @@ func spawnUpdateInvocation() {
 	_ = cmd.Process.Release()
 }
 
+// readLineStdin reads one line from r, stripping the trailing CR/LF.
+// Echoed — no-echo isn't needed because these flags are run by an admin
+// in an elevated console on a paused kiosk; there's no shoulder-surfing
+// kiosk-user threat in that context, and avoiding golang.org/x/term
+// keeps the change dependency-free. v1.3.1.
+func readLineStdin(r *bufio.Reader) string {
+	line, _ := r.ReadString('\n')
+	return strings.TrimRight(line, "\r\n")
+}
+
+// cliVerifyPassword is the shared password gate for the v1.3.1 console
+// flags. Prints a prompt, reads the password from stdin, verifies it
+// against the stored bcrypt hash. Returns true on match. On any failure
+// (no hash configured, wrong password) it prints a message, logs, and
+// the caller should os.Exit(1).
+func cliVerifyPassword(r *bufio.Reader, flagName string) bool {
+	migrateLegacyHash()
+	hash, err := loadHash()
+	if err != nil || len(hash) == 0 {
+		logf("%s: no password configured", flagName)
+		fmt.Println("SK Filter is not configured (no admin password set). Run first-run setup first.")
+		return false
+	}
+	storedHash = hash
+	fmt.Print("Admin password: ")
+	pw := readLineStdin(r)
+	if bcrypt.CompareHashAndPassword(storedHash, []byte(pw)) != nil {
+		logf("%s: incorrect password", flagName)
+		fmt.Println("Incorrect password.")
+		return false
+	}
+	return true
+}
+
+// runCLISetURL: console-only (no WebView2/zenity) admin URL change for an
+// elevated PowerShell on a locked kiosk. Reads password then URL from
+// stdin, verifies the bcrypt hash, saves to HKLM, kills the --webview
+// child so the controller respawns it at the new URL. Exits non-zero on
+// any failure. v1.3.1 — sidesteps the desktop-shortcut / WebView2 path
+// entirely so the URL is changeable even when those are broken.
+func runCLISetURL() {
+	logf("--cli-set-url: invoked")
+	r := bufio.NewReader(os.Stdin)
+	fmt.Println("SK Filter — change kiosk URL")
+	if !cliVerifyPassword(r, "--cli-set-url") {
+		os.Exit(1)
+	}
+	cur := loadKioskURL()
+	fmt.Printf("Current URL: %s\n", cur)
+	fmt.Print("New kiosk URL (blank = keep current): ")
+	url := strings.TrimSpace(readLineStdin(r))
+	if url == "" {
+		fmt.Println("No change — kept current URL.")
+		return
+	}
+	if !isValidKioskURL(url) {
+		logf("--cli-set-url: rejected invalid URL %q", url)
+		fmt.Println("Invalid URL. Must start with https://, http://, or file:///.")
+		os.Exit(1)
+	}
+	if err := saveKioskURLToRegistry(url); err != nil {
+		logf("--cli-set-url: save to registry failed: %v", err)
+		fmt.Printf("Failed to save URL: %v\n", err)
+		os.Exit(1)
+	}
+	if p := findOurWebViewChild(); p != nil {
+		_ = p.Kill()
+		logf("--cli-set-url: kiosk URL updated to %q; killed webview child for reload", url)
+	} else {
+		logf("--cli-set-url: kiosk URL updated to %q; no webview child running", url)
+	}
+	fmt.Printf("Kiosk URL updated to:\n  %s\nThe kiosk window reloads within a few seconds.\n", url)
+}
+
+// runCLISetZoom: console-only admin zoom change. Reads password then a
+// zoom percent from stdin, verifies, clamps to [50,200], writes BOTH the
+// HKLM KioskZoom DWORD and %ProgramData%\KioskExitGuard\zoom.txt. Writing
+// both is required: loadKioskZoomPercent treats zoom.txt as the source of
+// truth (it wins over and re-syncs into the registry on every --webview
+// launch), so a registry-only write would be silently overwritten on the
+// next launch whenever a zoom.txt already exists. v1.3.1.
+func runCLISetZoom() {
+	logf("--cli-set-zoom: invoked")
+	r := bufio.NewReader(os.Stdin)
+	fmt.Println("SK Filter — change kiosk zoom")
+	if !cliVerifyPassword(r, "--cli-set-zoom") {
+		os.Exit(1)
+	}
+	fmt.Printf("Current zoom: %d%%\n", loadKioskZoomPercent())
+	fmt.Printf("New zoom percent (%d–%d): ", minKioskZoom, maxKioskZoom)
+	raw := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(readLineStdin(r)), "%"))
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		logf("--cli-set-zoom: unparseable zoom input %q", raw)
+		fmt.Println("Not a number. Enter a whole number like 90.")
+		os.Exit(1)
+	}
+	clamped := clampKioskZoom(n)
+	if err := saveKioskZoomPercent(clamped); err != nil {
+		logf("--cli-set-zoom: registry save failed: %v", err)
+		fmt.Printf("Failed to save zoom to registry: %v\n", err)
+		os.Exit(1)
+	}
+	// Write zoom.txt too so the v1.3.1 zoom.txt-wins precedence doesn't
+	// overwrite the registry value we just set on the next launch.
+	_ = os.MkdirAll(programDataDir(), 0o755)
+	if err := os.WriteFile(zoomTxtPath(), []byte(strconv.Itoa(clamped)+"\r\n"), 0o644); err != nil {
+		logf("--cli-set-zoom: zoom.txt write failed: %v (registry still set to %d)", err, clamped)
+		fmt.Printf("Zoom saved to registry as %d%%, but zoom.txt write failed: %v\n", clamped, err)
+		fmt.Println("It will still take effect unless a stale zoom.txt overrides it.")
+		return
+	}
+	logf("--cli-set-zoom: zoom %d%% (raw %d) saved to registry+zoom.txt", clamped, n)
+	if clamped != n {
+		fmt.Printf("Zoom set to %d%% (clamped from %d to the %d–%d range).\n", clamped, n, minKioskZoom, maxKioskZoom)
+	} else {
+		fmt.Printf("Zoom set to %d%%.\n", clamped)
+	}
+	fmt.Println("Applies on the next kiosk window launch (or pause/resume).")
+}
+
 // runPauseInvocation is the entry point for `kiosk-exit-guard.exe --pause`,
 // which is wired to the "Pause SK Filter" desktop shortcut. It performs
 // the same flow as the Ctrl+Shift+Alt+K hotkey would inside the running
@@ -5441,6 +5682,19 @@ func main() {
 	// everything down.
 	if len(os.Args) > 1 && os.Args[1] == "--uninstall" {
 		runUninstallInvocation()
+		return
+	}
+
+	// v1.3.1 console-only admin flags. Run from an elevated PowerShell
+	// (e.g. after pausing the filter via double-right-click) when the
+	// desktop shortcuts / WebView2 modals aren't reachable. Password is
+	// read from stdin and verified against the bcrypt hash; no GUI.
+	if len(os.Args) > 1 && os.Args[1] == "--cli-set-url" {
+		runCLISetURL()
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "--cli-set-zoom" {
+		runCLISetZoom()
 		return
 	}
 

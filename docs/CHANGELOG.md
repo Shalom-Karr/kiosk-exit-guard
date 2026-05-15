@@ -5,6 +5,77 @@ All notable changes to kiosk-exit-guard, newest first. Versions follow [Semantic
 For the current state of the project, see the [landing page](https://shalom-karr.github.io/kiosk-exit-guard/), the [architecture doc](architecture.md), and the [admin runbook](admin-runbook.md).
 
 
+## v1.3.1 — 2026-05-15
+
+Drop-in zoom override file + two diagnostic log lines.
+
+### zoom.txt drop-in override
+
+`%ProgramData%\KioskExitGuard\zoom.txt` — write a single number into it
+(e.g. `90`, `90%`, trailing comment/whitespace tolerated) and the kiosk
+renders at that page-zoom on the next `--webview` launch, no need to
+go through the `--set-url` WebView2 form. Precedence: zoom.txt **wins**
+over the registry `KioskZoom` DWORD AND syncs back into it, so the
+`--set-url` form's pre-fill stays consistent — the file is the source
+of truth on each launch. `loadKioskZoomPercent` now resolves
+zoom.txt → registry → default(100); `registryZoomPercent` was split
+out so the sync path can compare without recursing. Only the first
+whitespace-delimited token is parsed and the value is clamped to
+50–200, so a fat-fingered `9000` renders at 200% rather than breaking
+layout.
+
+### New log lines
+
+- `kiosk: rendering "<url>" at zoom <n>%` — emitted by `runWebViewKiosk`
+  on every kiosk paint, so the field log shows both the URL and the
+  resolved zoom (after zoom.txt/registry resolution). When zoom.txt
+  drives the value you also get `loadKioskZoomPercent: zoom.txt=<n>
+  (raw <r>) synced to registry (was <old>)`.
+- `watchdog: kiosk child not running — relaunching (next tick in 30s)`
+  — emitted only on the relaunch transition (child found dead). A tick
+  that finds the child alive stays silent so the 30 s cadence doesn't
+  flood the log. `watchdog: filter active but pause-just-applied
+  marker set — skipping relaunch this tick` covers the v1.1.9
+  kiosk-blink-suppression window.
+
+
+## v1.3.0 — 2026-05-15
+
+Four field-reported runtime fixes (contributed via Copilot cloud-agent
+PRs #2–#4). These close out the elevation / SID-mapping / log-path
+problems chased across the v1.2.x line.
+
+- **installStartupTask SID mapping.** `New-ScheduledTaskPrincipal`
+  used `$env:USERNAME`, which evaluates to `SYSTEM` (or empty) when
+  the function runs in the LocalSystem service context — Task
+  Scheduler can't map that to an interactive-logon SID and returned
+  `HRESULT 0x80070534` ("No mapping between account names and security
+  IDs was done"), the error that flooded the v1.2.3 field logs. Now
+  resolves the real interactive user via `os/user.Current()`, strips
+  the `DOMAIN\` prefix, passes it as `KEG_USER`, and fails early with
+  a meaningful log line if the user still can't be resolved.
+- **parentProcessImagePath.** `ERROR_GEN_FAILURE (31)` ("a device
+  attached to the system is not functioning") is now absorbed
+  silently like the other expected parent-already-exited errors,
+  instead of logging a scary line every service-spawn.
+- **Log path moved to `%ProgramData%\KioskExitGuard\logs\`.** v1.2.9's
+  `<install-dir>/logs/` layout failed once the exe relocated to
+  `C:\Program Files\KioskExitGuard\` — standard users can't create
+  files there. `%ProgramData%` is user-writable and already hosts the
+  WebView2 data dir. `cleanupInstallDir` allowed-subdirs gained
+  `logs` for the transitional case.
+- **Service spawn privileges.** `enableServiceSpawnPrivileges` now
+  enables `SeAssignPrimaryTokenPrivilege` + `SeIncreaseQuotaPrivilege`
+  on the process token before `CreateProcessAsUser`. LocalSystem holds
+  these by default but they're disabled; enabling them is the root-
+  cause fix for the `ERROR_ELEVATION_REQUIRED` spawn loop the v1.2.3
+  linked-token swap only treated symptomatically. Applied to both the
+  Service supervisor path and `spawnFlagAsUserInSession`.
+
+Release workflow also gained a `workflow_dispatch` trigger so a failed
+build can be re-run from the Actions tab without pushing a new tag.
+
+
 ## v1.2.9 — 2026-05-13
 
 Bundles the four queued items from v1.2.8: WebView2 URL/zoom form,
