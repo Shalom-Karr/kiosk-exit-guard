@@ -5,6 +5,36 @@ All notable changes to kiosk-exit-guard, newest first. Versions follow [Semantic
 For the current state of the project, see the [landing page](https://shalom-karr.github.io/kiosk-exit-guard/), the [architecture doc](architecture.md), and the [admin runbook](admin-runbook.md).
 
 
+## v1.3.3 — 2026-05-15
+
+One-step pause dialog. Triggering a pause (Ctrl+Shift+Alt+K or
+double-right-click or the "Pause SK Filter" shortcut) now shows a
+single modal with the password field **and** the duration choices
+together — pick 5 min / 15 min / etc. (or a custom 1–100), type the
+password, done. Replaces the old two-step flow (password modal → then
+a separate zenity duration list).
+
+- New `pausePromptHTML` — same branding/CSS as the password modal,
+  with a duration button grid (1/5/10/15/20/30/45/60 min) plus a
+  custom-minutes field. Clicking a duration submits both the password
+  and the chosen length via one `kgPause(pw, minutes)` binding.
+- New `runPauseDialogInProcess` (sibling of
+  `askPasswordModalInProcess`: same global prompt lock, 30 s
+  inactivity + 60 s fallback timers, fullscreen-topmost host, 3-attempt
+  inline retry) and `askPauseCombined`, which spawns a new `--ask-pause`
+  child (zero prior WebView2 → no go-webview2 second-instance panic;
+  chosen minutes returned via stdout, exit 0/1/2 for ok/wrong/cancel).
+- `promptAndPause` and `runPauseInvocation` rewired to the combined
+  dialog. The pre-kill of the kiosk child before the duration picker is
+  gone — it was only needed because the old `zenity.List` wasn't
+  HWND_TOPMOST and would hide behind the kiosk; the combined modal is
+  itself fullscreen-topmost, so the kiosk is killed only once the pause
+  is actually committed (no kiosk blink on cancel).
+- WebView2-unavailable fallback preserved: `runPauseDialogInProcess`
+  drops to the legacy `zenity.Entry` + `askPauseDuration` two-step on
+  machines where WebView2 won't start.
+
+
 ## v1.3.2 — 2026-05-15
 
 True browser zoom (Ctrl+- equivalent) for the kiosk page.

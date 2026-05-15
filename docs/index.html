@@ -155,7 +155,7 @@
 <div class="wrap">
 
 <header>
-  <h1>kiosk-exit-guard <span class="version-pill">v1.3.2</span></h1>
+  <h1>kiosk-exit-guard <span class="version-pill">v1.3.3</span></h1>
   <p class="tagline">Single-binary kiosk lockdown for <strong>Windows 11 Home</strong> and <strong>Windows Server 2022 (RDP / physical console)</strong>. Embedded WebView2 kiosk, password-gated keyboard, Chrome uninstalled, Edge launches blocked at the OS level, self-installing, self-updating, all from one ~7.9&nbsp;MB exe.</p>
 </header>
 
@@ -195,7 +195,13 @@
   <a href="#build">Build</a>
 </nav>
 
-<h2 id="whats-new">v1.3.2 — true browser zoom (Ctrl+- equivalent)</h2>
+<h2 id="whats-new">v1.3.3 — one-step pause dialog</h2>
+
+<div class="callout callout-good">
+  <strong>Pausing is now a single screen: password + duration together.</strong> Ctrl+Shift+Alt+K, double-right-click, or the "Pause SK Filter" shortcut opens one modal with the password field and a duration grid (1/5/10/15/20/30/45/60 min + a custom 1–100 box). Type the password, click a duration, done — replacing the old two-step flow (password modal, then a separate zenity duration list). New <code>pausePromptHTML</code> + <code>runPauseDialogInProcess</code> (sibling of the password modal: same prompt lock, inactivity/fallback timers, fullscreen-topmost host, 3-attempt inline retry) + an <code>--ask-pause</code> child (zero prior WebView2 → no second-instance panic; minutes via stdout). The pre-kill of the kiosk before the picker is gone (the combined modal is itself topmost, so no kiosk blink on cancel); the kiosk is killed only once the pause is committed. WebView2-unavailable machines fall back to the legacy two-step zenity flow.
+</div>
+
+<h2 id="v132">v1.3.2 — true browser zoom (Ctrl+- equivalent)</h2>
 
 <div class="callout callout-good">
   <strong>Kiosk zoom now uses the WebView2 controller's <code>PutZoomFactor</code> — the exact COM property Ctrl+- drives — instead of CSS <code>zoom</code>.</strong> Through v1.3.1, <code>document.body.style.zoom</code> scaled the body box but the layout viewport never reflowed, so a viewport-pinned page just looked vertically squished. v1.3.2 reflows the viewport like a real browser zoom-out. The high-level go-webview2 package hides <code>*edge.Chromium</code> behind an unexported field, so <code>applyWebViewZoomFactor</code> reaches it via reflect+unsafe (<code>webview.browser → *edge.Chromium → GetController() → controller.vtbl.PutZoomFactor</code>); the <code>double</code> arg goes through <code>ComProc.Call → syscall.SyscallN</code> with <code>math.Float64bits</code> (Go's windows/amd64 ABI mirrors args into XMM, so <code>put_ZoomFactor</code> reads XMM1 correctly). Wrapped in <code>recover()</code> with full nil-checking; on any failure it falls back to the legacy CSS-zoom injection so zoom never silently no-ops. zoom.txt / registry / <code>--cli-set-zoom</code> precedence is unchanged — only the mechanism that consumes the percent changed.

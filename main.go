@@ -67,7 +67,7 @@ import (
 
 // currentVersion must be kept in sync with versioninfo.json. Used by the
 // --update flow to compare against the latest GitHub release tag.
-const currentVersion = "1.3.2"
+const currentVersion = "1.3.3"
 
 // Auto-update background-check timing. v1.2.1: the controller polls
 // GitHub's /releases/latest on startup (after autoUpdateInitialDelay so
@@ -3709,6 +3709,150 @@ const passwordPromptHTML = `<!DOCTYPE html><html lang="en"><head><meta charset="
 </script>
 </body></html>`
 
+// pausePromptHTML is the v1.3.3 ONE-STEP pause dialog: password field
+// AND duration choices in a single modal, replacing the old two-step
+// flow (password modal → then a separate zenity duration list). Same
+// branding/CSS as passwordPromptHTML. Clicking a duration button (or
+// entering a custom value) submits both the password and the chosen
+// minutes via the kgPause(pw, minutes) binding in one action.
+const pausePromptHTML = `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<style>
+  *,*::before,*::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0;
+    background: radial-gradient(ellipse at top left, #1e293b, #0b1220 70%);
+    color: #f1f5f9; font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
+    min-height: 100vh; -webkit-font-smoothing: antialiased; }
+  .wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 1.25rem; overflow-y: auto; }
+  .card { background: linear-gradient(180deg, rgba(35, 47, 72, 0.95), rgba(26, 36, 56, 0.95));
+    border: 1px solid rgba(148, 163, 184, 0.22); border-radius: 16px;
+    padding: 2rem 2.25rem; width: 100%; max-width: 540px;
+    box-shadow: 0 30px 70px rgba(0,0,0,0.6); backdrop-filter: blur(8px); }
+  .header { display: flex; align-items: center; gap: 0.9rem; margin: 0 0 1.25rem; }
+  .lock-icon { width: 48px; height: 48px; border-radius: 12px;
+    background: linear-gradient(135deg, rgba(56, 189, 248, 0.18), rgba(56, 189, 248, 0.06));
+    border: 1px solid rgba(56, 189, 248, 0.32); display: flex; align-items: center;
+    justify-content: center; flex-shrink: 0; }
+  .lock-icon svg { width: 22px; height: 22px; color: #38bdf8; }
+  .brand { color: #38bdf8; font-size: 0.7rem; font-weight: 700;
+    letter-spacing: 0.12em; text-transform: uppercase; margin: 0; }
+  h1 { font-size: 1.25rem; margin: 0.15rem 0 0; letter-spacing: -0.015em;
+    line-height: 1.25; font-weight: 700; }
+  .subtitle { color: #cbd5e1; font-size: 0.92rem; margin: 0 0 1.1rem; line-height: 1.5; }
+  label { display: block; font-size: 0.72rem; color: #94a3b8;
+    margin: 0 0 0.4rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.08em; }
+  input { width: 100%; padding: 0.85rem 1.05rem; border-radius: 9px;
+    border: 1px solid rgba(148, 163, 184, 0.3); background: rgba(11, 18, 32, 0.7);
+    color: #f1f5f9; font-size: 1rem; font-family: inherit;
+    transition: border-color 0.15s, box-shadow 0.15s; }
+  input:focus { outline: none; border-color: #38bdf8;
+    box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.2); }
+  .grid { display: grid; grid-template-columns: repeat(4, 1fr);
+    gap: 0.5rem; margin: 0.4rem 0 0; }
+  .dur { padding: 0.7rem 0.4rem; border-radius: 8px; border: 1px solid rgba(148,163,184,0.3);
+    background: rgba(11,18,32,0.55); color: #f1f5f9; font-weight: 700;
+    font-size: 0.9rem; font-family: inherit; cursor: pointer;
+    transition: background 0.12s, border-color 0.12s, transform 0.05s; }
+  .dur:hover { background: rgba(56,189,248,0.16); border-color: #38bdf8; }
+  .dur:active { transform: translateY(1px); }
+  .customrow { display: flex; gap: 0.5rem; margin-top: 0.5rem; }
+  .customrow input { flex: 1; }
+  .err { color: #fca5a5; font-size: 0.85rem; margin: 0.75rem 0 0;
+    background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.32);
+    padding: 0.55rem 0.8rem; border-radius: 7px; display: none; }
+  .err.show { display: block; }
+  .actions { display: flex; gap: 0.6rem; justify-content: flex-end; margin-top: 1.25rem; }
+  button { padding: 0.7rem 1.5rem; border-radius: 8px; border: 0; cursor: pointer;
+    font-weight: 700; font-size: 0.92rem; font-family: inherit;
+    transition: background 0.15s, transform 0.05s; }
+  button:active { transform: translateY(1px); }
+  .btn-primary { background: #38bdf8; color: #0b1220; }
+  .btn-primary:hover { background: #7dd3fc; }
+  .btn-secondary { background: transparent; color: #94a3b8;
+    border: 1px solid rgba(148, 163, 184, 0.3); }
+  .btn-secondary:hover { color: #f1f5f9; border-color: rgba(148, 163, 184, 0.55); }
+</style></head>
+<body>
+<div class="wrap"><div class="card">
+  <div class="header">
+    <div class="lock-icon" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3" y="11" width="18" height="11" rx="2"/>
+        <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+      </svg>
+    </div>
+    <div>
+      <p class="brand">SK Filter</p>
+      <h1>Pause the SK Filter</h1>
+    </div>
+  </div>
+  <p class="subtitle">Enter the admin password, then pick how long. Edge is allowed and the kiosk closes for that long; the filter resumes automatically.</p>
+  <label for="pw">Admin password</label>
+  <input type="password" id="pw" autofocus />
+  <label style="margin-top:1rem;">Pause duration</label>
+  <div class="grid">
+    <button class="dur" data-m="1">1 min</button>
+    <button class="dur" data-m="5">5 min</button>
+    <button class="dur" data-m="10">10 min</button>
+    <button class="dur" data-m="15">15 min</button>
+    <button class="dur" data-m="20">20 min</button>
+    <button class="dur" data-m="30">30 min</button>
+    <button class="dur" data-m="45">45 min</button>
+    <button class="dur" data-m="60">60 min</button>
+  </div>
+  <div class="customrow">
+    <input type="number" id="custom" min="1" max="100" placeholder="Custom minutes (1–100)" />
+    <button class="btn-primary" onclick="goCustom()">Pause</button>
+  </div>
+  <div class="err" id="err"></div>
+  <div class="actions">
+    <button class="btn-secondary" onclick="cancel()">Cancel</button>
+  </div>
+</div></div>
+<script>
+  var pw = document.getElementById('pw');
+  var custom = document.getElementById('custom');
+  setTimeout(function(){ pw.focus(); }, 0);
+  window.addEventListener('load', function(){ pw.focus(); });
+  document.addEventListener('DOMContentLoaded', function(){
+    if (window.kgReady) window.kgReady();
+  });
+  window.addEventListener('load', function(){ if (window.kgReady) window.kgReady(); });
+  function go(mins) {
+    if (!pw.value) { showErr('Enter the admin password first.'); pw.focus(); return; }
+    window.kgPause(pw.value, mins);
+  }
+  function goCustom() {
+    var n = parseInt(custom.value, 10);
+    if (!n || n < 1 || n > 100) { showErr('Custom minutes must be 1–100.'); custom.focus(); return; }
+    go(n);
+  }
+  var btns = document.querySelectorAll('.dur');
+  for (var i = 0; i < btns.length; i++) {
+    btns[i].addEventListener('click', function(){ go(parseInt(this.getAttribute('data-m'),10)); });
+  }
+  function cancel() { window.kgCancel(); }
+  function showErr(m) {
+    var el = document.getElementById('err');
+    el.textContent = m; el.classList.add('show');
+  }
+  window.kgShowError = function(m) { showErr(m); pw.value=''; pw.focus(); };
+  // Enter in the password field jumps to the custom box (so the admin can
+  // type password then a number then Enter for a full keyboard flow).
+  pw.addEventListener('keydown', function(e){
+    if (e.key === 'Enter') { e.preventDefault(); custom.focus(); }
+    if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+  });
+  custom.addEventListener('keydown', function(e){
+    if (e.key === 'Enter') { e.preventDefault(); goCustom(); }
+    if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+  });
+  document.addEventListener('keydown', function(e){
+    if (e.key === 'F4' && e.altKey) { e.preventDefault(); cancel(); }
+  }, true);
+</script>
+</body></html>`
+
 // globalPromptMutexName is the well-known name of a system-wide mutex
 // used to serialize password modals across processes. Without it, two
 // desktop-shortcut clicks (or a click + hotkey) can stack two fullscreen
@@ -4128,6 +4272,191 @@ func askPassword(label string) bool {
 	return askPasswordOK(label, "")
 }
 
+// pauseResult carries the outcome of the v1.3.3 one-step pause dialog:
+// the verified outcome plus the chosen duration (only meaningful when
+// outcome == pwOK).
+type pauseResult struct {
+	outcome  passwordResult
+	duration time.Duration
+}
+
+// runPauseDialogInProcess renders the v1.3.3 combined pause modal
+// (password + duration in one screen) and returns the verified outcome.
+// Structurally a sibling of askPasswordModalInProcess — same global
+// prompt lock, inactivity/fallback timers, fullscreen-topmost host, and
+// 3-attempt inline retry — but the kgPause(pw, minutes) binding carries
+// both fields so the admin authenticates and picks the length in one
+// action. Only invoked by the --ask-pause child so the modal is always
+// the child's first (and only) WebView2 instance.
+func runPauseDialogInProcess() pauseResult {
+	const inactivityTimeout = 30 * time.Second
+
+	if !promptOpen.CompareAndSwap(false, true) {
+		return pauseResult{outcome: pwCancel}
+	}
+	defer promptOpen.Store(false)
+
+	gh, gotLock := acquireGlobalPromptLock()
+	if !gotLock {
+		showTimedInfo("Another SK Filter prompt is already open.\nFinish that one first.")
+		return pauseResult{outcome: pwCancel}
+	}
+	defer releaseGlobalPromptLock(gh)
+
+	var (
+		chosenMin int
+		submitted bool
+	)
+
+	w := webview2.NewWithOptions(webview2.WebViewOptions{
+		Debug:     false,
+		AutoFocus: true,
+		DataPath:  ensureWebView2DataDir(),
+		WindowOptions: webview2.WindowOptions{
+			Title:  "SK Filter — pause",
+			Width:  640,
+			Height: 480,
+			Center: true,
+		},
+	})
+	if w == nil {
+		// WebView2 unavailable — fall back to the legacy two-step zenity
+		// flow so pause still works on stripped-down machines.
+		pw, err := zenity.Entry("Pause the SK Filter?\nEnter the admin password.",
+			zenity.Title("SK Filter"), zenity.HideText())
+		if err != nil {
+			return pauseResult{outcome: pwCancel}
+		}
+		if bcrypt.CompareHashAndPassword(storedHash, []byte(pw)) != nil {
+			return pauseResult{outcome: pwWrong}
+		}
+		dur, ok := askPauseDuration()
+		if !ok {
+			return pauseResult{outcome: pwCancel}
+		}
+		return pauseResult{outcome: pwOK, duration: dur}
+	}
+	defer w.Destroy()
+
+	const maxAttempts = 3
+	var attempts int
+	var inactivityTimer *time.Timer
+	var inactivityArmed atomic.Bool
+
+	w.Bind("kgReady", func() {
+		if !inactivityArmed.CompareAndSwap(false, true) {
+			return
+		}
+		inactivityTimer = time.AfterFunc(inactivityTimeout, func() {
+			logf("runPauseDialogInProcess: %s inactivity timeout — auto-dismissing", inactivityTimeout)
+			w.Dispatch(func() { w.Terminate() })
+		})
+	})
+	w.Bind("kgPause", func(pw string, minutes float64) {
+		if inactivityTimer != nil {
+			inactivityTimer.Reset(inactivityTimeout)
+		}
+		attempts++
+		if bcrypt.CompareHashAndPassword(storedHash, []byte(pw)) == nil {
+			m := int(minutes)
+			if m < 1 {
+				m = 1
+			}
+			if m > 100 {
+				m = 100
+			}
+			chosenMin = m
+			submitted = true
+			w.Terminate()
+			return
+		}
+		if attempts >= maxAttempts {
+			submitted = false
+			w.Terminate()
+			return
+		}
+		remaining := maxAttempts - attempts
+		msg := fmt.Sprintf("Wrong password. %d attempt(s) left.", remaining)
+		w.Dispatch(func() {
+			w.Eval(fmt.Sprintf(`window.kgShowError && window.kgShowError(%q);`, msg))
+		})
+	})
+	w.Bind("kgCancel", func() {
+		if inactivityTimer != nil {
+			inactivityTimer.Reset(inactivityTimeout)
+		}
+		w.Terminate()
+	})
+
+	w.SetHtml(pausePromptHTML)
+	go func() {
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			h := uintptr(w.Window())
+			if h != 0 {
+				makeModalFullscreenTopmost(h)
+				return
+			}
+			time.Sleep(15 * time.Millisecond)
+		}
+	}()
+	fallbackTimer := time.AfterFunc(60*time.Second, func() {
+		if !inactivityArmed.CompareAndSwap(false, true) {
+			return
+		}
+		logf("runPauseDialogInProcess: 60s fallback timeout (kgReady never fired) — auto-dismissing")
+		w.Dispatch(func() { w.Terminate() })
+	})
+	defer fallbackTimer.Stop()
+	defer func() {
+		if inactivityTimer != nil {
+			inactivityTimer.Stop()
+		}
+	}()
+
+	w.Run()
+
+	if submitted && chosenMin > 0 {
+		return pauseResult{outcome: pwOK, duration: time.Duration(chosenMin) * time.Minute}
+	}
+	if attempts >= maxAttempts && !submitted {
+		return pauseResult{outcome: pwWrong}
+	}
+	return pauseResult{outcome: pwCancel}
+}
+
+// askPauseCombined spawns the --ask-pause child (zero prior WebView2
+// instances → no go-webview2 second-NewWithOptions panic, same pattern
+// as askPasswordModal). The child prints the chosen minutes to stdout
+// and exits 0 on success, 1 on wrong-password-exhausted, 2 on cancel.
+func askPauseCombined() (time.Duration, passwordResult) {
+	exe, err := os.Executable()
+	if err != nil {
+		r := runPauseDialogInProcess()
+		return r.duration, r.outcome
+	}
+	cmd := exec.Command(exe, "--ask-pause")
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+	out, runErr := cmd.Output()
+	if runErr == nil {
+		mins, perr := strconv.Atoi(strings.TrimSpace(string(out)))
+		if perr != nil || mins < 1 {
+			return 0, pwCancel
+		}
+		return time.Duration(mins) * time.Minute, pwOK
+	}
+	if exitErr, ok := runErr.(*exec.ExitError); ok {
+		switch exitErr.ExitCode() {
+		case 1:
+			return 0, pwWrong
+		case 2:
+			return 0, pwCancel
+		}
+	}
+	logf("askPauseCombined: child spawn failed: %v", runErr)
+	return 0, pwCancel
+}
+
 // promptAndReinject is the goroutine kicked off when the hook captures a
 // blocked combo. Verifies the password, then re-injects the original key
 // combo so the user's intended action goes through.
@@ -4188,34 +4517,22 @@ func promptAndPause() {
 		return
 	}
 
-	switch askPasswordModal(
-		"Pause the SK Filter?",
-		"Edge will be allowed and the kiosk will close for the duration you choose. The filter resumes automatically when the timer ends.",
-	) {
+	// v1.3.3: one-step combined dialog (password + duration in a single
+	// fullscreen-topmost WebView2 modal). Replaces the old two-step
+	// askPasswordModal → askPauseDuration. No need to pre-kill the kiosk:
+	// the old kill was only because askPauseDuration used a non-topmost
+	// zenity.List that would hide behind the kiosk; the combined modal is
+	// itself fullscreen-topmost (renders cleanly over the kiosk, no
+	// blink). The kiosk is killed below only once the pause is committed.
+	dur, outcome := askPauseCombined()
+	switch outcome {
 	case pwWrong:
 		showFailedToast()
 		return
 	case pwCancel:
 		return
 	}
-	// v1.1.7: kill the kiosk WebView2 child BEFORE showing the duration
-	// picker. askPauseDuration uses zenity.List which is a native Win32
-	// dialog (not HWND_TOPMOST) — it would render behind the kiosk's
-	// fullscreen topmost WebView2 and be invisible to the user. With the
-	// kiosk gone, zenity gets normal foreground. If the user cancels the
-	// picker, the watchdog respawns the kiosk within 30s; we also try a
-	// proactive relaunch on cancel below to avoid the gap.
-	killWebViewChild()
-	dur, accepted := askPauseDuration()
-	if !accepted {
-		showTimedInfo("Pause cancelled.\nSK Filter is still active.")
-		// User backed out — bring the kiosk back immediately instead of
-		// waiting for the next watchdog tick.
-		launchWebViewChild()
-		return
-	}
 	if dur <= 0 {
-		launchWebViewChild()
 		return
 	}
 
@@ -4228,7 +4545,7 @@ func promptAndPause() {
 	removeLockdown()
 	removeIFEOBlock("chrome.exe")
 	removeIFEOBlock("msedge.exe")
-	// (kiosk already killed above)
+	killWebViewChild()
 
 	logf("pause started for %v (resumes at %s)", dur, time.Unix(0, pauseUntilNano.Load()).Format("3:04 PM"))
 	showTimedInfo(fmt.Sprintf(
@@ -5474,10 +5791,14 @@ func runPauseInvocation() {
 		return
 	}
 
-	switch askPasswordModal(
-		"Pause the SK Filter?",
-		"Edge will be allowed and the kiosk will close for the duration you choose. The filter resumes automatically when the timer ends.",
-	) {
+	// v1.3.3: one-step combined dialog (password + duration in a single
+	// fullscreen-topmost WebView2 modal), replacing the old two-step
+	// askPasswordModal → askPauseDuration. The combined modal is itself
+	// fullscreen-topmost, so unlike the old zenity.List path there's no
+	// need to kill the kiosk before showing it — the kiosk is killed
+	// only once the pause is committed (below).
+	dur, outcome := askPauseCombined()
+	switch outcome {
 	case pwWrong:
 		// v1.1.9 UX MEDIUM#9: sync variant — os.Exit below kills the
 		// parent before a fire-and-forget child toast can render.
@@ -5486,34 +5807,16 @@ func runPauseInvocation() {
 	case pwCancel:
 		os.Exit(0)
 	}
-	// v1.1.9 UX MEDIUM#6: write the pause-just-applied marker BEFORE
-	// killing the kiosk child. The controller's runWatchdog ticks every
-	// 30s; if a tick fires between this Kill and the syncFilterStateLoop
-	// (2s) flipping filterMode, the watchdog respawns the kiosk and the
-	// user sees the "paused" toast followed by the kiosk briefly
-	// reappearing. The marker carries a 5s future timestamp; watchdogTick
-	// skips relaunching while the marker is in the future.
-	writePauseJustAppliedMarker(5 * time.Second)
+	if dur <= 0 {
+		os.Exit(0)
+	}
 
-	// v1.1.7: kill the kiosk WebView2 child BEFORE showing the duration
-	// picker. zenity.List is not HWND_TOPMOST so it would render behind
-	// the kiosk's fullscreen topmost WebView2 and be invisible. Killing
-	// the kiosk first lets zenity grab normal foreground. If the user
-	// cancels we relaunch the kiosk; otherwise pause takes effect and
-	// the kiosk stays down for the pause window.
+	// v1.1.9 UX MEDIUM#6: write the pause-just-applied marker BEFORE
+	// killing the kiosk child so a watchdog tick between the Kill and
+	// the syncFilterStateLoop flip doesn't briefly respawn the kiosk.
+	writePauseJustAppliedMarker(5 * time.Second)
 	if p := findOurWebViewChild(); p != nil {
 		_ = p.Kill()
-	}
-	dur, accepted := askPauseDuration()
-	if !accepted || dur <= 0 {
-		showTimedInfo("Pause cancelled.\nSK Filter is still active.")
-		// Kiosk will reappear on the controller's next watchdog tick (30s)
-		// — explicitly nudge it back via a process the controller will
-		// detect; the running controller is the one that actually
-		// launches --webview children. Best we can do from this fresh
-		// --pause process is exit and let the controller's watchdog
-		// notice. The user sees ~ up to 30s without the kiosk.
-		return
 	}
 
 	until := time.Now().Add(dur)
@@ -5655,6 +5958,32 @@ func main() {
 		topAlign := os.Getenv("KEG_ASK_PASSWORD_TOP") == "1"
 		switch askPasswordModalInProcess(title, subtitle, topAlign) {
 		case pwOK:
+			os.Exit(0)
+		case pwWrong:
+			os.Exit(1)
+		default:
+			os.Exit(2)
+		}
+	}
+
+	// v1.3.3 --ask-pause: child process for the one-step combined pause
+	// dialog (password + duration in one screen). Spawned by
+	// askPauseCombined so the modal is always the child's first WebView2
+	// instance (no go-webview2 second-NewWithOptions panic). On success
+	// the chosen minutes are printed to stdout and the child exits 0;
+	// exit 1 = wrong password (attempts exhausted), exit 2 = cancel.
+	if len(os.Args) > 1 && os.Args[1] == "--ask-pause" {
+		migrateLegacyHash()
+		hash, herr := loadHash()
+		if herr != nil || len(hash) == 0 {
+			logf("--ask-pause: no hash configured")
+			os.Exit(2)
+		}
+		storedHash = hash
+		r := runPauseDialogInProcess()
+		switch r.outcome {
+		case pwOK:
+			fmt.Println(int(r.duration / time.Minute))
 			os.Exit(0)
 		case pwWrong:
 			os.Exit(1)
