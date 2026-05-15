@@ -4,6 +4,11 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.3.0)'
+        required: true
 
 permissions:
   contents: write
@@ -11,6 +16,9 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+
+    env:
+      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
 
     steps:
       - name: Checkout
@@ -55,8 +63,9 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
           files: |
             kiosk-exit-guard.exe
             kiosk-exit-guard.exe.sha256
           generate_release_notes: true
-          name: ${{ github.ref_name }}
+          name: ${{ env.RELEASE_TAG }}
